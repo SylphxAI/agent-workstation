@@ -369,14 +369,15 @@ class CamoufoxSession:
     locale and WebRTC with the egress IP. Page scripts run in Camoufox's isolated world.
     """
 
-    def __init__(self, plan: LaunchPlan, egress: Egress, env: dict[str, str], state_dir: Path):
+    def __init__(self, plan: LaunchPlan, egress: Egress, env: dict[str, str], state_dir: Path,
+                 target_os: str | None = None):
         from camoufox.fingerprints import Screen
         from camoufox.sync_api import NewBrowser
         from camoufox.utils import launch_options
         from playwright.sync_api import sync_playwright
 
         self.plan = plan
-        cache = state_dir / f"camoufox-{plan.seed}-{egress.name}.json"
+        cache = state_dir / f"camoufox{'-' + target_os if target_os else ''}-{plan.seed}-{egress.name}.json"
         if cache.exists():
             opts = json.loads(cache.read_text())
         else:
@@ -385,6 +386,10 @@ class CamoufoxSession:
                 # Same egress-derived locale as the Chromium engines; Camoufox's geoip
                 # otherwise samples any language spoken in the country (e.g. pa-GB).
                 locale=plan.locale,
+                # None = Camoufox default (random OS; canvas covered with random data
+                # whenever the claimed OS/GPU differs from the host). "linux" = claim
+                # the host OS, so canvas/WebGL render uncovered and stay stable.
+                os=target_os,
                 env=dict(env), i_know_what_im_doing=True,
                 # Keep the generated screen within the Xvfb framebuffer the seed selected.
                 screen=Screen(max_width=plan.screen[0], max_height=plan.screen[1]),
@@ -433,7 +438,7 @@ def _camoufox_config_digest(opts: dict[str, Any]) -> str:
 
 # --------------------------------------------------------------------------- planning
 
-ENGINES = ("fpc", "camoufox", "chrome-seed", "fpc-brand157", "chrome-jshooks")
+ENGINES = ("fpc", "camoufox", "chrome-seed", "fpc-brand157", "camoufox-linux", "chrome-jshooks")
 
 
 def plan_launch(engine: str, seed: str, egress: Egress) -> LaunchPlan:
@@ -464,4 +469,6 @@ def open_session(plan: LaunchPlan, egress: Egress, env: dict[str, str], state_di
         return ChromeSession("jshooks", plan, egress, env)
     if plan.engine == "camoufox":
         return CamoufoxSession(plan, egress, env, state_dir)
+    if plan.engine == "camoufox-linux":
+        return CamoufoxSession(plan, egress, env, state_dir, target_os="linux")
     raise ValueError(plan.engine)

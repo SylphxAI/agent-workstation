@@ -11,6 +11,7 @@ Engines (`--engine`):
 | `fpc` | [fingerprint-chromium](https://github.com/adryfish/fingerprint-chromium) (ungoogled-chromium fork) | `--fingerprint=<seed>` (C++), `--fingerprint-brand=Chrome`, `--timezone`, `--lang`, `--accept-lang` |
 | `fpc-brand157` | same binary | additionally `--fingerprint-brand-version=<current stable Chrome>` to test the version-lag question |
 | `camoufox` | [Camoufox](https://github.com/daijro/camoufox) (Firefox fork) | C++ spoofing from a generated config; generated once per seed and replayed, geoip aligned to the egress |
+| `camoufox-linux` | same binary | identity pinned to the host OS (`os="linux"`), so canvas/WebGL are not covered with per-launch noise |
 | `chrome-seed` | stock Google Chrome stable | launch-time only: screen size, process locale, `TZ`, CPU-affinity core count; no page hooks |
 | `chrome-jshooks` | stock Google Chrome + document-start JS overrides | the common `addScriptToEvaluateOnNewDocument` approach, kept as a known-bad baseline |
 
@@ -43,7 +44,14 @@ python -m wsbench.run --out results \
   --egress residential=socks5://127.0.0.1:1080 --egress datacenter \
   --seeds A,A,A,A,A,B,C,D --parallel 4
 python -m wsbench.report results/runs.jsonl
+python -m wsbench.perf --egress residential=socks5://127.0.0.1:1080 --seeds A,A   # startup + peak RSS
 python -m wsbench.integration   # CDP/BiDi, a11y, insertText, tabs, Chrome-profile carry-over
+
+One command reruns the full measurement (detection + perf, then the report):
+
+```sh
+./rerun.sh --egress residential=socks5://127.0.0.1:1080
+```
 ```
 
 - `--seeds`: one fresh launch (fresh profile, fresh compositor) per entry. Repeats of a seed
