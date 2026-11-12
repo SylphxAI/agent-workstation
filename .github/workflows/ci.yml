@@ -1,6 +1,7 @@
 name: ci
 
-# Format, clippy, unit tests and a headful integration test under Xvfb.
+# Format, clippy, docs, unit tests and a headful integration test on a
+# headless Wayland desktop (sway + wayvnc + Chrome).
 #
 # GitHub-hosted standard runners are free only on a public repository, so
 # every job carries `github.event.repository.private == false`: a private copy
@@ -64,14 +65,14 @@ jobs:
       - name: Desktop packages
         run: |
           sudo apt-get update -q
-          sudo apt-get install -yq --no-install-recommends xvfb openbox x11vnc xdotool fonts-dejavu-core
+          sudo apt-get install -yq --no-install-recommends sway wayvnc fonts-dejavu-core
       - name: Unit and behaviour tests
         run: cargo test --all-features --locked
-      - name: Headful integration (Xvfb + openbox + Chrome + x11vnc)
+      - name: Headful integration (headless Wayland + Chrome + wayvnc)
         env:
           AGENT_WORKSTATION_HEADFUL: '1'
-          AGENT_WORKSTATION_CHROMIUM: /usr/bin/google-chrome
-        run: cargo test --all-features --locked --test headful -- --nocapture --test-threads=1
+          AGENT_WORKSTATION_BROWSER: /usr/bin/google-chrome
+        run: cargo test --all-features --locked --tests -- --nocapture --test-threads=1
 
   ci-ok:
     if: always() && github.event.repository.private == false

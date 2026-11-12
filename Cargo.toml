@@ -28,6 +28,12 @@ tokio-tungstenite = "0.28"
 tracing = "0.1"
 url = "2"
 png = "0.18"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
+rustix = { version = "1", features = ["fs"] }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [dev-dependencies]
 tempfile = "3"
