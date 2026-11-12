@@ -1,0 +1,38 @@
+[package]
+name = "agent-workstation"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+description = "One headless Wayland desktop per agent session: a single headful browser, web and desktop operations on one state, and a full-desktop noVNC takeover"
+repository = "https://github.com/SylphxAI/agent-workstation"
+readme = "README.md"
+keywords = ["agent", "browser", "wayland", "automation", "vnc"]
+categories = ["web-programming", "api-bindings", "development-tools::testing"]
+exclude = ["/bench", "/.github"]
+
+[workspace]
+# `bench/` is an independent tree; it may depend on this crate by path.
+exclude = ["bench"]
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "process", "sync", "time", "io-util", "fs"] }
+tokio-tungstenite = "0.28"
+tracing = "0.1"
+url = "2"
+png = "0.18"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
