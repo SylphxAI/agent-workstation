@@ -6,7 +6,6 @@
 //! the person's VNC input reaches the display. Handing back (explicitly, or
 //! after [`IDLE_TIMEOUT`] without input) resumes the agent.
 
-
 use std::sync::Arc;
 use std::time::Duration;
 

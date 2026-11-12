@@ -18,7 +18,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_workstation::{
-    BrowserConfig, Button, DesktopSession, Error, Profile, Proxy, Secret, SecretResolver, SessionConfig,
+    BrowserConfig, Button, DesktopSession, Error, Profile, Proxy, Secret, SecretResolver,
+    SessionConfig,
 };
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -82,9 +83,12 @@ impl SecretResolver for CommandResolver {
             .output()
             .await?;
         if !out.status.success() {
-            return Err(Error::Refused(format!("secret command failed for {secret_ref:?}")));
+            return Err(Error::Refused(format!(
+                "secret command failed for {secret_ref:?}"
+            )));
         }
-        let mut v = String::from_utf8(out.stdout).map_err(|_| Error::Refused("secret is not UTF-8".into()))?;
+        let mut v = String::from_utf8(out.stdout)
+            .map_err(|_| Error::Refused("secret is not UTF-8".into()))?;
         if v.ends_with('\n') {
             v.pop();
         }
@@ -119,18 +123,40 @@ impl From<Error> for ApiError {
             Error::Starting { .. } | Error::Timeout(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        ApiError(status, json!({ "code": e.code(), "message": e.to_string() }))
+        ApiError(
+            status,
+            json!({ "code": e.code(), "message": e.to_string() }),
+        )
     }
 }
 
 fn bad(msg: impl Into<String>) -> ApiError {
-    ApiError(StatusCode::BAD_REQUEST, json!({ "code": "invalid-input", "message": msg.into() }))
+    ApiError(
+        StatusCode::BAD_REQUEST,
+        json!({ "code": "invalid-input", "message": msg.into() }),
+    )
 }
 
 fn authorize(app: &App, headers: &HeaderMap) -> Result<(), ApiError> {
-    let given = headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-    let ok = given.is_some_and(|g| g.len() == app.token.len() && g.bytes().zip(app.token.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0);
-    if ok { Ok(()) } else { Err(ApiError(StatusCode::UNAUTHORIZED, json!({ "code": "unauthorized" }))) }
+    let given = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let ok = given.is_some_and(|g| {
+        g.len() == app.token.len()
+            && g.bytes()
+                .zip(app.token.bytes())
+                .fold(0u8, |a, (x, y)| a | (x ^ y))
+                == 0
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            json!({ "code": "unauthorized" }),
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -140,23 +166,48 @@ struct CreateSession {
     proxy: Option<String>,
 }
 
-async fn create(State(app): State<Shared>, headers: HeaderMap, Json(req): Json<CreateSession>) -> Result<Json<Value>, ApiError> {
+async fn create(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Json(req): Json<CreateSession>,
+) -> Result<Json<Value>, ApiError> {
     authorize(&app, &headers)?;
-    if req.profile.is_empty() || !req.profile.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
+    if req.profile.is_empty()
+        || !req
+            .profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
         return Err(bad("profile must be [A-Za-z0-9._-]+"));
     }
     let id = random_id()?;
-    let mut cfg = SessionConfig::new(Profile::new(req.profile, req.profile_dir), app.opts.browser.clone(), app.opts.state_dir.join(&id));
+    let mut cfg = SessionConfig::new(
+        Profile::new(req.profile, req.profile_dir),
+        app.opts.browser.clone(),
+        app.opts.state_dir.join(&id),
+    );
     cfg.proxy = req.proxy.as_deref().map(Proxy::parse).transpose()?;
     let session = DesktopSession::start(cfg).await?;
     let url = session.takeover_url().map(|u| u.to_string());
-    app.sessions.write().await.insert(id.clone(), Arc::new(session));
+    app.sessions
+        .write()
+        .await
+        .insert(id.clone(), Arc::new(session));
     Ok(Json(json!({ "id": id, "takeover_url": url })))
 }
 
-async fn remove(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>) -> Result<StatusCode, ApiError> {
+async fn remove(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
     authorize(&app, &headers)?;
-    let s = app.sessions.write().await.remove(&id).ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
+    let s = app
+        .sessions
+        .write()
+        .await
+        .remove(&id)
+        .ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
     match Arc::try_unwrap(s) {
         Ok(s) => s.shutdown().await,
         Err(_) => return Err(ApiError(StatusCode::CONFLICT, json!({ "code": "busy" }))),
@@ -167,31 +218,72 @@ async fn remove(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<St
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Op {
-    Navigate { url: String },
+    Navigate {
+        url: String,
+    },
     Back,
     Forward,
     Reload,
     CurrentUrl,
     Tabs,
-    NewTab { url: String },
-    SelectTab { id: String },
-    CloseTab { id: String },
+    NewTab {
+        url: String,
+    },
+    SelectTab {
+        id: String,
+    },
+    CloseTab {
+        id: String,
+    },
     Snapshot,
     Read,
-    Click { r#ref: String },
-    Fill { r#ref: String, text: String },
-    FillSecret { r#ref: String, secret_ref: String, expect_origin: Option<String> },
+    Click {
+        r#ref: String,
+    },
+    Fill {
+        r#ref: String,
+        text: String,
+    },
+    FillSecret {
+        r#ref: String,
+        secret_ref: String,
+        expect_origin: Option<String>,
+    },
     Screenshot,
-    ClickAt { x: f64, y: f64, button: Option<Button> },
-    Key { chord: String },
-    Type { text: String },
-    Scroll { x: f64, y: f64, dx: i32, dy: i32 },
+    ClickAt {
+        x: f64,
+        y: f64,
+        button: Option<Button>,
+    },
+    Key {
+        chord: String,
+    },
+    Type {
+        text: String,
+    },
+    Scroll {
+        x: f64,
+        y: f64,
+        dx: i32,
+        dy: i32,
+    },
     HandBack,
 }
 
-async fn call(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<String>, Json(op): Json<Op>) -> Result<Json<Value>, ApiError> {
+async fn call(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(op): Json<Op>,
+) -> Result<Json<Value>, ApiError> {
     authorize(&app, &headers)?;
-    let s = app.sessions.read().await.get(&id).cloned().ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
+    let s = app
+        .sessions
+        .read()
+        .await
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
     let v = match op {
         Op::Navigate { url } => json!({ "url": s.navigate(&url).await? }),
         Op::Back => json!({ "url": s.back().await? }),
@@ -202,13 +294,22 @@ async fn call(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<Stri
         Op::NewTab { url } => json!({ "id": s.new_tab(&url).await? }),
         Op::SelectTab { id } => json!({ "ok": s.select_tab(&id).await? }),
         Op::CloseTab { id } => json!({ "ok": s.close_tab(&id).await? }),
-        Op::Snapshot => serde_json::to_value(s.snapshot().await?).map_err(|e| bad(e.to_string()))?,
+        Op::Snapshot => {
+            serde_json::to_value(s.snapshot().await?).map_err(|e| bad(e.to_string()))?
+        }
         Op::Read => json!({ "text": s.read().await? }),
         Op::Click { r#ref } => json!({ "ok": s.click(&r#ref).await? }),
         Op::Fill { r#ref, text } => json!({ "ok": s.fill(&r#ref, &text).await? }),
-        Op::FillSecret { r#ref, secret_ref, expect_origin } => {
-            let resolver = app.resolver.as_ref().ok_or_else(|| ApiError::from(Error::Unsupported("no --secret-command configured".into())))?;
-            s.fill_secret(&r#ref, &secret_ref, resolver, expect_origin.as_deref()).await?;
+        Op::FillSecret {
+            r#ref,
+            secret_ref,
+            expect_origin,
+        } => {
+            let resolver = app.resolver.as_ref().ok_or_else(|| {
+                ApiError::from(Error::Unsupported("no --secret-command configured".into()))
+            })?;
+            s.fill_secret(&r#ref, &secret_ref, resolver, expect_origin.as_deref())
+                .await?;
             json!({ "ok": true })
         }
         Op::Screenshot => {
@@ -216,7 +317,9 @@ async fn call(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<Stri
             let png = f.to_png()?;
             json!({ "width": f.width, "height": f.height, "png_base64": base64::engine::general_purpose::STANDARD.encode(png) })
         }
-        Op::ClickAt { x, y, button } => json!({ "ok": s.click_at(x, y, button.unwrap_or(Button::Left)).await? }),
+        Op::ClickAt { x, y, button } => {
+            json!({ "ok": s.click_at(x, y, button.unwrap_or(Button::Left)).await? })
+        }
         Op::Key { chord } => json!({ "ok": s.key(&chord).await? }),
         Op::Type { text } => json!({ "ok": s.type_text(&text).await? }),
         Op::Scroll { x, y, dx, dy } => json!({ "ok": s.scroll(x, y, dx, dy).await? }),
@@ -228,7 +331,9 @@ async fn call(State(app): State<Shared>, headers: HeaderMap, Path(id): Path<Stri
 fn random_id() -> Result<String, ApiError> {
     use std::io::Read;
     let mut b = [0u8; 12];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map_err(|e| ApiError::from(Error::Io(e)))?;
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut b))
+        .map_err(|e| ApiError::from(Error::Io(e)))?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
@@ -241,7 +346,10 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    let Some(token) = std::env::var("AGENT_WORKSTATION_TOKEN").ok().filter(|t| t.len() >= 16) else {
+    let Some(token) = std::env::var("AGENT_WORKSTATION_TOKEN")
+        .ok()
+        .filter(|t| t.len() >= 16)
+    else {
         eprintln!("agent-workstation: set AGENT_WORKSTATION_TOKEN (16+ characters)");
         std::process::exit(2);
     };

@@ -32,7 +32,9 @@ impl Compositor {
     /// created with mode 0700 and must not be shared with another session.
     pub async fn start(binary: &Path, runtime_dir: &Path, width: u32, height: u32) -> Result<Self> {
         if !(320..=7680).contains(&width) || !(240..=4320).contains(&height) {
-            return Err(Error::InvalidInput(format!("desktop size {width}x{height} is out of range")));
+            return Err(Error::InvalidInput(format!(
+                "desktop size {width}x{height} is out of range"
+            )));
         }
         create_private_dir(runtime_dir)?;
         let config = runtime_dir.join("compositor.conf");
@@ -54,7 +56,9 @@ impl Compositor {
             .kill_on_drop(true)
             .process_group(0)
             .spawn()
-            .map_err(|e| Error::Process(format!("cannot start compositor {}: {e}", binary.display())))?;
+            .map_err(|e| {
+                Error::Process(format!("cannot start compositor {}: {e}", binary.display()))
+            })?;
         let deadline = Instant::now() + START_TIMEOUT;
         let wayland_display = loop {
             if let Some(status) = child.try_wait()? {
@@ -72,7 +76,12 @@ impl Compositor {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        Ok(Self { child, runtime_dir: runtime_dir.to_path_buf(), wayland_display, size: (width, height) })
+        Ok(Self {
+            child,
+            runtime_dir: runtime_dir.to_path_buf(),
+            wayland_display,
+            size: (width, height),
+        })
     }
 
     /// Private runtime directory.
@@ -98,7 +107,10 @@ impl Compositor {
     /// Environment a client needs to open windows on this desktop.
     pub fn client_env(&self) -> Vec<(String, String)> {
         vec![
-            ("XDG_RUNTIME_DIR".into(), self.runtime_dir.display().to_string()),
+            (
+                "XDG_RUNTIME_DIR".into(),
+                self.runtime_dir.display().to_string(),
+            ),
             ("WAYLAND_DISPLAY".into(), self.wayland_display.clone()),
         ]
     }
@@ -129,7 +141,10 @@ fn find_socket(dir: &Path) -> Option<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .filter(|n| n.strip_prefix("wayland-").is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())))
+        .filter(|n| {
+            n.strip_prefix("wayland-")
+                .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        })
         .collect();
     names.sort();
     names.into_iter().next()
@@ -160,7 +175,12 @@ mod tests {
     #[test]
     fn socket_discovery_ignores_locks_and_ipc() {
         let d = tempfile::tempdir().unwrap();
-        for n in ["wayland-1.lock", "sway-ipc.1.sock", "wayland-x", "wayland-1"] {
+        for n in [
+            "wayland-1.lock",
+            "sway-ipc.1.sock",
+            "wayland-x",
+            "wayland-1",
+        ] {
             std::fs::write(d.path().join(n), "").unwrap();
         }
         assert_eq!(find_socket(d.path()).as_deref(), Some("wayland-1"));
@@ -169,7 +189,9 @@ mod tests {
     #[tokio::test]
     async fn out_of_range_size_is_refused_before_spawning() {
         let d = tempfile::tempdir().unwrap();
-        let e = Compositor::start(Path::new("/nonexistent"), d.path(), 10, 10).await.unwrap_err();
+        let e = Compositor::start(Path::new("/nonexistent"), d.path(), 10, 10)
+            .await
+            .unwrap_err();
         assert_eq!(e.code(), "invalid-input");
     }
 }

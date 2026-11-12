@@ -82,7 +82,8 @@ impl DesktopSession {
         let fingerprint = config.profile.fingerprint(&config.fingerprint_defaults)?;
         fingerprint.validate()?;
         let size = (fingerprint.screen_width, fingerprint.screen_height);
-        let compositor = Compositor::start(&config.compositor, &config.runtime_dir, size.0, size.1).await?;
+        let compositor =
+            Compositor::start(&config.compositor, &config.runtime_dir, size.0, size.1).await?;
         let env = compositor.client_env();
         let socket = compositor.socket_path();
         let proxy = match &config.proxy {
@@ -303,8 +304,14 @@ impl DesktopSession {
     pub async fn click_at(&self, x: f64, y: f64, button: Button) -> Result<()> {
         self.input(vec![
             Input::Move { x, y },
-            Input::Button { button, pressed: true },
-            Input::Button { button, pressed: false },
+            Input::Button {
+                button,
+                pressed: true,
+            },
+            Input::Button {
+                button,
+                pressed: false,
+            },
         ])
         .await
     }
@@ -321,7 +328,8 @@ impl DesktopSession {
 
     /// Scroll at desktop coordinates by notches.
     pub async fn scroll(&self, x: f64, y: f64, dx: i32, dy: i32) -> Result<()> {
-        self.input(vec![Input::Move { x, y }, Input::Scroll { dx, dy }]).await
+        self.input(vec![Input::Move { x, y }, Input::Scroll { dx, dy }])
+            .await
     }
 
     /// Stop everything. The profile is flushed by the browser's graceful close.
@@ -342,5 +350,7 @@ impl DesktopSession {
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(f).await.map_err(|e| Error::Process(format!("desktop worker: {e}")))?
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::Process(format!("desktop worker: {e}")))?
 }

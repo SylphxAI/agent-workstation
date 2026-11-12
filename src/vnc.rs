@@ -18,7 +18,11 @@ pub struct Vnc {
 
 impl Vnc {
     /// Start `binary` (usually `wayvnc`) for the desktop `desktop_env` names.
-    pub async fn start(binary: &Path, desktop_env: &[(String, String)], runtime_dir: &Path) -> Result<Self> {
+    pub async fn start(
+        binary: &Path,
+        desktop_env: &[(String, String)],
+        runtime_dir: &Path,
+    ) -> Result<Self> {
         let socket = runtime_dir.join("vnc.sock");
         if let Err(e) = std::fs::remove_file(&socket)
             && e.kind() != std::io::ErrorKind::NotFound

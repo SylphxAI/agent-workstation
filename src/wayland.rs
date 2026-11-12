@@ -20,14 +20,16 @@ use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_ini
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop};
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
-    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1, zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+    zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
+    zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
-    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1, zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
+    zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
+    zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
 use crate::error::{Error, Result};
@@ -37,8 +39,8 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 /// on these codes only: clients treat codes such as Backspace or Enter by
 /// their physical meaning whatever keysym they carry.
 const CHAR_CODES: [u32; 47] = [
-    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 30, 31, 32, 33, 34, 35,
-    36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 30, 31,
+    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
 ];
 /// Distinct character keysyms one generated keymap carries.
 const KEYMAP_SLOTS: usize = CHAR_CODES.len();
@@ -68,9 +70,13 @@ impl Frame {
         let mut enc = png::Encoder::new(&mut out, self.width, self.height);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
-        let mut w = enc.write_header().map_err(|e| Error::Protocol(format!("png: {e}")))?;
-        w.write_image_data(&self.rgba).map_err(|e| Error::Protocol(format!("png: {e}")))?;
-        w.finish().map_err(|e| Error::Protocol(format!("png: {e}")))?;
+        let mut w = enc
+            .write_header()
+            .map_err(|e| Error::Protocol(format!("png: {e}")))?;
+        w.write_image_data(&self.rgba)
+            .map_err(|e| Error::Protocol(format!("png: {e}")))?;
+        w.finish()
+            .map_err(|e| Error::Protocol(format!("png: {e}")))?;
         Ok(out)
     }
 }
@@ -123,18 +129,40 @@ struct State {
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
-    fn event(_: &mut Self, _: &wl_registry::WlRegistry, _: wl_registry::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wl_registry::WlRegistry,
+        _: wl_registry::Event,
+        _: &GlobalListContents,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 
 impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
-    fn event(s: &mut Self, _: &ZwlrScreencopyFrameV1, ev: zwlr_screencopy_frame_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+    fn event(
+        s: &mut Self,
+        _: &ZwlrScreencopyFrameV1,
+        ev: zwlr_screencopy_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
         use zwlr_screencopy_frame_v1::Event as E;
         match ev {
-            E::Buffer { format: WEnum::Value(f), width, height, stride } if s.buffer.is_none() => {
+            E::Buffer {
+                format: WEnum::Value(f),
+                width,
+                height,
+                stride,
+            } if s.buffer.is_none() => {
                 s.buffer = Some((f, width, height, stride));
             }
             E::BufferDone => s.buffer_done = true,
-            E::Flags { flags: WEnum::Value(f) } => {
+            E::Flags {
+                flags: WEnum::Value(f),
+            } => {
                 s.flags_y_invert = f.contains(zwlr_screencopy_frame_v1::Flags::YInvert);
             }
             E::Ready { .. } => s.outcome = Some(true),
@@ -166,10 +194,16 @@ impl Client {
     fn connect(socket: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket)
             .map_err(|e| Error::Process(format!("cannot reach the compositor: {e}")))?;
-        let conn = Connection::from_socket(stream).map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
-        let (globals, queue) =
-            registry_queue_init::<State>(&conn).map_err(|e| Error::Protocol(format!("wayland registry: {e}")))?;
-        Ok(Self { conn, queue, globals, state: State::default() })
+        let conn = Connection::from_socket(stream)
+            .map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
+        let (globals, queue) = registry_queue_init::<State>(&conn)
+            .map_err(|e| Error::Protocol(format!("wayland registry: {e}")))?;
+        Ok(Self {
+            conn,
+            queue,
+            globals,
+            state: State::default(),
+        })
     }
 
     fn bind<I>(&self, versions: std::ops::RangeInclusive<u32>) -> Result<I>
@@ -179,11 +213,15 @@ impl Client {
     {
         self.globals
             .bind::<I, State, ()>(&self.queue.handle(), versions, ())
-            .map_err(|e| Error::Unsupported(format!("compositor lacks {}: {e}", I::interface().name)))
+            .map_err(|e| {
+                Error::Unsupported(format!("compositor lacks {}: {e}", I::interface().name))
+            })
     }
 
     fn roundtrip(&mut self) -> Result<()> {
-        self.queue.roundtrip(&mut self.state).map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
+        self.queue
+            .roundtrip(&mut self.state)
+            .map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
         Ok(())
     }
 }
@@ -199,7 +237,9 @@ pub fn screenshot(socket: &Path) -> Result<Frame> {
     let deadline = Instant::now() + FRAME_TIMEOUT;
     while c.state.buffer.is_none() || (frame.version() >= 3 && !c.state.buffer_done) {
         if c.state.outcome == Some(false) || Instant::now() > deadline {
-            return Err(Error::Protocol("screencopy offered no shared-memory buffer".into()));
+            return Err(Error::Protocol(
+                "screencopy offered no shared-memory buffer".into(),
+            ));
         }
         c.roundtrip()?;
     }
@@ -209,13 +249,23 @@ pub fn screenshot(socket: &Path) -> Result<Frame> {
         .map_err(|e| Error::Io(e.into()))?;
     rustix::fs::ftruncate(&fd, size as u64).map_err(|e| Error::Io(e.into()))?;
     let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, ());
-    let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, format, &qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        width as i32,
+        height as i32,
+        stride as i32,
+        format,
+        &qh,
+        (),
+    );
     frame.copy(&buffer);
     while c.state.outcome.is_none() {
         if Instant::now() > deadline {
             return Err(Error::Timeout("screencopy frame".into()));
         }
-        c.queue.blocking_dispatch(&mut c.state).map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
+        c.queue
+            .blocking_dispatch(&mut c.state)
+            .map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
     }
     frame.destroy();
     buffer.destroy();
@@ -228,7 +278,14 @@ pub fn screenshot(socket: &Path) -> Result<Frame> {
     to_rgba(&raw, format, width, height, stride, c.state.flags_y_invert)
 }
 
-fn to_rgba(raw: &[u8], format: wl_shm::Format, width: u32, height: u32, stride: u32, y_invert: bool) -> Result<Frame> {
+fn to_rgba(
+    raw: &[u8],
+    format: wl_shm::Format,
+    width: u32,
+    height: u32,
+    stride: u32,
+    y_invert: bool,
+) -> Result<Frame> {
     // Little-endian 32-bit formats: [A|X]RGB8888 is B,G,R,A in memory; [A|X]BGR8888 is R,G,B,A.
     let bgr = match format {
         wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => true,
@@ -239,11 +296,19 @@ fn to_rgba(raw: &[u8], format: wl_shm::Format, width: u32, height: u32, stride: 
     for row in 0..height {
         let src = if y_invert { height - 1 - row } else { row } as usize * stride as usize;
         for px in raw[src..src + width as usize * 4].as_chunks::<4>().0 {
-            let (r, g, b) = if bgr { (px[2], px[1], px[0]) } else { (px[0], px[1], px[2]) };
+            let (r, g, b) = if bgr {
+                (px[2], px[1], px[0])
+            } else {
+                (px[0], px[1], px[2])
+            };
             rgba.extend_from_slice(&[r, g, b, 255]);
         }
     }
-    Ok(Frame { width, height, rgba })
+    Ok(Frame {
+        width,
+        height,
+        rgba,
+    })
 }
 
 /// A virtual pointer and keyboard held for the life of a session, so the
@@ -268,13 +333,23 @@ impl InputDevice {
         let mut c = Client::connect(socket)?;
         let qh = c.queue.handle();
         let seat: wl_seat::WlSeat = c.bind(1..=7)?;
-        let pointer = c.bind::<ZwlrVirtualPointerManagerV1>(1..=2)?.create_virtual_pointer(Some(&seat), &qh, ());
-        let keyboard = c.bind::<ZwpVirtualKeyboardManagerV1>(1..=1)?.create_virtual_keyboard(&seat, &qh, ());
+        let pointer = c
+            .bind::<ZwlrVirtualPointerManagerV1>(1..=2)?
+            .create_virtual_pointer(Some(&seat), &qh, ());
+        let keyboard = c
+            .bind::<ZwpVirtualKeyboardManagerV1>(1..=1)?
+            .create_virtual_keyboard(&seat, &qh, ());
         upload_keymap(&keyboard, &[(1, "Escape".to_string())])?;
         c.roundtrip()?;
         // Give clients a moment to bind the seat's new keyboard and pointer.
         std::thread::sleep(Duration::from_millis(300));
-        Ok(Self { c, pointer, keyboard, size, started: Instant::now() })
+        Ok(Self {
+            c,
+            pointer,
+            keyboard,
+            size,
+            started: Instant::now(),
+        })
     }
 
     fn now(&self) -> u32 {
@@ -282,7 +357,10 @@ impl InputDevice {
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.c.conn.flush().map_err(|e| Error::Protocol(format!("wayland: {e}")))
+        self.c
+            .conn
+            .flush()
+            .map_err(|e| Error::Protocol(format!("wayland: {e}")))
     }
 
     fn tap(&mut self, evdev: u32) -> Result<()> {
@@ -300,9 +378,17 @@ impl InputDevice {
         let size = self.size;
         for step in steps {
             if let Input::Move { x, y } = step
-                && !(x.is_finite() && y.is_finite() && *x >= 0.0 && *y >= 0.0 && *x < size.0 as f64 && *y < size.1 as f64)
+                && !(x.is_finite()
+                    && y.is_finite()
+                    && *x >= 0.0
+                    && *y >= 0.0
+                    && *x < size.0 as f64
+                    && *y < size.1 as f64)
             {
-                return Err(Error::InvalidInput(format!("point ({x}, {y}) is outside the {}x{} desktop", size.0, size.1)));
+                return Err(Error::InvalidInput(format!(
+                    "point ({x}, {y}) is outside the {}x{} desktop",
+                    size.0, size.1
+                )));
             }
             if let Input::Key(chord) = step {
                 parse_chord(chord)?;
@@ -311,12 +397,17 @@ impl InputDevice {
         for step in steps {
             match step {
                 Input::Move { x, y } => {
-                    self.pointer.motion_absolute(self.now(), *x as u32, *y as u32, size.0, size.1);
+                    self.pointer
+                        .motion_absolute(self.now(), *x as u32, *y as u32, size.0, size.1);
                     self.pointer.frame();
                 }
                 Input::Button { button, pressed } => {
                     use wayland_client::protocol::wl_pointer::ButtonState;
-                    let state = if *pressed { ButtonState::Pressed } else { ButtonState::Released };
+                    let state = if *pressed {
+                        ButtonState::Pressed
+                    } else {
+                        ButtonState::Released
+                    };
                     self.pointer.button(self.now(), button.code(), state);
                     self.pointer.frame();
                 }
@@ -325,7 +416,8 @@ impl InputDevice {
                     self.pointer.axis_source(AxisSource::Wheel);
                     for (axis, n) in [(Axis::VerticalScroll, *dy), (Axis::HorizontalScroll, *dx)] {
                         if n != 0 {
-                            self.pointer.axis_discrete(self.now(), axis, 15.0 * n as f64, n);
+                            self.pointer
+                                .axis_discrete(self.now(), axis, 15.0 * n as f64, n);
                         }
                     }
                     self.pointer.frame();
@@ -350,7 +442,9 @@ impl InputDevice {
                                 None => {
                                     let c = match named_code(&s) {
                                         Some(c) => c,
-                                        None => *next.next().expect("chunk fits the character codes"),
+                                        None => {
+                                            *next.next().expect("chunk fits the character codes")
+                                        }
                                     };
                                     map.push((c, s));
                                     c
@@ -395,7 +489,8 @@ fn keysym_chunks(text: &str) -> Vec<Vec<String>> {
 /// Upload a keymap in which each evdev code produces its keysym.
 fn upload_keymap(kb: &ZwpVirtualKeyboardV1, keysyms: &[(u32, String)]) -> Result<()> {
     let text = keymap_text(keysyms);
-    let fd = rustix::fs::memfd_create("keymap", rustix::fs::MemfdFlags::CLOEXEC).map_err(|e| Error::Io(e.into()))?;
+    let fd = rustix::fs::memfd_create("keymap", rustix::fs::MemfdFlags::CLOEXEC)
+        .map_err(|e| Error::Io(e.into()))?;
     let file = std::fs::File::from(fd);
     file.write_all_at(text.as_bytes(), 0)?;
     file.write_all_at(&[0], text.len() as u64)?;
@@ -457,7 +552,10 @@ fn char_keysym(c: char) -> String {
 /// Parse `ctrl+shift+t` into a modifier mask and one keysym name.
 fn parse_chord(chord: &str) -> Result<(u32, String)> {
     let parts: Vec<&str> = chord.split('+').map(str::trim).collect();
-    let (key, mods) = parts.split_last().filter(|(k, _)| !k.is_empty()).ok_or_else(|| Error::InvalidInput("empty key chord".into()))?;
+    let (key, mods) = parts
+        .split_last()
+        .filter(|(k, _)| !k.is_empty())
+        .ok_or_else(|| Error::InvalidInput("empty key chord".into()))?;
     let mut mask = 0;
     for m in mods {
         mask |= match m.to_ascii_lowercase().as_str() {
@@ -485,10 +583,18 @@ fn parse_chord(chord: &str) -> Result<(u32, String)> {
         "pagedown" => "Next".into(),
         _ if key.chars().count() == 1 => {
             let c = key.chars().next().expect("one char");
-            if c.is_ascii_alphanumeric() { c.to_ascii_lowercase().to_string() } else { char_keysym(c) }
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase().to_string()
+            } else {
+                char_keysym(c)
+            }
         }
         _ if key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => key.to_string(),
-        _ => return Err(Error::InvalidInput(format!("key {key:?} is not a keysym name"))),
+        _ => {
+            return Err(Error::InvalidInput(format!(
+                "key {key:?} is not a keysym name"
+            )));
+        }
     };
     Ok((mask, name))
 }
@@ -508,7 +614,10 @@ mod tests {
         assert_eq!(parse_chord("/").unwrap(), (0, "U002F".into()));
         assert!(parse_chord("hyper+x").is_err());
         assert!(parse_chord("").is_err());
-        assert!(parse_chord("a ] }; key <X> { [ b").is_err(), "no keymap injection");
+        assert!(
+            parse_chord("a ] }; key <X> { [ b").is_err(),
+            "no keymap injection"
+        );
     }
 
     #[test]
@@ -544,10 +653,16 @@ mod tests {
 
     #[test]
     fn long_text_splits_into_chunks_within_the_keymap_budget() {
-        let text: String = (0..500u32).filter_map(|i| char::from_u32(0x4e00 + i)).collect();
+        let text: String = (0..500u32)
+            .filter_map(|i| char::from_u32(0x4e00 + i))
+            .collect();
         let chunks = keysym_chunks(&text);
         assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 500);
-        assert!(chunks.iter().all(|c| c.iter().collect::<std::collections::HashSet<_>>().len() <= KEYMAP_SLOTS));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.iter().collect::<std::collections::HashSet<_>>().len() <= KEYMAP_SLOTS)
+        );
         assert_eq!(keysym_chunks("aab").len(), 1);
     }
 }

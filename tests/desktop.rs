@@ -7,7 +7,8 @@
 use std::time::Duration;
 
 use agent_workstation::{
-    BrowserConfig, Button, DesktopSession, Error, Profile, Secret, SecretResolver, SessionConfig, TakeoverConfig,
+    BrowserConfig, Button, DesktopSession, Error, Profile, Secret, SecretResolver, SessionConfig,
+    TakeoverConfig,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -56,9 +57,14 @@ async fn serve_fixture() -> String {
     format!("http://{addr}/")
 }
 
-fn config(profile_dir: &std::path::Path, runtime: &std::path::Path, takeover: bool) -> SessionConfig {
-    let mut browser =
-        BrowserConfig::new(std::env::var("AGENT_WORKSTATION_BROWSER").unwrap_or_else(|_| "/usr/bin/chromium".into()));
+fn config(
+    profile_dir: &std::path::Path,
+    runtime: &std::path::Path,
+    takeover: bool,
+) -> SessionConfig {
+    let mut browser = BrowserConfig::new(
+        std::env::var("AGENT_WORKSTATION_BROWSER").unwrap_or_else(|_| "/usr/bin/chromium".into()),
+    );
     if let Ok(extra) = std::env::var("AGENT_WORKSTATION_BROWSER_ARGS") {
         browser.extra_args = extra.split_whitespace().map(String::from).collect();
     }
@@ -86,7 +92,9 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     let fp_before = std::fs::read(profile.path().join("fingerprint.json")).unwrap();
     let rt = tempfile::tempdir().unwrap();
 
-    let s = DesktopSession::start(config(profile.path(), &rt.path().join("a"), false)).await.expect("session starts");
+    let s = DesktopSession::start(config(profile.path(), &rt.path().join("a"), false))
+        .await
+        .expect("session starts");
     assert_eq!(s.size(), (1280, 800));
     assert_eq!(s.fingerprint().seed, 42);
 
@@ -95,37 +103,86 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     let snap = s.snapshot().await.unwrap();
     assert!(snap.text.contains("heading \"Sign in\""), "{}", snap.text);
     let line_ref = |name: &str| -> String {
-        let line = snap.text.lines().find(|l| l.contains(name)).unwrap_or_else(|| panic!("{name} in {}", snap.text));
-        line.rsplit("[@").next().unwrap().trim_end_matches(']').to_string()
+        let line = snap
+            .text
+            .lines()
+            .find(|l| l.contains(name))
+            .unwrap_or_else(|| panic!("{name} in {}", snap.text));
+        line.rsplit("[@")
+            .next()
+            .unwrap()
+            .trim_end_matches(']')
+            .to_string()
     };
-    let (email, pw, go) = (line_ref("textbox \"Email\""), line_ref("textbox \"Password\""), line_ref("button \"Continue\""));
+    let (email, pw, go) = (
+        line_ref("textbox \"Email\""),
+        line_ref("textbox \"Password\""),
+        line_ref("button \"Continue\""),
+    );
     s.fill(&email, "person@example.com").await.unwrap();
-    s.fill_secret(&pw, "vault/item/password", &FixedResolver, Some(url.trim_end_matches('/'))).await.unwrap();
-    let refused = s.fill_secret(&pw, "vault/item/password", &FixedResolver, Some("https://example.net")).await.unwrap_err();
+    s.fill_secret(
+        &pw,
+        "vault/item/password",
+        &FixedResolver,
+        Some(url.trim_end_matches('/')),
+    )
+    .await
+    .unwrap();
+    let refused = s
+        .fill_secret(
+            &pw,
+            "vault/item/password",
+            &FixedResolver,
+            Some("https://example.net"),
+        )
+        .await
+        .unwrap_err();
     assert_eq!(refused.code(), "refused");
     s.click(&go).await.unwrap();
     let text = s.read().await.unwrap();
-    assert!(text.contains(&format!("clicked:person@example.com:{}", SECRET.len())), "{text}");
+    assert!(
+        text.contains(&format!("clicked:person@example.com:{}", SECRET.len())),
+        "{text}"
+    );
     assert!(!text.contains(SECRET) && !s.snapshot().await.unwrap().text.contains(SECRET));
 
     // Desktop operations on the same window: click the email field by its
     // on-screen position and type through the virtual keyboard.
     let frame = s.screenshot().await.unwrap();
     assert_eq!((frame.width, frame.height), (1280, 800));
-    assert!(frame.rgba.as_chunks::<4>().0.iter().any(|p| p[..3] != frame.rgba[..3]), "desktop is not blank");
+    assert!(
+        frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|p| p[..3] != frame.rgba[..3]),
+        "desktop is not blank"
+    );
     s.snapshot().await.unwrap();
     s.key("ctrl+l").await.unwrap();
     s.type_text(&format!("{url}?typed=1\n")).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     if let Ok(dir) = std::env::var("AGENT_WORKSTATION_DEBUG_DIR") {
-        std::fs::write(format!("{dir}/after-typing.png"), s.screenshot().await.unwrap().to_png().unwrap()).unwrap();
+        std::fs::write(
+            format!("{dir}/after-typing.png"),
+            s.screenshot().await.unwrap().to_png().unwrap(),
+        )
+        .unwrap();
     }
-    assert!(s.current_url().await.unwrap().ends_with("?typed=1"), "URL bar typing reached the browser chrome");
+    assert!(
+        s.current_url().await.unwrap().ends_with("?typed=1"),
+        "URL bar typing reached the browser chrome"
+    );
     s.click_at(640.0, 400.0, Button::Left).await.unwrap();
 
     // Human control suspends every agent call and resumes on release.
     s.gate().take(Some("tester".into()));
-    for err in [s.navigate(&url).await.unwrap_err(), s.screenshot().await.unwrap_err(), s.key("a").await.unwrap_err()] {
+    for err in [
+        s.navigate(&url).await.unwrap_err(),
+        s.screenshot().await.unwrap_err(),
+        s.key("a").await.unwrap_err(),
+    ] {
         assert!(matches!(err, Error::HumanInControl { .. }), "{err}");
     }
     assert!(s.gate().release(Some("done".into())));
@@ -140,9 +197,33 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
 
     // Same profile, new session: the cookie set before survives; the
     // fingerprint file is untouched.
-    let s = DesktopSession::start(config(profile.path(), &rt.path().join("b"), false)).await.expect("second session");
+    let s = DesktopSession::start(config(profile.path(), &rt.path().join("b"), true))
+        .await
+        .expect("second session");
     s.navigate(&url).await.unwrap();
     assert!(s.read().await.unwrap().contains("cookie=kept=yes"));
-    assert_eq!(std::fs::read(profile.path().join("fingerprint.json")).unwrap(), fp_before);
+    // The takeover page is served and guarded by its token.
+    let page = s.takeover_url().expect("takeover enabled");
+    let addr = page.socket_addrs(|| None).unwrap()[0];
+    let get = |path: String| async move {
+        let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tcp.write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut out = String::new();
+        tcp.read_to_string(&mut out).await.unwrap();
+        out
+    };
+    let token = s.takeover_url().unwrap().query().unwrap().to_string();
+    assert!(get(format!("/?{token}")).await.starts_with("HTTP/1.1 200"));
+    assert!(get("/".into()).await.starts_with("HTTP/1.1 401"));
+    let takeover = s.takeover_url().expect("takeover enabled");
+    assert!(takeover.query().unwrap_or_default().starts_with("token="));
+    assert_eq!(
+        std::fs::read(profile.path().join("fingerprint.json")).unwrap(),
+        fp_before
+    );
     s.shutdown().await;
 }

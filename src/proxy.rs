@@ -36,12 +36,17 @@ impl std::fmt::Debug for Proxy {
 impl Proxy {
     /// Parse `http://[user:pass@]host:port` or `socks5://[user:pass@]host:port`.
     pub fn parse(url: &str) -> Result<Self> {
-        let url = url::Url::parse(url).map_err(|e| Error::InvalidInput(format!("proxy URL: {e}")))?;
+        let url =
+            url::Url::parse(url).map_err(|e| Error::InvalidInput(format!("proxy URL: {e}")))?;
         if !matches!(url.scheme(), "http" | "socks5") {
-            return Err(Error::InvalidInput("proxy scheme must be http or socks5".into()));
+            return Err(Error::InvalidInput(
+                "proxy scheme must be http or socks5".into(),
+            ));
         }
         if url.host_str().is_none() || url.port_or_known_default().is_none() {
-            return Err(Error::InvalidInput("proxy URL needs a host and port".into()));
+            return Err(Error::InvalidInput(
+                "proxy URL needs a host and port".into(),
+            ));
         }
         Ok(Self { url })
     }
@@ -53,7 +58,11 @@ impl Proxy {
     }
 
     fn upstream(&self) -> String {
-        format!("{}:{}", self.url.host_str().unwrap_or_default(), self.url.port_or_known_default().unwrap_or(0))
+        format!(
+            "{}:{}",
+            self.url.host_str().unwrap_or_default(),
+            self.url.port_or_known_default().unwrap_or(0)
+        )
     }
 
     /// Start whatever the browser needs: nothing for an unauthenticated
@@ -62,7 +71,10 @@ impl Proxy {
         let Some((user, pass)) = self.credentials() else {
             let mut u = self.url.clone();
             u.set_path("");
-            return Ok(ProxyEndpoint { browser_url: u.as_str().trim_end_matches('/').to_string(), relay: None });
+            return Ok(ProxyEndpoint {
+                browser_url: u.as_str().trim_end_matches('/').to_string(),
+                relay: None,
+            });
         };
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let local: SocketAddr = listener.local_addr()?;
@@ -74,7 +86,8 @@ impl Proxy {
         );
         let relay = tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
-                let (upstream, header, user, pass) = (upstream.clone(), header.clone(), user.clone(), pass.clone());
+                let (upstream, header, user, pass) =
+                    (upstream.clone(), header.clone(), user.clone(), pass.clone());
                 tokio::spawn(async move {
                     let r = if socks {
                         relay_socks(client, &upstream, &user, &pass).await
@@ -88,7 +101,10 @@ impl Proxy {
             }
         });
         let scheme = if socks { "socks5" } else { "http" };
-        Ok(ProxyEndpoint { browser_url: format!("{scheme}://{local}"), relay: Some(relay) })
+        Ok(ProxyEndpoint {
+            browser_url: format!("{scheme}://{local}"),
+            relay: Some(relay),
+        })
     }
 }
 
@@ -112,7 +128,9 @@ impl Drop for ProxyEndpoint {
 /// splice. Plain (non-CONNECT) requests are sent with `Connection: close` so
 /// every request head passes through here on its own connection.
 async fn relay_http(mut client: TcpStream, upstream: &str, header: &str) -> Result<()> {
-    let Some(head) = read_head(&mut client).await? else { return Ok(()) };
+    let Some(head) = read_head(&mut client).await? else {
+        return Ok(());
+    };
     let line_end = head
         .windows(2)
         .position(|w| w == b"\r\n")
@@ -137,7 +155,11 @@ async fn relay_http(mut client: TcpStream, upstream: &str, header: &str) -> Resu
 
 fn strip_header<'a>(rest: &'a [u8], name: &'a [u8]) -> impl Iterator<Item = u8> + 'a {
     rest.split_inclusive(|b| *b == b'\n')
-        .filter(move |line| !(line.len() > name.len() && line[..name.len()].eq_ignore_ascii_case(name) && line[name.len()] == b':'))
+        .filter(move |line| {
+            !(line.len() > name.len()
+                && line[..name.len()].eq_ignore_ascii_case(name)
+                && line[name.len()] == b':')
+        })
         .flatten()
         .copied()
 }
@@ -147,7 +169,11 @@ async fn read_head(s: &mut TcpStream) -> Result<Option<Vec<u8>>> {
     let mut byte = [0u8; 1];
     while !buf.ends_with(b"\r\n\r\n") {
         if s.read(&mut byte).await? == 0 {
-            return if buf.is_empty() { Ok(None) } else { Err(Error::Protocol("truncated request head".into())) };
+            return if buf.is_empty() {
+                Ok(None)
+            } else {
+                Err(Error::Protocol("truncated request head".into()))
+            };
         }
         buf.push(byte[0]);
         if buf.len() > MAX_HEAD {
@@ -174,10 +200,14 @@ async fn relay_socks(mut client: TcpStream, upstream: &str, user: &str, pass: &s
     let mut sel = [0u8; 2];
     up.read_exact(&mut sel).await?;
     if sel != [5, 2] {
-        return Err(Error::Refused("upstream SOCKS5 proxy refused username/password".into()));
+        return Err(Error::Refused(
+            "upstream SOCKS5 proxy refused username/password".into(),
+        ));
     }
     if user.len() > 255 || pass.len() > 255 {
-        return Err(Error::InvalidInput("SOCKS5 credentials longer than 255 bytes".into()));
+        return Err(Error::InvalidInput(
+            "SOCKS5 credentials longer than 255 bytes".into(),
+        ));
     }
     let mut auth = vec![1, user.len() as u8];
     auth.extend_from_slice(user.as_bytes());
@@ -187,7 +217,9 @@ async fn relay_socks(mut client: TcpStream, upstream: &str, user: &str, pass: &s
     let mut ok = [0u8; 2];
     up.read_exact(&mut ok).await?;
     if ok[1] != 0 {
-        return Err(Error::Refused("upstream SOCKS5 proxy rejected the credentials".into()));
+        return Err(Error::Refused(
+            "upstream SOCKS5 proxy rejected the credentials".into(),
+        ));
     }
     tokio::io::copy_bidirectional(&mut client, &mut up).await?;
     Ok(())
@@ -227,7 +259,11 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_proxy_is_passed_through() {
-        let e = Proxy::parse("socks5://127.0.0.1:1080").unwrap().start().await.unwrap();
+        let e = Proxy::parse("socks5://127.0.0.1:1080")
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
         assert_eq!(e.browser_url, "socks5://127.0.0.1:1080");
     }
 
@@ -238,7 +274,9 @@ mod tests {
         let seen = tokio::spawn(async move {
             let (mut s, _) = upstream.accept().await.unwrap();
             let head = read_head(&mut s).await.unwrap().unwrap();
-            s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.unwrap();
+            s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await
+                .unwrap();
             String::from_utf8(head).unwrap()
         });
         let p = Proxy::parse(&format!("http://u:pw@{addr}")).unwrap();
@@ -249,7 +287,9 @@ mod tests {
         let mut reply = [0u8; 12];
         c.read_exact(&mut reply).await.unwrap();
         let head = seen.await.unwrap();
-        assert!(head.starts_with("CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dTpwdw==\r\n"));
+        assert!(head.starts_with(
+            "CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dTpwdw==\r\n"
+        ));
         assert!(!head.contains("Zm9vOmJhcg=="));
         assert_eq!(&reply, b"HTTP/1.1 200");
     }
@@ -272,8 +312,14 @@ mod tests {
             s.read_exact(&mut payload).await.unwrap();
             payload
         });
-        let ep = Proxy::parse(&format!("socks5://u:pwd@{addr}")).unwrap().start().await.unwrap();
-        let mut c = TcpStream::connect(ep.browser_url.trim_start_matches("socks5://")).await.unwrap();
+        let ep = Proxy::parse(&format!("socks5://u:pwd@{addr}"))
+            .unwrap()
+            .start()
+            .await
+            .unwrap();
+        let mut c = TcpStream::connect(ep.browser_url.trim_start_matches("socks5://"))
+            .await
+            .unwrap();
         c.write_all(&[5, 1, 0]).await.unwrap();
         let mut sel = [0u8; 2];
         c.read_exact(&mut sel).await.unwrap();

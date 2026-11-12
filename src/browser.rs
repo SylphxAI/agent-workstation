@@ -39,11 +39,21 @@ pub struct BrowserConfig {
 impl BrowserConfig {
     /// A config for `binary` with no seed flag and no extra arguments.
     pub fn new(binary: impl Into<PathBuf>) -> Self {
-        Self { binary: binary.into(), seed_flag: None, extra_args: Vec::new() }
+        Self {
+            binary: binary.into(),
+            seed_flag: None,
+            extra_args: Vec::new(),
+        }
     }
 
     /// Command-line arguments (exposed for inspection).
-    pub fn args(&self, user_data_dir: &Path, fp: &Fingerprint, proxy_url: Option<&str>, start_url: &str) -> Vec<String> {
+    pub fn args(
+        &self,
+        user_data_dir: &Path,
+        fp: &Fingerprint,
+        proxy_url: Option<&str>,
+        start_url: &str,
+    ) -> Vec<String> {
         let mut a = vec![
             "--ozone-platform=wayland".to_string(),
             format!("--user-data-dir={}", user_data_dir.display()),
@@ -55,7 +65,10 @@ impl BrowserConfig {
             "--disable-blink-features=AutomationControlled".into(),
             "--start-maximized".into(),
             format!("--accept-lang={}", fp.accept_language()),
-            format!("--lang={}", fp.languages.first().map(String::as_str).unwrap_or("en-US")),
+            format!(
+                "--lang={}",
+                fp.languages.first().map(String::as_str).unwrap_or("en-US")
+            ),
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
         ];
         if let Some(flag) = &self.seed_flag {
@@ -108,16 +121,25 @@ impl Browser {
             .kill_on_drop(true)
             .process_group(0)
             .spawn()
-            .map_err(|e| Error::Process(format!("cannot start {}: {e}", config.binary.display())))?;
+            .map_err(|e| {
+                Error::Process(format!("cannot start {}: {e}", config.binary.display()))
+            })?;
         let deadline = Instant::now() + LAUNCH_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait()? {
-                return Err(Error::Process(format!("browser exited during start-up: {status}")));
+                return Err(Error::Process(format!(
+                    "browser exited during start-up: {status}"
+                )));
             }
             if let Some((port, path)) = read_port_file(&port_file)
-                && tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+                && tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_ok()
             {
-                return Ok(Self { child, endpoint: format!("ws://127.0.0.1:{port}{path}") });
+                return Ok(Self {
+                    child,
+                    endpoint: format!("ws://127.0.0.1:{port}{path}"),
+                });
             }
             if Instant::now() >= deadline {
                 let _ = child.kill().await;
@@ -140,9 +162,14 @@ impl Browser {
     /// Close gracefully (flushing the profile), then kill after a grace period.
     pub async fn shutdown(mut self) {
         if let Ok(mut cdp) = Cdp::connect(&self.endpoint).await {
-            let _ = tokio::time::timeout(Duration::from_secs(3), cdp.call("Browser.close", json!({}))).await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(3), cdp.call("Browser.close", json!({})))
+                    .await;
         }
-        if tokio::time::timeout(Duration::from_secs(5), self.child.wait()).await.is_err() {
+        if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+            .await
+            .is_err()
+        {
             let _ = self.child.kill().await;
         }
     }
@@ -181,10 +208,38 @@ pub struct Snapshot {
 }
 
 const INTERACTIVE: &[&str] = &[
-    "button", "link", "textbox", "searchbox", "checkbox", "radio", "combobox", "listbox", "option",
-    "menuitem", "menuitemcheckbox", "menuitemradio", "tab", "switch", "slider", "spinbutton", "treeitem",
+    "button",
+    "link",
+    "textbox",
+    "searchbox",
+    "checkbox",
+    "radio",
+    "combobox",
+    "listbox",
+    "option",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "tab",
+    "switch",
+    "slider",
+    "spinbutton",
+    "treeitem",
 ];
-const STRUCTURAL: &[&str] = &["heading", "img", "dialog", "alert", "table", "row", "cell", "list", "listitem", "navigation", "main", "form"];
+const STRUCTURAL: &[&str] = &[
+    "heading",
+    "img",
+    "dialog",
+    "alert",
+    "table",
+    "row",
+    "cell",
+    "list",
+    "listitem",
+    "navigation",
+    "main",
+    "form",
+];
 
 /// Web operations over one DevTools connection.
 #[derive(Debug)]
@@ -197,8 +252,17 @@ pub struct Web {
 impl Web {
     /// Connect to the browser endpoint and attach to its first tab.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let mut web = Self { cdp: Cdp::connect(endpoint).await?, active: None, refs: HashMap::new() };
-        let first = web.cdp.pages().await?.into_iter().find_map(|t| t["targetId"].as_str().map(String::from));
+        let mut web = Self {
+            cdp: Cdp::connect(endpoint).await?,
+            active: None,
+            refs: HashMap::new(),
+        };
+        let first = web
+            .cdp
+            .pages()
+            .await?
+            .into_iter()
+            .find_map(|t| t["targetId"].as_str().map(String::from));
         match first {
             Some(id) => web.select_tab(&id).await?,
             None => {
@@ -230,15 +294,21 @@ impl Web {
     /// Open a tab at `url` and make it active.
     pub async fn new_tab(&mut self, url: &str) -> Result<String> {
         check_url(url)?;
-        let r = self.browser_call("Target.createTarget", json!({ "url": url })).await?;
-        let id = r["targetId"].as_str().ok_or_else(|| Error::Protocol("createTarget returned no id".into()))?.to_string();
+        let r = self
+            .browser_call("Target.createTarget", json!({ "url": url }))
+            .await?;
+        let id = r["targetId"]
+            .as_str()
+            .ok_or_else(|| Error::Protocol("createTarget returned no id".into()))?
+            .to_string();
         self.select_tab(&id).await?;
         Ok(id)
     }
 
     /// Make `id` the active tab (brought to front on the desktop too).
     pub async fn select_tab(&mut self, id: &str) -> Result<()> {
-        self.browser_call("Target.activateTarget", json!({ "targetId": id })).await?;
+        self.browser_call("Target.activateTarget", json!({ "targetId": id }))
+            .await?;
         self.cdp.attach(id).await?;
         self.active = Some(id.to_string());
         self.refs.clear();
@@ -250,11 +320,17 @@ impl Web {
 
     /// Close tab `id`; the first remaining tab becomes active.
     pub async fn close_tab(&mut self, id: &str) -> Result<()> {
-        self.browser_call("Target.closeTarget", json!({ "targetId": id })).await?;
+        self.browser_call("Target.closeTarget", json!({ "targetId": id }))
+            .await?;
         if self.active.as_deref() == Some(id) {
             self.cdp.detach();
             self.active = None;
-            let next = self.cdp.pages().await?.into_iter().find_map(|t| t["targetId"].as_str().map(String::from));
+            let next = self
+                .cdp
+                .pages()
+                .await?
+                .into_iter()
+                .find_map(|t| t["targetId"].as_str().map(String::from));
             match next {
                 Some(n) => self.select_tab(&n).await?,
                 None => {
@@ -269,7 +345,10 @@ impl Web {
     pub async fn navigate(&mut self, url: &str) -> Result<String> {
         check_url(url)?;
         self.refs.clear();
-        let r = self.cdp.call("Page.navigate", json!({ "url": url })).await?;
+        let r = self
+            .cdp
+            .call("Page.navigate", json!({ "url": url }))
+            .await?;
         if let Some(err) = r["errorText"].as_str().filter(|e| !e.is_empty()) {
             return Err(Error::Protocol(format!("navigation failed: {err}")));
         }
@@ -279,11 +358,22 @@ impl Web {
 
     /// History back (`-1`) or forward (`1`).
     pub async fn history(&mut self, delta: i64) -> Result<String> {
-        let h = self.cdp.call("Page.getNavigationHistory", json!({})).await?;
+        let h = self
+            .cdp
+            .call("Page.getNavigationHistory", json!({}))
+            .await?;
         let idx = h["currentIndex"].as_i64().unwrap_or(0) + delta;
-        let entry = h["entries"].get(idx as usize).filter(|_| idx >= 0).ok_or_else(|| Error::NotFound("no history entry".into()))?;
+        let entry = h["entries"]
+            .get(idx as usize)
+            .filter(|_| idx >= 0)
+            .ok_or_else(|| Error::NotFound("no history entry".into()))?;
         self.refs.clear();
-        self.cdp.call("Page.navigateToHistoryEntry", json!({ "entryId": entry["id"] })).await?;
+        self.cdp
+            .call(
+                "Page.navigateToHistoryEntry",
+                json!({ "entryId": entry["id"] }),
+            )
+            .await?;
         self.wait_loaded().await?;
         self.current_url().await
     }
@@ -298,9 +388,15 @@ impl Web {
 
     /// URL of the active tab.
     pub async fn current_url(&mut self) -> Result<String> {
-        let h = self.cdp.call("Page.getNavigationHistory", json!({})).await?;
+        let h = self
+            .cdp
+            .call("Page.getNavigationHistory", json!({}))
+            .await?;
         let i = h["currentIndex"].as_u64().unwrap_or(0) as usize;
-        Ok(h["entries"][i]["url"].as_str().unwrap_or_default().to_string())
+        Ok(h["entries"][i]["url"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// Visible text of the active tab (form field values are not included).
@@ -309,16 +405,26 @@ impl Web {
             .cdp
             .call("Runtime.evaluate", json!({ "expression": "document.body ? document.body.innerText : ''", "returnByValue": true }))
             .await?;
-        Ok(r["result"]["value"].as_str().unwrap_or_default().to_string())
+        Ok(r["result"]["value"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
     }
 
     /// Accessibility snapshot; refs stay valid until the next snapshot or navigation.
     pub async fn snapshot(&mut self) -> Result<Snapshot> {
-        let tree = self.cdp.call("Accessibility.getFullAXTree", json!({})).await?;
+        let tree = self
+            .cdp
+            .call("Accessibility.getFullAXTree", json!({}))
+            .await?;
         let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
         let (text, refs) = render_tree(&nodes);
         self.refs = refs;
-        Ok(Snapshot { url: self.current_url().await?, refs: self.refs.len(), text })
+        Ok(Snapshot {
+            url: self.current_url().await?,
+            refs: self.refs.len(),
+            text,
+        })
     }
 
     /// Click the element `reference` names.
@@ -326,7 +432,10 @@ impl Web {
         let (x, y) = self.center(reference).await?;
         for (kind, count) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 1)] {
             self.cdp
-                .call("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": count }))
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": count }),
+                )
                 .await?;
         }
         Ok(())
@@ -335,16 +444,25 @@ impl Web {
     /// Replace the value of the field `reference` names with `text`.
     pub async fn fill(&mut self, reference: &str, text: &str) -> Result<()> {
         self.focus_and_clear(reference).await?;
-        self.cdp.call("Input.insertText", json!({ "text": text })).await?;
+        self.cdp
+            .call("Input.insertText", json!({ "text": text }))
+            .await?;
         Ok(())
     }
 
     /// Fill with a secret only if the active tab's origin is `expect_origin`
     /// (when given). The value is never returned or logged.
-    pub async fn fill_secret(&mut self, reference: &str, secret: &crate::Secret, expect_origin: Option<&str>) -> Result<()> {
+    pub async fn fill_secret(
+        &mut self,
+        reference: &str,
+        secret: &crate::Secret,
+        expect_origin: Option<&str>,
+    ) -> Result<()> {
         if let Some(want) = expect_origin {
             let url = self.current_url().await?;
-            let have = url::Url::parse(&url).map(|u| u.origin().ascii_serialization()).unwrap_or_default();
+            let have = url::Url::parse(&url)
+                .map(|u| u.origin().ascii_serialization())
+                .unwrap_or_default();
             if have != want.trim_end_matches('/') {
                 return Err(Error::Refused(format!("page origin {have} is not {want}")));
             }
@@ -359,7 +477,9 @@ impl Web {
 
     async fn focus_and_clear(&mut self, reference: &str) -> Result<()> {
         let node = self.node(reference)?;
-        self.cdp.call("DOM.focus", json!({ "backendNodeId": node })).await?;
+        self.cdp
+            .call("DOM.focus", json!({ "backendNodeId": node }))
+            .await?;
         for (kind, key, code, vk, mods) in [
             ("keyDown", "a", "KeyA", 65, 2),
             ("keyUp", "a", "KeyA", 65, 2),
@@ -378,16 +498,34 @@ impl Web {
 
     fn node(&self, reference: &str) -> Result<i64> {
         let key = normalize_ref(reference);
-        self.refs.get(&key).copied().ok_or_else(|| Error::NotFound(format!("{reference} is not in the latest snapshot")))
+        self.refs
+            .get(&key)
+            .copied()
+            .ok_or_else(|| Error::NotFound(format!("{reference} is not in the latest snapshot")))
     }
 
     async fn center(&mut self, reference: &str) -> Result<(f64, f64)> {
         let node = self.node(reference)?;
-        let _ = self.cdp.call("DOM.scrollIntoViewIfNeeded", json!({ "backendNodeId": node })).await;
-        let q = self.cdp.call("DOM.getContentQuads", json!({ "backendNodeId": node })).await?;
-        let quad = q["quads"][0].as_array().filter(|a| a.len() == 8).ok_or_else(|| Error::NotFound(format!("{reference} is not visible")))?;
+        let _ = self
+            .cdp
+            .call(
+                "DOM.scrollIntoViewIfNeeded",
+                json!({ "backendNodeId": node }),
+            )
+            .await;
+        let q = self
+            .cdp
+            .call("DOM.getContentQuads", json!({ "backendNodeId": node }))
+            .await?;
+        let quad = q["quads"][0]
+            .as_array()
+            .filter(|a| a.len() == 8)
+            .ok_or_else(|| Error::NotFound(format!("{reference} is not visible")))?;
         let v: Vec<f64> = quad.iter().map(|n| n.as_f64().unwrap_or(0.0)).collect();
-        Ok(((v[0] + v[2] + v[4] + v[6]) / 4.0, (v[1] + v[3] + v[5] + v[7]) / 4.0))
+        Ok((
+            (v[0] + v[2] + v[4] + v[6]) / 4.0,
+            (v[1] + v[3] + v[5] + v[7]) / 4.0,
+        ))
     }
 
     async fn wait_loaded(&mut self) -> Result<()> {
@@ -395,7 +533,10 @@ impl Web {
         loop {
             let r = self
                 .cdp
-                .call("Runtime.evaluate", json!({ "expression": "document.readyState", "returnByValue": true }))
+                .call(
+                    "Runtime.evaluate",
+                    json!({ "expression": "document.readyState", "returnByValue": true }),
+                )
                 .await;
             if let Ok(v) = r
                 && v["result"]["value"] == "complete"
@@ -410,7 +551,9 @@ impl Web {
     }
 
     async fn browser_call(&mut self, method: &str, params: Value) -> Result<Value> {
-        self.cdp.call_in(None, method, params, crate::cdp::CALL_TIMEOUT).await
+        self.cdp
+            .call_in(None, method, params, crate::cdp::CALL_TIMEOUT)
+            .await
     }
 }
 
@@ -418,7 +561,9 @@ fn check_url(url: &str) -> Result<()> {
     let u = url::Url::parse(url).map_err(|e| Error::InvalidInput(format!("URL {url:?}: {e}")))?;
     match u.scheme() {
         "http" | "https" | "about" | "data" | "file" => Ok(()),
-        s => Err(Error::InvalidInput(format!("URL scheme {s:?} is not navigable"))),
+        s => Err(Error::InvalidInput(format!(
+            "URL scheme {s:?} is not navigable"
+        ))),
     }
 }
 
@@ -429,10 +574,15 @@ fn normalize_ref(r: &str) -> String {
 
 /// Render AX nodes as an outline; interactive nodes get refs to their DOM node.
 fn render_tree(nodes: &[Value]) -> (String, HashMap<String, i64>) {
-    let by_id: HashMap<&str, &Value> = nodes.iter().filter_map(|n| Some((n["nodeId"].as_str()?, n))).collect();
+    let by_id: HashMap<&str, &Value> = nodes
+        .iter()
+        .filter_map(|n| Some((n["nodeId"].as_str()?, n)))
+        .collect();
     let mut out = Vec::new();
     let mut refs = HashMap::new();
-    let Some(root) = nodes.first() else { return (String::new(), refs) };
+    let Some(root) = nodes.first() else {
+        return (String::new(), refs);
+    };
     let mut stack = vec![(root, 0usize)];
     while let Some((n, depth)) = stack.pop() {
         if out.len() >= MAX_SNAPSHOT_LINES {
@@ -443,7 +593,10 @@ fn render_tree(nodes: &[Value]) -> (String, HashMap<String, i64>) {
         let name = n["name"]["value"].as_str().unwrap_or("").trim();
         let ignored = n["ignored"].as_bool().unwrap_or(false);
         let interactive = INTERACTIVE.contains(&role);
-        let shown = !ignored && (interactive || STRUCTURAL.contains(&role) || (role == "StaticText" && !name.is_empty()));
+        let shown = !ignored
+            && (interactive
+                || STRUCTURAL.contains(&role)
+                || (role == "StaticText" && !name.is_empty()));
         let mut child_depth = depth;
         if shown {
             let mut line = format!("{}- {role}", "  ".repeat(depth));
@@ -480,7 +633,12 @@ mod tests {
         let fp = Fingerprint::generate("p", &FingerprintDefaults::default());
         let mut cfg = BrowserConfig::new("/usr/bin/chromium");
         cfg.seed_flag = Some("--fingerprint".into());
-        let a = cfg.args(Path::new("/profiles/p/user-data"), &fp, Some("http://127.0.0.1:9000"), "about:blank");
+        let a = cfg.args(
+            Path::new("/profiles/p/user-data"),
+            &fp,
+            Some("http://127.0.0.1:9000"),
+            "about:blank",
+        );
         assert!(a.contains(&"--ozone-platform=wayland".to_string()));
         assert!(a.contains(&format!("--fingerprint={}", fp.seed)));
         assert!(a.contains(&"--proxy-server=http://127.0.0.1:9000".to_string()));
@@ -500,7 +658,10 @@ mod tests {
         ]))
         .unwrap();
         let (text, refs) = render_tree(&nodes);
-        assert_eq!(text, "- heading \"Sign in\"\n- textbox \"Email\" [@e1]\n- button \"Continue\" [@e2]");
+        assert_eq!(
+            text,
+            "- heading \"Sign in\"\n- textbox \"Email\" [@e1]\n- button \"Continue\" [@e2]"
+        );
         assert_eq!(refs.get("e1"), Some(&41));
         assert_eq!(refs.get("e2"), Some(&42));
         assert_eq!(refs.len(), 2);
