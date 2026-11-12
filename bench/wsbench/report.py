@@ -19,7 +19,13 @@ def load(paths: list[str]) -> list[dict]:
     rows = []
     for p in paths:
         with open(p) as f:
-            rows += [json.loads(l) for l in f if l.strip()]
+            for n, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:  # truncated write (e.g. disk full); not scored
+                    print(f"warning: {p}:{n} unreadable, skipped", file=sys.stderr)
     return rows
 
 
