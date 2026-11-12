@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content">
+<meta name="referrer" content="no-referrer">
+<title>Desktop takeover</title>
+<link rel="stylesheet" href="app.css">
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header id="bar">
+  <span id="status" role="status">Connecting…</span>
+  <button id="take" class="primary" hidden>Take control</button>
+  <button id="handback" class="primary" hidden>Hand back</button>
+  <span class="tools">
+    <button id="kbd" class="needs-control" title="Keyboard" aria-label="Keyboard">⌨</button>
+    <button id="keys-btn" class="needs-control" title="Special keys">Keys</button>
+    <button id="paste" class="needs-control" title="Paste your clipboard into the desktop">Paste</button>
+    <button id="copy" disabled title="Copy the desktop clipboard">Copy</button>
+    <button id="fit" title="Switch between fit-to-window and actual size">1:1</button>
+    <button id="pan" hidden title="Drag to pan instead of sending input">Pan</button>
+  </span>
+</header>
+<div id="idle" role="alert" hidden></div>
+<nav id="keys" hidden>
+  <button data-key="XK_Escape">Esc</button>
+  <button data-key="XK_Tab">Tab</button>
+  <button data-mod="XK_Control_L">Ctrl</button>
+  <button data-mod="XK_Alt_L">Alt</button>
+  <button data-mod="XK_Shift_L">Shift</button>
+  <button data-key="XK_Left" aria-label="Left">←</button>
+  <button data-key="XK_Up" aria-label="Up">↑</button>
+  <button data-key="XK_Down" aria-label="Down">↓</button>
+  <button data-key="XK_Right" aria-label="Right">→</button>
+  <button data-key="XK_Home">Home</button>
+  <button data-key="XK_End">End</button>
+  <button data-key="XK_BackSpace" aria-label="Backspace">⌫</button>
+  <button data-key="XK_Return" aria-label="Enter">⏎</button>
+</nav>
+<main id="screen"></main>
+<textarea id="ime" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Type into the desktop"></textarea>
+<dialog id="note-dlg">
+  <form method="dialog">
+    <label for="note">Note for the agent (optional)</label>
+    <textarea id="note" maxlength="2000" rows="4"></textarea>
+    <menu><button value="cancel">Cancel</button><button value="ok" class="primary">Hand back</button></menu>
+  </form>
+</dialog>
+<dialog id="clip-dlg">
+  <form method="dialog">
+    <label for="clip" id="clip-label"></label>
+    <textarea id="clip" rows="6"></textarea>
+    <menu><button value="cancel">Close</button><button id="clip-send" value="ok" class="primary">Send</button></menu>
+  </form>
+</dialog>
+</body>
+</html>

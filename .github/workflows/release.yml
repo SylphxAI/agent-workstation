@@ -1,0 +1,45 @@
+name: release
+
+# Publishes the crate to crates.io when Cargo.toml's version is new on main,
+# then tags the commit. Uses the CARGO_REGISTRY_TOKEN Actions secret.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+      - name: Version not yet published
+        id: check
+        run: |
+          set -euo pipefail
+          v=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -A 'agent-workstation-release' "https://crates.io/api/v1/crates/agent-workstation/$v")
+          if [ "$code" = 200 ]; then echo "publish=false" >> "$GITHUB_OUTPUT"; else echo "publish=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Publish
+        if: steps.check.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+      - name: Tag
+        if: steps.check.outputs.publish == 'true'
+        env:
+          V: ${{ steps.check.outputs.version }}
+        run: |
+          git tag "v$V"
+          git push origin "v$V"
