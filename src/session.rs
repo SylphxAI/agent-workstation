@@ -287,7 +287,9 @@ impl DesktopSession {
 
     /// Fill a field with the secret `secret_ref` names, resolved by
     /// `resolver` at the moment of insertion. When `expect_origin` is given,
-    /// the fill is refused unless the active tab is on that origin.
+    /// the fill is refused unless the field's owning frame has that origin.
+    /// Validation and node-bound DOM insertion are synchronous; emitted
+    /// input/change events are not trusted keyboard events.
     pub async fn fill_secret(
         &self,
         reference: &str,
