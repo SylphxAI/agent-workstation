@@ -1,0 +1,21 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: #111; color: #eee; font: 14px/1.3 system-ui, sans-serif; }
+body { display: flex; flex-direction: column; height: 100dvh; overflow: hidden; }
+#bar, #keys { display: flex; align-items: center; gap: 6px; padding: 6px; background: #222; flex-wrap: wrap; }
+#status { flex: 1 1 12em; min-width: 0; }
+.tools { display: flex; gap: 6px; flex-wrap: wrap; }
+#keys { flex-wrap: nowrap; overflow-x: auto; border-top: 1px solid #333; }
+button { min-height: 40px; min-width: 40px; padding: 0 12px; border: 1px solid #555; border-radius: 6px;
+  background: #333; color: inherit; font: inherit; touch-action: manipulation; }
+button:disabled { opacity: .4; }
+button.primary { background: #2563eb; border-color: #2563eb; color: #fff; font-weight: 600; }
+button.on { background: #eab308; border-color: #eab308; color: #111; }
+#idle { padding: 8px; background: #b45309; color: #fff; text-align: center; font-weight: 600; }
+#screen { flex: 1; min-height: 0; position: relative; overflow: hidden; }
+#screen.view-only { cursor: not-allowed; }
+#ime { position: fixed; left: 0; bottom: 0; width: 1px; height: 1px; opacity: 0; font-size: 16px; border: 0; padding: 0; resize: none; }
+dialog { background: #222; color: inherit; border: 1px solid #555; border-radius: 8px; width: min(32rem, 92vw); }
+dialog label { display: block; margin-bottom: 6px; }
+dialog textarea { width: 100%; font: inherit; background: #111; color: inherit; border: 1px solid #555; border-radius: 6px; padding: 6px; }
+dialog menu { display: flex; justify-content: flex-end; gap: 6px; padding: 0; margin: 8px 0 0; }
+[hidden] { display: none !important; }
