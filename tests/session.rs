@@ -478,3 +478,76 @@ async fn one_agent_holds_a_desktop_and_close_waits_for_calls() {
     assert!(matches!(desk.lease("agent-c").unwrap_err(), Error::Closed));
     desk.close().await;
 }
+
+/// A login page whose form leads to a page without one, so the browser
+/// offers to save the password; the login sets a session cookie.
+async fn serve_login() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let (extra, body) = if buf[..n].starts_with(b"POST") {
+                    (
+                        "set-cookie: session=signed-in; Max-Age=86400; Path=/\r\n",
+                        "<!doctype html><title>Welcome</title><h1>Signed in</h1>",
+                    )
+                } else {
+                    (
+                        "",
+                        "<!doctype html><title>Login</title><form method=post action=/login>\
+                         <input name=email aria-label=Email><input name=password type=password \
+                         aria-label=Password><button>Go</button></form>\
+                         <p id=c></p><script>c.textContent = document.cookie</script>",
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}/")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_after_a_login_is_a_clean_exit_that_keeps_the_login() {
+    if !headful() {
+        return;
+    }
+    let url = serve_login().await;
+    let (profile, rt) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let desk = DesktopSession::start(config(profile.path(), &rt.path().join("a")))
+        .await
+        .unwrap();
+    let a = desk.lease("agent-a").unwrap();
+    a.navigate(&url).await.unwrap();
+    a.fill("input[name=email]", "person@example.com")
+        .await
+        .unwrap();
+    a.fill("input[name=password]", "pw-123456").await.unwrap();
+    a.press("Enter").await.unwrap();
+    expect_url(&a, &format!("{url}login")).await;
+    // The "Save password?" bubble is open now; closing must not crash.
+    desk.close().await;
+    let prefs: Value = serde_json::from_slice(
+        &std::fs::read(profile.path().join("user-data/Default/Preferences")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        prefs["profile"]["exit_type"], "Normal",
+        "{}",
+        prefs["profile"]
+    );
+    let desk = DesktopSession::start(config(profile.path(), &rt.path().join("b")))
+        .await
+        .unwrap();
+    let a = desk.lease("agent-a").unwrap();
+    a.navigate(&url).await.unwrap();
+    assert_eq!(a.eval("c.textContent").await.unwrap(), "session=signed-in");
+    desk.close().await;
+}

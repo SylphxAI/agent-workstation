@@ -170,8 +170,31 @@ impl Browser {
     }
 
     /// Close gracefully (flushing the profile), then kill after a grace period.
+    ///
+    /// Every tab is closed first, which ends the browser the way a person
+    /// closing its last window does. `Browser.close` is only the fallback:
+    /// Chromium crashes in it while a native bubble such as "Save password?"
+    /// is open, and a crash loses the cookies it had not written yet.
     pub async fn shutdown(mut self) {
         if let Ok(mut cdp) = Cdp::connect(&self.endpoint).await {
+            for page in cdp.pages().await.unwrap_or_default() {
+                if let Some(id) = page["targetId"].as_str() {
+                    let _ = cdp
+                        .call_in(
+                            None,
+                            "Target.closeTarget",
+                            json!({ "targetId": id }),
+                            Duration::from_secs(3),
+                        )
+                        .await;
+                }
+            }
+            if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+                .await
+                .is_ok()
+            {
+                return;
+            }
             let _ =
                 tokio::time::timeout(Duration::from_secs(3), cdp.call("Browser.close", json!({})))
                     .await;
