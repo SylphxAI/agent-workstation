@@ -2,7 +2,8 @@
 //!
 //! ```text
 //! agent-workstation --listen 127.0.0.1:7600 --state-dir /var/lib/agent-workstation \
-//!     --browser /usr/bin/chromium [--seed-flag --fingerprint] [--secret-command CMD [ARG...] --]
+//!     --browser /usr/bin/chromium [--seed-flag --fingerprint] [--browser-arg ARG]... \
+//!     [--secret-command CMD [ARG...] --]
 //! ```
 //!
 //! The bearer token comes from `AGENT_WORKSTATION_TOKEN` (required). With
@@ -45,6 +46,7 @@ struct Options {
 fn parse_args() -> Result<Options, String> {
     let mut args = std::env::args().skip(1);
     let (mut listen, mut state, mut browser, mut seed, mut secret) = (None, None, None, None, None);
+    let mut browser_args = Vec::new();
     while let Some(a) = args.next() {
         let mut val = || args.next().ok_or(format!("{a} needs a value"));
         match a.as_str() {
@@ -52,6 +54,7 @@ fn parse_args() -> Result<Options, String> {
             "--state-dir" => state = Some(PathBuf::from(val()?)),
             "--browser" => browser = Some(PathBuf::from(val()?)),
             "--seed-flag" => seed = Some(val()?),
+            "--browser-arg" => browser_args.push(val()?),
             "--secret-command" => {
                 let cmd: Vec<String> = args.by_ref().take_while(|x| x != "--").collect();
                 if cmd.is_empty() {
@@ -64,6 +67,7 @@ fn parse_args() -> Result<Options, String> {
     }
     let mut cfg = BrowserConfig::new(browser.ok_or("--browser is required")?);
     cfg.seed_flag = seed;
+    cfg.extra_args = browser_args;
     Ok(Options {
         listen: listen.unwrap_or_else(|| ([127, 0, 0, 1], 7600).into()),
         state_dir: state.ok_or("--state-dir is required")?,
