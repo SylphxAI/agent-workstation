@@ -76,7 +76,7 @@ async fn takeover_streams_a_headless_sway_desktop() {
     let takeover = Takeover::start(TakeoverConfig::default(), vnc, gate)
         .await
         .unwrap();
-    let addr = takeover.local_addr();
+    let addr = takeover.local_addr().unwrap();
     let url = takeover.url();
     let token = url
         .query_pairs()
