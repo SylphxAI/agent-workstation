@@ -9,7 +9,7 @@ repository = "https://github.com/SylphxAI/agent-workstation"
 readme = "README.md"
 keywords = ["agent", "browser", "wayland", "automation", "vnc"]
 categories = ["web-programming", "api-bindings", "development-tools::testing"]
-exclude = ["/bench", "/.github"]
+include = ["/src/**", "/assets/**", "/tests/**", "/LICENSE", "/README.md"]
 
 [workspace]
 # `bench/` is an independent tree; it may depend on this crate by path.

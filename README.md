@@ -84,6 +84,25 @@ sudo apt-get install sway wayvnc chromium
 <dir>/fingerprint.json  seed and launch-time identity, written once, read as-is
 ```
 
+## Releases
+
+Releases are manual: dispatch the `release` workflow on `main` and supply the
+exact version in `Cargo.toml`. Main pushes and tags never publish automatically.
+The workflow skips versions already on crates.io, rejects unexpected registry
+responses and existing tags for unpublished versions, publishes with a
+short-lived OIDC token, then creates the version tag. No static registry secret
+is used. If publishing succeeds but tagging fails, verify the published source
+before repairing the missing tag; redispatching skips an already published
+version rather than tagging a potentially different commit.
+
+Before dispatch, configure the GitHub environment `crates-io` to allow releases
+from `main`, and register the corresponding crates.io trusted publisher for
+this repository, workflow filename `release.yml`, and environment `crates-io`.
+Follow the [crates.io trusted publishing documentation](https://crates.io/docs/trusted-publishing)
+for first-publication setup; workflow authentication does not itself register a
+publisher or grant ownership of a crate name. Keep publisher registration and
+publication as separate deliberate operations.
+
 ## License
 
 MIT. The takeover page bundles noVNC (MPL-2.0); see `assets/takeover/novnc/`.
