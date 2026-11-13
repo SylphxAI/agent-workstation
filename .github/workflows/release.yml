@@ -1,15 +1,17 @@
 name: release
 
-# Publishes the crate to crates.io when Cargo.toml's version is new on main,
-# then tags the commit. Uses the CARGO_REGISTRY_TOKEN Actions secret.
-
+# Deliberate releases only. Configure the crates.io trusted publisher first.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: Cargo.toml version to publish from main
+        required: true
+        type: string
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release
@@ -17,24 +19,26 @@ concurrency:
 
 jobs:
   publish:
-    if: github.event.repository.private == false
+    if: github.event.repository.private == false && github.ref == 'refs/heads/main'
+    environment: crates-io
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-      - name: Version not yet published
+      - name: Check requested release
         id: check
-        run: |
-          set -euo pipefail
-          v=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          code=$(curl -s -o /dev/null -w '%{http_code}' -A 'agent-workstation-release' "https://crates.io/api/v1/crates/agent-workstation/$v")
-          if [ "$code" = 200 ]; then echo "publish=false" >> "$GITHUB_OUTPUT"; else echo "publish=true" >> "$GITHUB_OUTPUT"; fi
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: bash .github/scripts/release-check.sh
+      - name: Authenticate to crates.io
+        if: steps.check.outputs.publish == 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18
       - name: Publish
         if: steps.check.outputs.publish == 'true'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish --locked
       - name: Tag
         if: steps.check.outputs.publish == 'true'
