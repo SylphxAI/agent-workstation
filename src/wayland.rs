@@ -7,6 +7,11 @@
 //!   exactly the keysyms the call needs, so any Unicode text types without
 //!   depending on the desktop's layout.
 //!
+//! - Clipboard: `wlr-data-control`. Reading takes the current selection
+//!   over a short-lived connection; setting it starts an owner thread that
+//!   serves pastes until another client replaces the selection or the
+//!   compositor exits.
+//!
 //! Screenshots open a short-lived connection; input goes through one
 //! [`InputDevice`] per session. All calls block (use `spawn_blocking`).
 
@@ -22,6 +27,12 @@ use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
+};
+use wayland_protocols_wlr::data_control::v1::client::{
+    zwlr_data_control_device_v1::{self, ZwlrDataControlDeviceV1},
+    zwlr_data_control_manager_v1::ZwlrDataControlManagerV1,
+    zwlr_data_control_offer_v1::{self, ZwlrDataControlOfferV1},
+    zwlr_data_control_source_v1::{self, ZwlrDataControlSourceV1},
 };
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
@@ -43,6 +54,7 @@ const CHAR_CODES: [u32; 47] = [
     32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53,
 ];
 /// Distinct character keysyms one generated keymap carries.
+#[cfg(test)]
 const KEYMAP_SLOTS: usize = CHAR_CODES.len();
 const KEY_GAP: Duration = Duration::from_millis(4);
 
@@ -54,6 +66,8 @@ impl Button {
             Button::Left => 0x110,
             Button::Right => 0x111,
             Button::Middle => 0x112,
+            Button::Back => 0x113,
+            Button::Forward => 0x114,
         }
     }
 }
@@ -64,7 +78,26 @@ struct State {
     buffer_done: bool,
     flags_y_invert: bool,
     outcome: Option<bool>,
+    /// The clipboard selection offered to this client.
+    selection: Option<ZwlrDataControlOfferV1>,
+    /// Text this client serves as the clipboard owner.
+    owned: Option<String>,
+    /// The owned selection was replaced.
+    cancelled: bool,
 }
+
+/// MIME types offered for clipboard text, most preferred first.
+const TEXT_MIMES: [&str; 5] = [
+    "text/plain;charset=utf-8",
+    "UTF8_STRING",
+    "text/plain",
+    "STRING",
+    "TEXT",
+];
+/// Largest clipboard text read.
+const MAX_CLIPBOARD: usize = 16 << 20;
+/// How long a clipboard owner may take to start sending.
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
     fn event(
@@ -110,6 +143,78 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
     }
 }
 
+impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
+    fn event(
+        s: &mut Self,
+        _: &ZwlrDataControlDeviceV1,
+        ev: zwlr_data_control_device_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwlr_data_control_device_v1::Event as E;
+        match ev {
+            E::Selection { id } => {
+                if let Some(old) = std::mem::replace(&mut s.selection, id) {
+                    old.destroy();
+                }
+            }
+            E::PrimarySelection { id: Some(offer) } => offer.destroy(),
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(State, ZwlrDataControlDeviceV1, [
+        zwlr_data_control_device_v1::EVT_DATA_OFFER_OPCODE => (ZwlrDataControlOfferV1, std::sync::Mutex::new(Vec::new())),
+    ]);
+}
+
+impl Dispatch<ZwlrDataControlOfferV1, std::sync::Mutex<Vec<String>>> for State {
+    fn event(
+        _: &mut Self,
+        _: &ZwlrDataControlOfferV1,
+        ev: zwlr_data_control_offer_v1::Event,
+        mimes: &std::sync::Mutex<Vec<String>>,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let zwlr_data_control_offer_v1::Event::Offer { mime_type } = ev else {
+            return;
+        };
+        if let Ok(mut m) = mimes.lock() {
+            m.push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
+    fn event(
+        s: &mut Self,
+        source: &ZwlrDataControlSourceV1,
+        ev: zwlr_data_control_source_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        use zwlr_data_control_source_v1::Event as E;
+        match ev {
+            E::Send { fd, .. } => {
+                if let Some(text) = &s.owned {
+                    // A reader that closes early only ends its own paste.
+                    let _ =
+                        std::io::Write::write_all(&mut std::fs::File::from(fd), text.as_bytes());
+                }
+            }
+            E::Cancelled => {
+                s.cancelled = true;
+                s.owned = None;
+                source.destroy();
+            }
+            _ => {}
+        }
+    }
+}
+
 delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_output::WlOutput);
 delegate_noop!(State: ignore wl_seat::WlSeat);
@@ -120,6 +225,7 @@ delegate_noop!(State: ZwlrVirtualPointerManagerV1);
 delegate_noop!(State: ZwlrVirtualPointerV1);
 delegate_noop!(State: ZwpVirtualKeyboardManagerV1);
 delegate_noop!(State: ZwpVirtualKeyboardV1);
+delegate_noop!(State: ZwlrDataControlManagerV1);
 
 struct Client {
     conn: Connection,
@@ -216,6 +322,105 @@ pub fn screenshot(socket: &Path) -> Result<Frame> {
     to_rgba(&raw, format, width, height, stride, c.state.flags_y_invert)
 }
 
+/// The clipboard's text, or `None` when it holds no text.
+pub fn clipboard_text(socket: &Path) -> Result<Option<String>> {
+    let mut c = Client::connect(socket)?;
+    let qh = c.queue.handle();
+    let seat: wl_seat::WlSeat = c.bind(1..=7)?;
+    let manager: ZwlrDataControlManagerV1 = c.bind(1..=2)?;
+    let device = manager.get_data_device(&seat, &qh, ());
+    // The compositor answers a new device with the current selection.
+    c.roundtrip()?;
+    c.roundtrip()?;
+    let Some(offer) = c.state.selection.take() else {
+        device.destroy();
+        return Ok(None);
+    };
+    let offered = offer
+        .data::<std::sync::Mutex<Vec<String>>>()
+        .and_then(|m| m.lock().ok().map(|m| m.clone()))
+        .unwrap_or_default();
+    let Some(mime) = TEXT_MIMES.iter().find(|m| offered.iter().any(|o| o == *m)) else {
+        offer.destroy();
+        device.destroy();
+        return Ok(None);
+    };
+    let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+        .map_err(|e| Error::Io(e.into()))?;
+    offer.receive(mime.to_string(), write.as_fd());
+    c.roundtrip()?;
+    drop(write);
+    let mut out = Vec::new();
+    let mut buf = [0u8; 64 << 10];
+    let file = std::fs::File::from(read);
+    loop {
+        let mut fds = [rustix::event::PollFd::new(
+            &file,
+            rustix::event::PollFlags::IN,
+        )];
+        let timeout = rustix::event::Timespec {
+            tv_sec: CLIPBOARD_TIMEOUT.as_secs() as _,
+            tv_nsec: 0,
+        };
+        if rustix::event::poll(&mut fds, Some(&timeout)).map_err(|e| Error::Io(e.into()))? == 0 {
+            return Err(Error::Timeout("clipboard owner did not send".into()));
+        }
+        let n = std::io::Read::read(&mut &file, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if out.len() + n > MAX_CLIPBOARD {
+            return Err(Error::InvalidInput(format!(
+                "clipboard text exceeds {} MiB",
+                MAX_CLIPBOARD >> 20
+            )));
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+    offer.destroy();
+    device.destroy();
+    String::from_utf8(out)
+        .map(Some)
+        .map_err(|_| Error::InvalidInput("clipboard text is not UTF-8".into()))
+}
+
+/// Make `text` the clipboard. Returns once the compositor has the new
+/// selection; a thread then serves pastes until another client replaces it
+/// or the compositor exits.
+pub fn set_clipboard_text(socket: &Path, text: String) -> Result<()> {
+    if text.len() > MAX_CLIPBOARD {
+        return Err(Error::InvalidInput(format!(
+            "clipboard text exceeds {} MiB",
+            MAX_CLIPBOARD >> 20
+        )));
+    }
+    let mut c = Client::connect(socket)?;
+    let qh = c.queue.handle();
+    let seat: wl_seat::WlSeat = c.bind(1..=7)?;
+    let manager: ZwlrDataControlManagerV1 = c.bind(1..=2)?;
+    let device = manager.get_data_device(&seat, &qh, ());
+    let source = manager.create_data_source(&qh, ());
+    for mime in TEXT_MIMES {
+        source.offer(mime.to_string());
+    }
+    c.state.owned = Some(text);
+    device.set_selection(Some(&source));
+    c.roundtrip()?;
+    std::thread::Builder::new()
+        .name("desktop-clipboard".into())
+        .spawn(move || {
+            while !c.state.cancelled {
+                if c.queue.blocking_dispatch(&mut c.state).is_err() {
+                    break;
+                }
+            }
+            device.destroy();
+            let _ = c.conn.flush();
+        })
+        .map_err(|e| Error::Process(format!("clipboard owner: {e}")))?;
+    Ok(())
+}
+
 fn to_rgba(
     raw: &[u8],
     format: wl_shm::Format,
@@ -257,6 +462,10 @@ pub struct InputDevice {
     keyboard: ZwpVirtualKeyboardV1,
     size: (u32, u32),
     started: Instant,
+    /// Modifier mask of the held keys.
+    mods: u32,
+    /// Keys held by [`Input::KeyDown`]: evdev code, keysym, modifier bit.
+    held: Vec<(u32, String, u32)>,
 }
 
 impl std::fmt::Debug for InputDevice {
@@ -285,6 +494,8 @@ impl InputDevice {
             keyboard,
             size,
             started: Instant::now(),
+            mods: 0,
+            held: Vec::new(),
         })
     }
 
@@ -299,118 +510,203 @@ impl InputDevice {
             .map_err(|e| Error::Protocol(format!("wayland: {e}")))
     }
 
-    fn tap(&mut self, evdev: u32) -> Result<()> {
-        for state in [1, 0] {
-            self.keyboard.key(self.now(), evdev, state);
-            self.flush()?;
-            std::thread::sleep(KEY_GAP);
-        }
+    fn key(&mut self, evdev: u32, pressed: bool) -> Result<()> {
+        self.keyboard.key(self.now(), evdev, u32::from(pressed));
+        self.flush()?;
+        std::thread::sleep(KEY_GAP);
         Ok(())
     }
 
+    fn tap(&mut self, evdev: u32) -> Result<()> {
+        self.key(evdev, true)?;
+        self.key(evdev, false)
+    }
+
+    /// Character codes no held key occupies.
+    fn free_codes(&self) -> Vec<u32> {
+        CHAR_CODES
+            .iter()
+            .copied()
+            .filter(|c| !self.held.iter().any(|(h, _, _)| h == c))
+            .collect()
+    }
+
+    /// Upload a keymap with every held key plus `extra`.
+    fn keymap(&mut self, extra: &[(u32, String)]) -> Result<()> {
+        let mut map: Vec<(u32, String)> =
+            self.held.iter().map(|(c, k, _)| (*c, k.clone())).collect();
+        for (code, keysym) in extra {
+            if !map.iter().any(|(c, _)| c == code) {
+                map.push((*code, keysym.clone()));
+            }
+        }
+        upload_keymap(&self.keyboard, &map)?;
+        self.c.roundtrip()
+    }
+
+    fn code_for(&self, keysym: &str) -> Result<u32> {
+        match named_code(keysym) {
+            Some(c) => Ok(c),
+            None => self
+                .free_codes()
+                .first()
+                .copied()
+                .ok_or_else(|| Error::InvalidInput("too many keys held".into())),
+        }
+    }
+
     /// Perform input steps in order. Points outside the output are refused
-    /// before anything is sent.
+    /// before anything is sent. Keys held by [`Input::KeyDown`] are released
+    /// when the steps end, whether or not they succeed.
     pub fn run(&mut self, steps: &[Input]) -> Result<()> {
         let size = self.size;
         for step in steps {
-            if let Input::Move { x, y } = step
-                && !(x.is_finite()
-                    && y.is_finite()
-                    && *x >= 0.0
-                    && *y >= 0.0
-                    && *x < size.0 as f64
-                    && *y < size.1 as f64)
-            {
-                return Err(Error::InvalidInput(format!(
-                    "point ({x}, {y}) is outside the {}x{} desktop",
-                    size.0, size.1
-                )));
-            }
-            if let Input::Key(chord) = step {
-                parse_chord(chord)?;
-            }
-        }
-        for step in steps {
             match step {
-                Input::Move { x, y } => {
-                    self.pointer
-                        .motion_absolute(self.now(), *x as u32, *y as u32, size.0, size.1);
-                    self.pointer.frame();
+                Input::Move { x, y }
+                    if !(x.is_finite()
+                        && y.is_finite()
+                        && *x >= 0.0
+                        && *y >= 0.0
+                        && *x < size.0 as f64
+                        && *y < size.1 as f64) =>
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "point ({x}, {y}) is outside the {}x{} desktop",
+                        size.0, size.1
+                    )));
                 }
-                Input::Button { button, pressed } => {
-                    use wayland_client::protocol::wl_pointer::ButtonState;
-                    let state = if *pressed {
-                        ButtonState::Pressed
-                    } else {
-                        ButtonState::Released
-                    };
-                    self.pointer.button(self.now(), button.code(), state);
-                    self.pointer.frame();
+                Input::Key(chord) | Input::KeyDown(chord) | Input::KeyUp(chord) => {
+                    parse_chord(chord)?;
                 }
-                Input::Scroll { dx, dy } => {
-                    use wayland_client::protocol::wl_pointer::{Axis, AxisSource};
-                    self.pointer.axis_source(AxisSource::Wheel);
-                    for (axis, n) in [(Axis::VerticalScroll, *dy), (Axis::HorizontalScroll, *dx)] {
-                        if n != 0 {
-                            self.pointer
-                                .axis_discrete(self.now(), axis, 15.0 * n as f64, n);
-                        }
-                    }
-                    self.pointer.frame();
-                }
-                Input::Key(chord) => {
-                    let (mods, key) = parse_chord(chord)?;
-                    let code = named_code(&key).unwrap_or(CHAR_CODES[0]);
-                    upload_keymap(&self.keyboard, &[(code, key)])?;
-                    self.c.roundtrip()?;
-                    self.keyboard.modifiers(mods, 0, 0, 0);
-                    self.tap(code)?;
-                    self.keyboard.modifiers(0, 0, 0, 0);
-                }
-                Input::Text(text) => {
-                    for chunk in keysym_chunks(text) {
-                        let mut map: Vec<(u32, String)> = Vec::new();
-                        let mut next = CHAR_CODES.iter();
-                        let mut codes = Vec::with_capacity(chunk.len());
-                        for s in chunk {
-                            let code = match map.iter().find(|(_, k)| *k == s) {
-                                Some((c, _)) => *c,
-                                None => {
-                                    let c = match named_code(&s) {
-                                        Some(c) => c,
-                                        None => {
-                                            *next.next().expect("chunk fits the character codes")
-                                        }
-                                    };
-                                    map.push((c, s));
-                                    c
-                                }
-                            };
-                            codes.push(code);
-                        }
-                        upload_keymap(&self.keyboard, &map)?;
-                        self.c.roundtrip()?;
-                        for code in codes {
-                            self.tap(code)?;
-                        }
-                    }
-                }
-                Input::Wait(d) => std::thread::sleep((*d).min(Duration::from_secs(10))),
+                _ => {}
             }
-            self.flush()?;
         }
+        let result = steps.iter().try_for_each(|step| self.step(step));
+        let released = self.release_held();
+        result.and(released)?;
         self.c.roundtrip()
+    }
+
+    fn step(&mut self, step: &Input) -> Result<()> {
+        let size = self.size;
+        match step {
+            Input::Move { x, y } => {
+                self.pointer
+                    .motion_absolute(self.now(), *x as u32, *y as u32, size.0, size.1);
+                self.pointer.frame();
+            }
+            Input::Button { button, pressed } => {
+                use wayland_client::protocol::wl_pointer::ButtonState;
+                let state = if *pressed {
+                    ButtonState::Pressed
+                } else {
+                    ButtonState::Released
+                };
+                self.pointer.button(self.now(), button.code(), state);
+                self.pointer.frame();
+            }
+            Input::Scroll { dx, dy } => {
+                use wayland_client::protocol::wl_pointer::{Axis, AxisSource};
+                self.pointer.axis_source(AxisSource::Wheel);
+                for (axis, n) in [(Axis::VerticalScroll, *dy), (Axis::HorizontalScroll, *dx)] {
+                    if n != 0 {
+                        self.pointer
+                            .axis_discrete(self.now(), axis, 15.0 * n as f64, n);
+                    }
+                }
+                self.pointer.frame();
+            }
+            Input::Key(chord) => {
+                let keys = parse_chord(chord)?;
+                let (last, prefix) = keys.split_last().expect("a chord has a key");
+                let mods = prefix.iter().fold(self.mods, |m, k| m | k.1);
+                let code = self.code_for(&last.0)?;
+                self.keymap(&[(code, last.0.clone())])?;
+                self.keyboard.modifiers(mods, 0, 0, 0);
+                self.tap(code)?;
+                self.keyboard.modifiers(self.mods, 0, 0, 0);
+            }
+            Input::KeyDown(chord) => {
+                for (keysym, bit) in parse_chord(chord)? {
+                    if self.held.iter().any(|(_, k, _)| *k == keysym) {
+                        continue;
+                    }
+                    let code = self.code_for(&keysym)?;
+                    self.held.push((code, keysym, bit));
+                    self.keymap(&[])?;
+                    self.mods |= bit;
+                    self.keyboard.modifiers(self.mods, 0, 0, 0);
+                    self.key(code, true)?;
+                }
+            }
+            Input::KeyUp(chord) => {
+                for (keysym, _) in parse_chord(chord)?.into_iter().rev() {
+                    self.release(&keysym)?;
+                }
+            }
+            Input::Text(text) => {
+                let free = self.free_codes();
+                for chunk in keysym_chunks(text, free.len()) {
+                    let mut map: Vec<(u32, String)> = Vec::new();
+                    let mut next = free.iter();
+                    let mut codes = Vec::with_capacity(chunk.len());
+                    for s in chunk {
+                        let code = match map.iter().find(|(_, k)| *k == s) {
+                            Some((c, _)) => *c,
+                            None => {
+                                let c = match named_code(&s) {
+                                    Some(c) => c,
+                                    None => *next.next().expect("chunk fits the character codes"),
+                                };
+                                map.push((c, s));
+                                c
+                            }
+                        };
+                        codes.push(code);
+                    }
+                    self.keymap(&map)?;
+                    for code in codes {
+                        self.tap(code)?;
+                    }
+                }
+            }
+            Input::Wait(d) => std::thread::sleep((*d).min(MAX_WAIT)),
+        }
+        self.flush()
+    }
+
+    fn release(&mut self, keysym: &str) -> Result<()> {
+        let Some(i) = self.held.iter().position(|(_, k, _)| k == keysym) else {
+            return Ok(());
+        };
+        let (code, _, _) = self.held.remove(i);
+        self.mods = self.held.iter().fold(0, |m, (_, _, bit)| m | bit);
+        self.key(code, false)?;
+        self.keyboard.modifiers(self.mods, 0, 0, 0);
+        self.flush()
+    }
+
+    fn release_held(&mut self) -> Result<()> {
+        while let Some((_, keysym, _)) = self.held.last().cloned() {
+            self.release(&keysym)?;
+        }
+        Ok(())
     }
 }
 
-/// Split text into keysym runs that each need at most [`KEYMAP_SLOTS`] distinct keysyms.
-fn keysym_chunks(text: &str) -> Vec<Vec<String>> {
+/// Longest single [`Input::Wait`].
+pub const MAX_WAIT: Duration = Duration::from_secs(10);
+
+/// Split text into keysym runs that each need at most `slots` distinct
+/// non-named keysyms.
+fn keysym_chunks(text: &str, slots: usize) -> Vec<Vec<String>> {
+    let slots = slots.max(1);
     let mut chunks: Vec<Vec<String>> = Vec::new();
     let mut distinct = std::collections::HashSet::new();
     for c in text.chars() {
         let s = char_keysym(c);
         let needs_slot = named_code(&s).is_none() && !distinct.contains(&s);
-        if chunks.is_empty() || (needs_slot && distinct.len() == KEYMAP_SLOTS) {
+        if chunks.is_empty() || (needs_slot && distinct.len() == slots) {
             chunks.push(Vec::new());
             distinct.clear();
         }
@@ -455,7 +751,10 @@ fn named_code(keysym: &str) -> Option<u32> {
         "Escape" => 1,
         "BackSpace" => 14,
         "Tab" => 15,
+        "Control_L" => 29,
         "Return" => 28,
+        "Shift_L" => 42,
+        "Alt_L" => 56,
         "space" => 57,
         "Home" => 102,
         "Up" => 103,
@@ -467,6 +766,7 @@ fn named_code(keysym: &str) -> Option<u32> {
         "Next" => 109,
         "Insert" => 110,
         "Delete" => 111,
+        "Super_L" => 125,
         "F11" => 87,
         "F12" => 88,
         f if f.len() <= 3 && f.starts_with('F') => match f[1..].parse::<u32>() {
@@ -485,22 +785,35 @@ fn char_keysym(c: char) -> String {
     }
 }
 
-/// Parse `ctrl+shift+t` into a modifier mask and one keysym name.
-fn parse_chord(chord: &str) -> Result<(u32, String)> {
+/// A modifier name's keysym and modifier bit.
+fn modifier(name: &str) -> Option<(&'static str, u32)> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "shift" => ("Shift_L", 1),
+        "ctrl" | "control" => ("Control_L", 4),
+        "alt" => ("Alt_L", 8),
+        "super" | "meta" | "cmd" => ("Super_L", 64),
+        _ => return None,
+    })
+}
+
+/// Parse `ctrl+shift+t` into its keys in press order: each a keysym and
+/// its modifier bit (0 for the final, non-modifier key). Every key but the
+/// last must be a modifier; the last may be one too (`shift`).
+fn parse_chord(chord: &str) -> Result<Vec<(String, u32)>> {
     let parts: Vec<&str> = chord.split('+').map(str::trim).collect();
     let (key, mods) = parts
         .split_last()
         .filter(|(k, _)| !k.is_empty())
         .ok_or_else(|| Error::InvalidInput("empty key chord".into()))?;
-    let mut mask = 0;
+    let mut keys = Vec::with_capacity(parts.len());
     for m in mods {
-        mask |= match m.to_ascii_lowercase().as_str() {
-            "shift" => 1,
-            "ctrl" | "control" => 4,
-            "alt" => 8,
-            "super" | "meta" | "cmd" => 64,
-            other => return Err(Error::InvalidInput(format!("unknown modifier {other:?}"))),
-        };
+        let (sym, bit) =
+            modifier(m).ok_or_else(|| Error::InvalidInput(format!("unknown modifier {m:?}")))?;
+        keys.push((sym.to_string(), bit));
+    }
+    if let Some((sym, bit)) = modifier(key) {
+        keys.push((sym.to_string(), bit));
+        return Ok(keys);
     }
     let lower = key.to_ascii_lowercase();
     let name = match lower.as_str() {
@@ -510,6 +823,7 @@ fn parse_chord(chord: &str) -> Result<(u32, String)> {
         "space" => "space".into(),
         "backspace" => "BackSpace".into(),
         "delete" | "del" => "Delete".into(),
+        "insert" => "Insert".into(),
         "up" | "down" | "left" | "right" | "home" | "end" => {
             let mut s = lower.clone();
             s[..1].make_ascii_uppercase();
@@ -525,14 +839,22 @@ fn parse_chord(chord: &str) -> Result<(u32, String)> {
                 char_keysym(c)
             }
         }
+        f if f.len() <= 3
+            && f.starts_with('f')
+            && f[1..].parse::<u32>().is_ok_and(|n| (1..=12).contains(&n)) =>
+        {
+            f.to_ascii_uppercase()
+        }
+        // Other keysym names (`Print`, `XF86AudioMute`) pass through as is.
         _ if key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') => key.to_string(),
         _ => {
             return Err(Error::InvalidInput(format!(
-                "key {key:?} is not a keysym name"
+                "key {key:?} is not a key name"
             )));
         }
     };
-    Ok((mask, name))
+    keys.push((name, 0));
+    Ok(keys)
 }
 
 #[cfg(test)]
@@ -541,14 +863,23 @@ mod tests {
 
     #[test]
     fn chords_parse_into_masks_and_safe_keysyms() {
-        assert_eq!(parse_chord("ctrl+l").unwrap(), (4, "l".into()));
-        assert_eq!(parse_chord("Ctrl+Shift+T").unwrap(), (5, "t".into()));
-        assert_eq!(parse_chord("enter").unwrap(), (0, "Return".into()));
-        assert_eq!(parse_chord("F5").unwrap(), (0, "F5".into()));
-        assert_eq!(parse_chord("pagedown").unwrap(), (0, "Next".into()));
-        assert_eq!(parse_chord("alt+left").unwrap(), (8, "Left".into()));
-        assert_eq!(parse_chord("/").unwrap(), (0, "U002F".into()));
+        let keys = |c: &str| parse_chord(c).unwrap();
+        let k = |s: &str, bit: u32| (s.to_string(), bit);
+        assert_eq!(keys("ctrl+l"), [k("Control_L", 4), k("l", 0)]);
+        assert_eq!(
+            keys("Ctrl+Shift+T"),
+            [k("Control_L", 4), k("Shift_L", 1), k("t", 0)]
+        );
+        assert_eq!(keys("enter"), [k("Return", 0)]);
+        assert_eq!(keys("F5"), [k("F5", 0)]);
+        assert_eq!(keys("f12"), [k("F12", 0)]);
+        assert_eq!(keys("pagedown"), [k("Next", 0)]);
+        assert_eq!(keys("alt+left"), [k("Alt_L", 8), k("Left", 0)]);
+        assert_eq!(keys("/"), [k("U002F", 0)]);
+        assert_eq!(keys("shift"), [k("Shift_L", 1)], "a modifier alone");
+        assert_eq!(keys("ctrl+shift"), [k("Control_L", 4), k("Shift_L", 1)]);
         assert!(parse_chord("hyper+x").is_err());
+        assert_eq!(keys("Print"), [k("Print", 0)]);
         assert!(parse_chord("").is_err());
         assert!(
             parse_chord("a ] }; key <X> { [ b").is_err(),
@@ -562,6 +893,9 @@ mod tests {
         assert!(km.contains("<K2> = 10;") && km.contains("key <K2> { [ U00E9 ] };"));
         assert!(km.contains("<K28> = 36;") && km.contains("key <K28> { [ Return ] };"));
         assert_eq!(named_code("Return"), Some(28));
+        for m in ["Shift_L", "Control_L", "Alt_L", "Super_L"] {
+            assert!(!CHAR_CODES.contains(&named_code(m).unwrap()), "{m}");
+        }
         assert_eq!(named_code("F5"), Some(63));
         assert_eq!(named_code("U003F"), None);
         assert!(!CHAR_CODES.contains(&14) && !CHAR_CODES.contains(&28) && !CHAR_CODES.contains(&1));
@@ -592,13 +926,18 @@ mod tests {
         let text: String = (0..500u32)
             .filter_map(|i| char::from_u32(0x4e00 + i))
             .collect();
-        let chunks = keysym_chunks(&text);
+        let chunks = keysym_chunks(&text, KEYMAP_SLOTS);
         assert_eq!(chunks.iter().map(Vec::len).sum::<usize>(), 500);
         assert!(
             chunks
                 .iter()
                 .all(|c| c.iter().collect::<std::collections::HashSet<_>>().len() <= KEYMAP_SLOTS)
         );
-        assert_eq!(keysym_chunks("aab").len(), 1);
+        assert_eq!(keysym_chunks("aab", KEYMAP_SLOTS).len(), 1);
+        assert_eq!(
+            keysym_chunks("abc", 2).len(),
+            2,
+            "held keys shrink the budget"
+        );
     }
 }
