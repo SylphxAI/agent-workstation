@@ -44,6 +44,11 @@ desk.shutdown().await;
 # Ok(()) }
 ```
 
+`DesktopSession::start` returns only after the browser's native Wayland window
+is mapped and owns keyboard focus. Seat input devices are registered before
+the browser starts; a DevTools connection alone is not treated as desktop
+readiness. Missing native focus fails startup with a bounded timeout.
+
 ## Daemon
 
 ```sh

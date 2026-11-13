@@ -90,6 +90,18 @@ impl DesktopSession {
             Some(p) => Some(p.start().await?),
             None => None,
         };
+        // Register the seat's keyboard/pointer before Chromium binds wl_seat,
+        // rather than hoping it has processed a capability change after a delay.
+        let input = {
+            let (socket, size) = (socket.clone(), size);
+            match blocking(move || InputDevice::open(&socket, size)).await {
+                Ok(i) => Arc::new(std::sync::Mutex::new(i)),
+                Err(e) => {
+                    compositor.shutdown().await;
+                    return Err(e);
+                }
+            }
+        };
         let log = config.runtime_dir.join("browser.log");
         let browser = match Browser::launch(
             &config.browser,
@@ -107,17 +119,11 @@ impl DesktopSession {
                 return Err(e);
             }
         };
-        let input = {
-            let (socket, size) = (socket.clone(), size);
-            match blocking(move || InputDevice::open(&socket, size)).await {
-                Ok(i) => Arc::new(std::sync::Mutex::new(i)),
-                Err(e) => {
-                    browser.shutdown().await;
-                    compositor.shutdown().await;
-                    return Err(e);
-                }
-            }
-        };
+        if let Err(e) = async { compositor.wait_for_focused_window(browser.pid()?).await }.await {
+            browser.shutdown().await;
+            compositor.shutdown().await;
+            return Err(e);
+        }
         let mut session = Self {
             gate: ControlGate::new(),
             fingerprint,
