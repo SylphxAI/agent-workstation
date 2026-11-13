@@ -71,6 +71,7 @@ pub struct ControlGate {
     idle_timeout: Duration,
     lease: std::sync::Mutex<Option<Lease>>,
     pointer: std::sync::Mutex<Option<(f64, f64)>>,
+    hand_backs: std::sync::atomic::AtomicU64,
 }
 
 impl ControlGate {
@@ -87,6 +88,7 @@ impl ControlGate {
             idle_timeout,
             lease: std::sync::Mutex::new(None),
             pointer: std::sync::Mutex::new(None),
+            hand_backs: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -221,9 +223,18 @@ impl ControlGate {
         self.last_hand_back.lock().expect("hand-back lock").take()
     }
 
-    /// Watch holder changes (for UIs and long-polls).
+    /// Watch holder changes (for UIs and long-polls). A watch keeps only
+    /// the latest holder, so a person who takes and hands back between two
+    /// observations is seen through [`ControlGate::hand_backs`], not as a
+    /// transition.
     pub fn subscribe(&self) -> watch::Receiver<Holder> {
         self.holder.subscribe()
+    }
+
+    /// How many times control has returned to the agent from a person. It
+    /// increases before subscribers are notified.
+    pub fn hand_backs(&self) -> u64 {
+        self.hand_backs.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Wait until the agent holds control again.
@@ -257,16 +268,19 @@ impl ControlGate {
     }
 
     fn hand_back(&self, why: HandBack) -> bool {
+        let mut last = self.last_hand_back.lock().expect("hand-back lock");
         let changed = self.holder.send_if_modified(|h| {
             if matches!(h, Holder::Human { .. }) {
                 *h = Holder::Agent;
+                self.hand_backs
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 true
             } else {
                 false
             }
         });
         if changed {
-            *self.last_hand_back.lock().expect("hand-back lock") = Some(why);
+            *last = Some(why);
         }
         changed
     }
@@ -295,6 +309,16 @@ mod tests {
         );
         assert_eq!(gate.take_hand_back(), None);
         assert!(!gate.release(None), "second release is a no-op");
+        assert_eq!(gate.hand_backs(), 1);
+        // An observer that wakes after a take and a hand-back sees only the
+        // agent holding control, but the count moved.
+        let mut rx = gate.subscribe();
+        rx.borrow_and_update();
+        gate.take(None);
+        gate.release(None);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), Holder::Agent);
+        assert_eq!(gate.hand_backs(), 2);
     }
 
     #[test]
