@@ -323,11 +323,18 @@ impl DesktopSession {
     }
 
     /// Press a key chord such as `ctrl+l`.
+    ///
+    /// Completion acknowledges compositor processing, not the application's
+    /// handling of the shortcut. Observe its effect before sending input that
+    /// depends on a focus change.
     pub async fn key(&self, chord: &str) -> Result<()> {
         self.input(vec![Input::Key(chord.to_string())]).await
     }
 
     /// Type text into whatever has keyboard focus.
+    ///
+    /// The caller must establish the intended application's focus first;
+    /// completing a preceding [`Self::key`] does not acknowledge a UI change.
     pub async fn type_text(&self, text: &str) -> Result<()> {
         self.input(vec![Input::Text(text.to_string())]).await
     }

@@ -49,6 +49,12 @@ is mapped and owns keyboard focus. Seat input devices are registered before
 the browser starts; a DevTools connection alone is not treated as desktop
 readiness. Missing native focus fails startup with a bounded timeout.
 
+Native input completion acknowledges compositor processing, not application
+handling. In particular, `key("ctrl+l")` does not mean the browser has finished
+moving focus to its address bar: observe the resulting UI state before typing
+text that depends on it. The generic input layer does not recognize browser
+shortcuts or resend input.
+
 ## Daemon
 
 ```sh
