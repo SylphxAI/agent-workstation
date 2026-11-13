@@ -1,6 +1,6 @@
 [package]
 name = "agent-workstation"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -9,7 +9,7 @@ repository = "https://github.com/SylphxAI/agent-workstation"
 readme = "README.md"
 keywords = ["agent", "browser", "wayland", "automation", "vnc"]
 categories = ["web-programming", "api-bindings", "development-tools::testing"]
-include = ["/src/**", "/assets/**", "/tests/**", "/LICENSE", "/README.md"]
+include = ["/src/**", "/assets/**", "/tests/**", "/LICENSE", "/README.md", "/CHANGELOG.md"]
 
 [workspace]
 # `bench/` is an independent tree; it may depend on this crate by path.
