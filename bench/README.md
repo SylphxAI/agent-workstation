@@ -37,6 +37,7 @@ same on every engine. Chromium extraction otherwise runs in a CDP isolated world
 ## Run
 
 ```sh
+cd bench
 ./setup.sh                      # user-space install: venv, Camoufox, fingerprint-chromium (sha256-pinned), Chrome, sway
 . ~/.cache/wsbench/env.sh
 python -m wsbench.run --out results \
@@ -46,12 +47,12 @@ python -m wsbench.run --out results \
 python -m wsbench.report results/runs.jsonl
 python -m wsbench.perf --egress residential=socks5://127.0.0.1:1080 --seeds A,A   # startup + peak RSS
 python -m wsbench.integration   # CDP/BiDi, a11y, insertText, tabs, Chrome-profile carry-over
+```
 
 One command reruns the full measurement (detection + perf, then the report):
 
 ```sh
 ./rerun.sh --egress residential=socks5://127.0.0.1:1080
-```
 ```
 
 - `--seeds`: one fresh launch (fresh profile, fresh compositor) per entry. Repeats of a seed
