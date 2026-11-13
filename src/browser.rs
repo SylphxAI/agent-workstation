@@ -2,9 +2,10 @@
 //!
 //! The browser runs headful on the session's Wayland desktop with a
 //! persistent, caller-owned profile directory. Web operations drive that same
-//! window over the browser's loopback DevTools endpoint: no page script is
-//! ever injected to change what a site sees, and input arrives as trusted
-//! browser events.
+//! window over the browser's loopback DevTools endpoint. Ordinary input uses
+//! trusted browser events; secret fills use a node-bound isolated-world DOM
+//! operation so origin validation and insertion cannot be separated by focus
+//! changes or navigation. No fingerprint-spoofing scripts are injected.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -214,6 +215,25 @@ pub struct Snapshot {
     pub refs: usize,
 }
 
+const SECRET_FILL: &str = r#"function(expected, value) {
+    if (this.ownerDocument !== document || !this.isConnected ||
+        (expected !== null && (globalThis.origin === 'null' || globalThis.origin !== expected)))
+        return 'refused';
+    if (this.matches(':disabled') || this.readOnly) return 'unsupported';
+    let prototype;
+    if (this instanceof HTMLInputElement) {
+        if (!['text', 'search', 'tel', 'url', 'email', 'password'].includes(this.type))
+            return 'unsupported';
+        prototype = HTMLInputElement.prototype;
+    }
+    else if (this instanceof HTMLTextAreaElement) prototype = HTMLTextAreaElement.prototype;
+    else return 'unsupported';
+    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(this, value);
+    this.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+    this.dispatchEvent(new Event('change', {bubbles: true}));
+    return 'ok';
+}"#;
+
 const INTERACTIVE: &[&str] = &[
     "button",
     "link",
@@ -248,12 +268,18 @@ const STRUCTURAL: &[&str] = &[
     "form",
 ];
 
+#[derive(Clone, Debug)]
+struct NodeRef {
+    backend: i64,
+    frame: String,
+}
+
 /// Web operations over one DevTools connection.
 #[derive(Debug)]
 pub struct Web {
     cdp: Cdp,
     active: Option<String>,
-    refs: HashMap<String, i64>,
+    refs: HashMap<String, NodeRef>,
 }
 
 impl Web {
@@ -432,17 +458,43 @@ impl Web {
 
     /// Accessibility snapshot; refs stay valid until the next snapshot or navigation.
     pub async fn snapshot(&mut self) -> Result<Snapshot> {
-        let tree = self
-            .cdp
-            .call("Accessibility.getFullAXTree", json!({}))
-            .await?;
-        let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
-        let (text, refs) = render_tree(&nodes);
-        self.refs = refs;
+        self.refs.clear();
+        let tree = self.cdp.call("Page.getFrameTree", json!({})).await?;
+        let mut frames = vec![&tree["frameTree"]];
+        let mut text = Vec::new();
+        let mut node_refs = HashMap::new();
+        while let Some(frame) = frames.pop() {
+            let id = frame["frame"]["id"]
+                .as_str()
+                .ok_or_else(|| Error::Protocol("frame missing id".into()))?;
+            let ax = self
+                .cdp
+                .call("Accessibility.getFullAXTree", json!({"frameId": id}))
+                .await?;
+            let nodes = ax["nodes"].as_array().cloned().unwrap_or_default();
+            let (outline, refs) = render_tree(&nodes, node_refs.len());
+            text.push(outline);
+            node_refs.extend(refs.into_iter().map(|(key, backend)| {
+                (
+                    key,
+                    NodeRef {
+                        backend,
+                        frame: id.to_owned(),
+                    },
+                )
+            }));
+            // Local child frames only. Out-of-process frame discovery and
+            // session routing are not yet supported by snapshots.
+            if let Some(children) = frame["childFrames"].as_array() {
+                frames.extend(children.iter().rev());
+            }
+        }
+        let url = self.current_url().await?;
+        self.refs = node_refs;
         Ok(Snapshot {
-            url: self.current_url().await?,
+            url,
             refs: self.refs.len(),
-            text,
+            text: text.join("\n"),
         })
     }
 
@@ -469,29 +521,78 @@ impl Web {
         Ok(())
     }
 
-    /// Fill with a secret only if the active tab's origin is `expect_origin`
-    /// (when given). The value is never returned or logged.
+    /// Replace a field's value in its owning frame. Origin validation and
+    /// insertion run synchronously on the same node in an isolated world.
+    /// Input/change events are dispatched but are not trusted keyboard events.
+    /// The secret is never returned or included in protocol error messages.
     pub async fn fill_secret(
         &mut self,
         reference: &str,
         secret: &crate::Secret,
         expect_origin: Option<&str>,
     ) -> Result<()> {
-        if let Some(want) = expect_origin {
-            let url = self.current_url().await?;
-            let have = url::Url::parse(&url)
-                .map(|u| u.origin().ascii_serialization())
-                .unwrap_or_default();
-            if have != want.trim_end_matches('/') {
-                return Err(Error::Refused(format!("page origin {have} is not {want}")));
-            }
-        }
-        self.focus_and_clear(reference).await?;
-        self.cdp
-            .call("Input.insertText", json!({ "text": secret.expose() }))
+        let node = self
+            .refs
+            .get(&normalize_ref(reference))
+            .cloned()
+            .ok_or_else(|| Error::NotFound("secret field is not in the latest snapshot".into()))?;
+        let refused = || Error::Refused("secret field changed or origin did not match".into());
+        let world = self
+            .cdp
+            .call(
+                "Page.createIsolatedWorld",
+                json!({
+                    "frameId": node.frame, "worldName": "credential-fill"
+                }),
+            )
             .await
-            .map_err(|_| Error::Protocol("inserting the secret failed".into()))?;
-        Ok(())
+            .map_err(|_| refused())?;
+        let context = world["executionContextId"].as_i64().ok_or_else(refused)?;
+        let resolved = self
+            .cdp
+            .call(
+                "DOM.resolveNode",
+                json!({
+                    "backendNodeId": node.backend, "executionContextId": context
+                }),
+            )
+            .await
+            .map_err(|_| refused())?;
+        let object = resolved["object"]["objectId"]
+            .as_str()
+            .ok_or_else(refused)?;
+        // Never use focused-element input for secrets: a focus handler can
+        // redirect it even without navigation. This function does not yield or
+        // invoke page code until after its checks and native DOM mutation.
+        let result = self
+            .cdp
+            .call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object,
+                    "functionDeclaration": SECRET_FILL,
+                    "arguments": [{"value": expect_origin.map(|o| o.trim_end_matches('/'))},
+                                  {"value": secret.expose()}],
+                    "returnByValue": true,
+                    "silent": true
+                }),
+            )
+            .await;
+        let _ = self
+            .cdp
+            .call("Runtime.releaseObject", json!({"objectId": object}))
+            .await;
+        let result = result.map_err(|_| Error::Protocol("secret insertion failed".into()))?;
+        if result.get("exceptionDetails").is_some() {
+            return Err(Error::Protocol("secret insertion failed".into()));
+        }
+        match result["result"]["value"].as_str() {
+            Some("ok") => Ok(()),
+            Some("unsupported") => Err(Error::Unsupported(
+                "secret fill requires an editable text field".into(),
+            )),
+            _ => Err(refused()),
+        }
     }
 
     async fn focus_and_clear(&mut self, reference: &str) -> Result<()> {
@@ -519,7 +620,7 @@ impl Web {
         let key = normalize_ref(reference);
         self.refs
             .get(&key)
-            .copied()
+            .map(|node| node.backend)
             .ok_or_else(|| Error::NotFound(format!("{reference} is not in the latest snapshot")))
     }
 
@@ -592,7 +693,7 @@ fn normalize_ref(r: &str) -> String {
 }
 
 /// Render AX nodes as an outline; interactive nodes get refs to their DOM node.
-fn render_tree(nodes: &[Value]) -> (String, HashMap<String, i64>) {
+fn render_tree(nodes: &[Value], start: usize) -> (String, HashMap<String, i64>) {
     let by_id: HashMap<&str, &Value> = nodes
         .iter()
         .filter_map(|n| Some((n["nodeId"].as_str()?, n)))
@@ -624,7 +725,7 @@ fn render_tree(nodes: &[Value]) -> (String, HashMap<String, i64>) {
                 line.push_str(&format!(" {:?}", short));
             }
             if interactive && let Some(dom) = n["backendDOMNodeId"].as_i64() {
-                let r = format!("e{}", refs.len() + 1);
+                let r = format!("e{}", start + refs.len() + 1);
                 line.push_str(&format!(" [@{r}]"));
                 refs.insert(r, dom);
             }
@@ -676,7 +777,7 @@ mod tests {
             {"nodeId": "5", "role": {"value": "button"}, "name": {"value": "Hidden"}, "ignored": true, "backendDOMNodeId": 43, "childIds": []}
         ]))
         .unwrap();
-        let (text, refs) = render_tree(&nodes);
+        let (text, refs) = render_tree(&nodes, 0);
         assert_eq!(
             text,
             "- heading \"Sign in\"\n- textbox \"Email\" [@e1]\n- button \"Continue\" [@e2]"
