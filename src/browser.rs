@@ -2,9 +2,10 @@
 //!
 //! The browser runs headful on the session's Wayland desktop with a
 //! persistent, caller-owned profile directory. Web operations drive that same
-//! window over the browser's loopback DevTools endpoint: no page script is
-//! ever injected to change what a site sees, and input arrives as trusted
-//! browser events.
+//! window over the browser's loopback DevTools endpoint. Ordinary input uses
+//! trusted browser events; secret fills use a node-bound isolated-world DOM
+//! operation so origin validation and insertion cannot be separated by focus
+//! changes or navigation. No fingerprint-spoofing scripts are injected.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ use tokio::process::{Child, Command};
 use crate::cdp::Cdp;
 use crate::error::{Error, Result};
 use crate::fingerprint::Fingerprint;
+
+mod keys;
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -167,8 +170,31 @@ impl Browser {
     }
 
     /// Close gracefully (flushing the profile), then kill after a grace period.
+    ///
+    /// Every tab is closed first, which ends the browser the way a person
+    /// closing its last window does. `Browser.close` is only the fallback:
+    /// Chromium crashes in it while a native bubble such as "Save password?"
+    /// is open, and a crash loses the cookies it had not written yet.
     pub async fn shutdown(mut self) {
         if let Ok(mut cdp) = Cdp::connect(&self.endpoint).await {
+            for page in cdp.pages().await.unwrap_or_default() {
+                if let Some(id) = page["targetId"].as_str() {
+                    let _ = cdp
+                        .call_in(
+                            None,
+                            "Target.closeTarget",
+                            json!({ "targetId": id }),
+                            Duration::from_secs(3),
+                        )
+                        .await;
+                }
+            }
+            if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
+                .await
+                .is_ok()
+            {
+                return;
+            }
             let _ =
                 tokio::time::timeout(Duration::from_secs(3), cdp.call("Browser.close", json!({})))
                     .await;
@@ -206,6 +232,9 @@ pub struct Tab {
 /// An accessibility snapshot of the active tab.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Snapshot {
+    /// Snapshot id, unique for the life of the browser. Qualified refs
+    /// (`@<id>:e3`) name it.
+    pub id: String,
     /// Page URL.
     pub url: String,
     /// Indented outline; interactive elements carry `[@eN]`.
@@ -213,6 +242,142 @@ pub struct Snapshot {
     /// Number of refs issued.
     pub refs: usize,
 }
+
+/// What a web operation acts on.
+///
+/// Refs come from the latest [`Snapshot`] and are bound to the document each
+/// was taken from: any navigation of that document (a link, a form, a
+/// script, history, reload) invalidates them, and a newer snapshot replaces
+/// them. CSS selectors resolve in the active tab's main document at the
+/// moment of the call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Locator {
+    /// `@e3` or `e3` (the latest snapshot), or `@<snapshot id>:e3`.
+    Ref {
+        /// The snapshot the ref was issued by, when qualified.
+        snapshot: Option<String>,
+        /// `e3`.
+        id: String,
+    },
+    /// A CSS selector.
+    Css(String),
+}
+
+impl Locator {
+    /// `@e3`, `e3` and `@<snapshot>:e3` are refs; anything else is a CSS
+    /// selector. A malformed `@` ref is refused rather than read as CSS.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let s = raw.trim();
+        if s.is_empty() {
+            return Err(Error::InvalidInput("empty element locator".into()));
+        }
+        let body = s.strip_prefix('@');
+        let candidate = body.unwrap_or(s);
+        let (snapshot, id) = match candidate.rsplit_once(':') {
+            Some((snap, id)) if body.is_some() => (Some(snap), id),
+            _ => (None, candidate),
+        };
+        let is_ref = id.len() > 1
+            && id.starts_with('e')
+            && id[1..].bytes().all(|b| b.is_ascii_digit())
+            && snapshot.is_none_or(|s| {
+                !s.is_empty()
+                    && s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            });
+        match (is_ref, body.is_some()) {
+            (true, _) => Ok(Locator::Ref {
+                snapshot: snapshot.map(String::from),
+                id: id.to_string(),
+            }),
+            (false, true) => Err(Error::InvalidInput(format!(
+                "{s:?} is not a ref; refs look like @e3 or @<snapshot id>:e3"
+            ))),
+            (false, false) => Ok(Locator::Css(s.to_string())),
+        }
+    }
+}
+
+/// A web-page image.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PageImage {
+    /// PNG bytes.
+    pub png: Vec<u8>,
+    /// Width in CSS pixels.
+    pub width: u32,
+    /// Height in CSS pixels.
+    pub height: u32,
+    /// Whether a full-page capture was cut at [`MAX_PAGE_HEIGHT`].
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for PageImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PageImage({}x{}{})",
+            self.width,
+            self.height,
+            if self.truncated { ", truncated" } else { "" }
+        )
+    }
+}
+
+/// Tallest full-page capture, in CSS pixels; taller pages are cut.
+pub const MAX_PAGE_HEIGHT: u32 = 16_384;
+
+/// A cookie, in DevTools field names. Reads fill every field the browser
+/// knows; writes need `name`, `value`, and `url` or `domain`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Cookie {
+    /// Name.
+    pub name: String,
+    /// Value.
+    pub value: String,
+    /// URL the cookie is set for (writes only): domain, path and secure
+    /// default from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// Path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Expiry, seconds since the Unix epoch; absent or negative for a
+    /// session cookie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires: Option<f64>,
+    /// `HttpOnly`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_only: Option<bool>,
+    /// `Secure`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secure: Option<bool>,
+    /// `Strict`, `Lax` or `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_site: Option<String>,
+}
+
+const SECRET_FILL: &str = r#"function(expected, value) {
+    if (this.ownerDocument !== document || !this.isConnected ||
+        (expected !== null && (globalThis.origin === 'null' || globalThis.origin !== expected)))
+        return 'refused';
+    if (this.matches(':disabled') || this.readOnly) return 'unsupported';
+    let prototype;
+    if (this instanceof HTMLInputElement) {
+        if (!['text', 'search', 'tel', 'url', 'email', 'password'].includes(this.type))
+            return 'unsupported';
+        prototype = HTMLInputElement.prototype;
+    }
+    else if (this instanceof HTMLTextAreaElement) prototype = HTMLTextAreaElement.prototype;
+    else return 'unsupported';
+    Object.getOwnPropertyDescriptor(prototype, 'value').set.call(this, value);
+    this.dispatchEvent(new Event('input', {bubbles: true, composed: true}));
+    this.dispatchEvent(new Event('change', {bubbles: true}));
+    return 'ok';
+}"#;
 
 const INTERACTIVE: &[&str] = &[
     "button",
@@ -246,14 +411,46 @@ const STRUCTURAL: &[&str] = &[
     "navigation",
     "main",
     "form",
+    // Out-of-process frames show here without their content; reach them
+    // through desktop operations.
+    "Iframe",
 ];
+
+/// A DOM node an operation acts on, with the document it belongs to.
+#[derive(Clone, Debug)]
+struct NodeRef {
+    backend: i64,
+    frame: String,
+}
+
+/// The refs of the latest snapshot and the documents they point into.
+#[derive(Debug)]
+struct Refs {
+    id: String,
+    nodes: HashMap<String, NodeRef>,
+    /// Loader of every frame the snapshot read, by frame id.
+    loaders: HashMap<String, String>,
+    main_frame: String,
+}
+
+/// The frames of the active tab: frame id → loader id, and the main frame.
+struct Frames {
+    loaders: HashMap<String, String>,
+    main: String,
+}
 
 /// Web operations over one DevTools connection.
 #[derive(Debug)]
 pub struct Web {
     cdp: Cdp,
     active: Option<String>,
-    refs: HashMap<String, i64>,
+    refs: Option<Refs>,
+    /// Why the latest snapshot's refs were dropped, for the stale-ref error.
+    dropped: Option<String>,
+    nonce: String,
+    snapshots: u64,
+    /// Keys a page holds down (`key_down` without `key_up`), in press order.
+    held: Vec<keys::Key>,
 }
 
 impl Web {
@@ -262,7 +459,11 @@ impl Web {
         let mut web = Self {
             cdp: Cdp::connect(endpoint).await?,
             active: None,
-            refs: HashMap::new(),
+            refs: None,
+            dropped: None,
+            nonce: nonce()?,
+            snapshots: 0,
+            held: Vec::new(),
         };
         web.browser_call("Target.setDiscoverTargets", json!({ "discover": true }))
             .await?;
@@ -314,21 +515,42 @@ impl Web {
         Ok(id)
     }
 
-    /// Make `id` the active tab (brought to front on the desktop too).
+    /// Make `id` the active tab: brought to front on the desktop, with
+    /// keyboard focus in its page.
     pub async fn select_tab(&mut self, id: &str) -> Result<()> {
+        // Held keys belong to the page that saw them go down.
+        if self.active.is_some() {
+            let _ = self.release_keys().await;
+        }
+        self.held.clear();
         self.browser_call("Target.activateTarget", json!({ "targetId": id }))
             .await?;
         self.cdp.attach(id).await?;
         self.active = Some(id.to_string());
-        self.refs.clear();
+        self.drop_refs("another tab was selected");
         for domain in ["Page.enable", "DOM.enable", "Accessibility.enable"] {
             self.cdp.call(domain, json!({})).await?;
         }
-        Ok(())
+        self.focus_page().await
     }
 
-    /// Close tab `id`; the first remaining tab becomes active.
+    /// Close tab `id` and return once the browser has destroyed it. Closing
+    /// the active tab activates the first remaining one; closing the last
+    /// tab opens a blank one first, so the browser window never closes.
     pub async fn close_tab(&mut self, id: &str) -> Result<()> {
+        let pages: Vec<String> = self
+            .cdp
+            .pages()
+            .await?
+            .into_iter()
+            .filter_map(|t| t["targetId"].as_str().map(String::from))
+            .collect();
+        if !pages.iter().any(|p| p == id) {
+            return Err(Error::NotFound(format!("no tab {id}")));
+        }
+        if pages.len() == 1 {
+            self.new_tab("about:blank").await?;
+        }
         let result = self
             .browser_call("Target.closeTarget", json!({ "targetId": id }))
             .await?;
@@ -347,21 +569,18 @@ impl Web {
                 .await?
                 .into_iter()
                 .filter_map(|t| t["targetId"].as_str().map(String::from))
-                .find(|target| target != id);
-            match next {
-                Some(n) => self.select_tab(&n).await?,
-                None => {
-                    self.new_tab("about:blank").await?;
-                }
-            }
+                .find(|target| target != id)
+                .ok_or_else(|| Error::Protocol("no tab remains after close".into()))?;
+            self.select_tab(&next).await?;
         }
         Ok(())
     }
 
-    /// Navigate the active tab and wait for the load.
+    /// Navigate the active tab and wait for the load. Keyboard focus moves
+    /// into the page, as after typing an address.
     pub async fn navigate(&mut self, url: &str) -> Result<String> {
         check_url(url)?;
-        self.refs.clear();
+        self.drop_refs("the page navigated");
         let r = self
             .cdp
             .call("Page.navigate", json!({ "url": url }))
@@ -370,6 +589,7 @@ impl Web {
             return Err(Error::Protocol(format!("navigation failed: {err}")));
         }
         self.wait_loaded().await?;
+        self.focus_page().await?;
         self.current_url().await
     }
 
@@ -384,7 +604,7 @@ impl Web {
             .get(idx as usize)
             .filter(|_| idx >= 0)
             .ok_or_else(|| Error::NotFound("no history entry".into()))?;
-        self.refs.clear();
+        self.drop_refs("the page navigated");
         self.cdp
             .call(
                 "Page.navigateToHistoryEntry",
@@ -392,14 +612,16 @@ impl Web {
             )
             .await?;
         self.wait_loaded().await?;
+        self.focus_page().await?;
         self.current_url().await
     }
 
     /// Reload the active tab.
     pub async fn reload(&mut self) -> Result<String> {
-        self.refs.clear();
+        self.drop_refs("the page reloaded");
         self.cdp.call("Page.reload", json!({})).await?;
         self.wait_loaded().await?;
+        self.focus_page().await?;
         self.current_url().await
     }
 
@@ -430,79 +652,540 @@ impl Web {
             .to_string())
     }
 
-    /// Accessibility snapshot; refs stay valid until the next snapshot or navigation.
+    /// Accessibility snapshot of the main document and its in-process child
+    /// frames. Its refs replace the previous snapshot's and stay valid until
+    /// a newer snapshot or a navigation of the document each points into.
     pub async fn snapshot(&mut self) -> Result<Snapshot> {
-        let tree = self
-            .cdp
-            .call("Accessibility.getFullAXTree", json!({}))
-            .await?;
-        let nodes = tree["nodes"].as_array().cloned().unwrap_or_default();
-        let (text, refs) = render_tree(&nodes);
-        self.refs = refs;
+        self.refs = None;
+        let tree = self.cdp.call("Page.getFrameTree", json!({})).await?;
+        let mut frames = vec![&tree["frameTree"]];
+        let mut text = Vec::new();
+        let mut nodes_by_ref = HashMap::new();
+        let mut loaders = HashMap::new();
+        let main_frame = frame_id(&tree["frameTree"])?;
+        while let Some(frame) = frames.pop() {
+            let id = frame_id(frame)?;
+            loaders.insert(
+                id.clone(),
+                frame["frame"]["loaderId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            let ax = self
+                .cdp
+                .call("Accessibility.getFullAXTree", json!({"frameId": id}))
+                .await?;
+            let nodes = ax["nodes"].as_array().cloned().unwrap_or_default();
+            let (outline, refs) = render_tree(&nodes, nodes_by_ref.len());
+            text.push(outline);
+            nodes_by_ref.extend(refs.into_iter().map(|(key, backend)| {
+                (
+                    key,
+                    NodeRef {
+                        backend,
+                        frame: id.clone(),
+                    },
+                )
+            }));
+            // Local child frames only. Out-of-process frames are listed by
+            // their `Iframe` node and reached through desktop operations.
+            if let Some(children) = frame["childFrames"].as_array() {
+                frames.extend(children.iter().rev());
+            }
+        }
+        let url = self.current_url().await?;
+        self.snapshots += 1;
+        let id = format!("{}-{}", self.nonce, self.snapshots);
+        let refs = nodes_by_ref.len();
+        self.refs = Some(Refs {
+            id: id.clone(),
+            nodes: nodes_by_ref,
+            loaders,
+            main_frame,
+        });
+        self.dropped = None;
         Ok(Snapshot {
-            url: self.current_url().await?,
-            refs: self.refs.len(),
-            text,
+            id,
+            url,
+            refs,
+            text: text.join("\n"),
         })
     }
 
-    /// Click the element `reference` names.
-    pub async fn click(&mut self, reference: &str) -> Result<()> {
-        let (x, y) = self.center(reference).await?;
+    /// Click the element `target` names (a ref or a CSS selector). Keys held
+    /// with [`Web::key_down`] apply as modifiers.
+    pub async fn click(&mut self, target: &str) -> Result<()> {
+        let node = self.resolve(target).await?;
+        let (x, y) = self.center(&node, target).await?;
+        let modifiers = self.held_modifiers();
         for (kind, count) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 1)] {
             self.cdp
                 .call(
                     "Input.dispatchMouseEvent",
-                    json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": count }),
+                    json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": count, "modifiers": modifiers }),
                 )
                 .await?;
         }
         Ok(())
     }
 
-    /// Replace the value of the field `reference` names with `text`.
-    pub async fn fill(&mut self, reference: &str, text: &str) -> Result<()> {
-        self.focus_and_clear(reference).await?;
+    /// Replace the value of the field `target` names with `text`, typed as
+    /// trusted input. The field keeps focus.
+    pub async fn fill(&mut self, target: &str, text: &str) -> Result<()> {
+        let node = self.resolve(target).await?;
+        self.focus_and_clear(&node).await?;
         self.cdp
             .call("Input.insertText", json!({ "text": text }))
             .await?;
         Ok(())
     }
 
-    /// Fill with a secret only if the active tab's origin is `expect_origin`
-    /// (when given). The value is never returned or logged.
+    /// Replace a field's value in its owning frame. Origin validation and
+    /// insertion run synchronously on the same node in an isolated world.
+    /// Input/change events are dispatched but are not trusted keyboard events.
+    /// The secret is never returned or included in protocol error messages.
     pub async fn fill_secret(
         &mut self,
-        reference: &str,
+        target: &str,
         secret: &crate::Secret,
         expect_origin: Option<&str>,
     ) -> Result<()> {
-        if let Some(want) = expect_origin {
-            let url = self.current_url().await?;
-            let have = url::Url::parse(&url)
-                .map(|u| u.origin().ascii_serialization())
-                .unwrap_or_default();
-            if have != want.trim_end_matches('/') {
-                return Err(Error::Refused(format!("page origin {have} is not {want}")));
-            }
-        }
-        self.focus_and_clear(reference).await?;
-        self.cdp
-            .call("Input.insertText", json!({ "text": secret.expose() }))
+        let node = self.resolve(target).await?;
+        let refused = || Error::Refused("secret field changed or origin did not match".into());
+        let world = self
+            .cdp
+            .call(
+                "Page.createIsolatedWorld",
+                json!({
+                    "frameId": node.frame, "worldName": "credential-fill"
+                }),
+            )
             .await
-            .map_err(|_| Error::Protocol("inserting the secret failed".into()))?;
+            .map_err(|_| refused())?;
+        let context = world["executionContextId"].as_i64().ok_or_else(refused)?;
+        let resolved = self
+            .cdp
+            .call(
+                "DOM.resolveNode",
+                json!({
+                    "backendNodeId": node.backend, "executionContextId": context
+                }),
+            )
+            .await
+            .map_err(|_| refused())?;
+        let object = resolved["object"]["objectId"]
+            .as_str()
+            .ok_or_else(refused)?;
+        // Never use focused-element input for secrets: a focus handler can
+        // redirect it even without navigation. This function does not yield or
+        // invoke page code until after its checks and native DOM mutation.
+        let result = self
+            .cdp
+            .call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object,
+                    "functionDeclaration": SECRET_FILL,
+                    "arguments": [{"value": expect_origin.map(|o| o.trim_end_matches('/'))},
+                                  {"value": secret.expose()}],
+                    "returnByValue": true,
+                    "silent": true
+                }),
+            )
+            .await;
+        let _ = self
+            .cdp
+            .call("Runtime.releaseObject", json!({"objectId": object}))
+            .await;
+        let result = result.map_err(|_| Error::Protocol("secret insertion failed".into()))?;
+        if result.get("exceptionDetails").is_some() {
+            return Err(Error::Protocol("secret insertion failed".into()));
+        }
+        match result["result"]["value"].as_str() {
+            Some("ok") => Ok(()),
+            Some("unsupported") => Err(Error::Unsupported(
+                "secret fill requires an editable text field".into(),
+            )),
+            _ => Err(refused()),
+        }
+    }
+
+    /// Focus the element `target` names.
+    pub async fn focus(&mut self, target: &str) -> Result<()> {
+        let node = self.resolve(target).await?;
+        self.focus_page().await?;
+        self.cdp
+            .call("DOM.focus", json!({ "backendNodeId": node.backend }))
+            .await?;
         Ok(())
     }
 
-    async fn focus_and_clear(&mut self, reference: &str) -> Result<()> {
-        let node = self.node(reference)?;
+    /// Press a key chord such as `Enter` or `ctrl+a` inside the page: it
+    /// reaches the page's focused element (never the address bar, and never
+    /// a browser shortcut). Keyboard focus first moves into the page, so
+    /// later desktop keys reach it too.
+    pub async fn press(&mut self, chord: &str) -> Result<()> {
+        let keys = keys::chord(chord)?;
+        self.focus_page().await?;
+        let mut modifiers = self.held_modifiers();
+        for k in &keys {
+            self.key_event(true, k, modifiers).await?;
+            modifiers |= k.modifier;
+        }
+        for k in keys.iter().rev() {
+            modifiers &= !k.modifier;
+            self.key_event(false, k, modifiers).await?;
+        }
+        Ok(())
+    }
+
+    /// Press `chord` inside the page and hold it for `duration` (at most
+    /// [`MAX_HOLD`]) before releasing it.
+    pub async fn hold(&mut self, chord: &str, duration: Duration) -> Result<()> {
+        if duration > MAX_HOLD {
+            return Err(Error::InvalidInput(format!(
+                "a key is held for at most {} s",
+                MAX_HOLD.as_secs()
+            )));
+        }
+        self.key_down(chord).await?;
+        tokio::time::sleep(duration).await;
+        self.key_up(chord).await
+    }
+
+    /// Press the keys of `chord` inside the page and keep them down until
+    /// [`Web::key_up`] or [`Web::release_keys`]. Held modifiers apply to later
+    /// keys and clicks.
+    pub async fn key_down(&mut self, chord: &str) -> Result<()> {
+        let keys = keys::chord(chord)?;
+        self.focus_page().await?;
+        for k in keys {
+            if self.held.iter().any(|h| h.code == k.code && h.key == k.key) {
+                continue;
+            }
+            let modifiers = self.held_modifiers();
+            self.key_event(true, &k, modifiers).await?;
+            self.held.push(k);
+        }
+        Ok(())
+    }
+
+    /// Release the keys of `chord` that are held.
+    pub async fn key_up(&mut self, chord: &str) -> Result<()> {
+        for k in keys::chord(chord)?.iter().rev() {
+            if let Some(i) = self
+                .held
+                .iter()
+                .position(|h| h.code == k.code && h.key == k.key)
+            {
+                let held = self.held.remove(i);
+                let modifiers = self.held_modifiers();
+                self.key_event(false, &held, modifiers).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Release every held key, last pressed first.
+    pub async fn release_keys(&mut self) -> Result<()> {
+        while let Some(k) = self.held.pop() {
+            let modifiers = self.held_modifiers();
+            self.key_event(false, &k, modifiers).await?;
+        }
+        Ok(())
+    }
+
+    /// Keys held with [`Web::key_down`], as `KeyboardEvent.key` names.
+    pub fn held_keys(&self) -> Vec<String> {
+        self.held.iter().map(|k| k.key.clone()).collect()
+    }
+
+    /// Evaluate `expression` in the page (awaiting a promise) and return its
+    /// JSON value; `undefined` is `null`. A thrown exception is
+    /// [`Error::Script`].
+    pub async fn eval(&mut self, expression: &str) -> Result<Value> {
+        let r = self
+            .cdp
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expression,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                    "userGesture": true,
+                }),
+            )
+            .await?;
+        if let Some(ex) = r.get("exceptionDetails") {
+            let text = ex["exception"]["description"]
+                .as_str()
+                .or_else(|| ex["text"].as_str())
+                .unwrap_or("exception");
+            return Err(Error::Script(text.chars().take(2_000).collect()));
+        }
+        Ok(r["result"].get("value").cloned().unwrap_or(Value::Null))
+    }
+
+    /// The outer HTML of the element `target` names, or of the whole main
+    /// document when `None`.
+    pub async fn html(&mut self, target: Option<&str>) -> Result<String> {
+        let params = match target {
+            Some(t) => json!({ "backendNodeId": self.resolve(t).await?.backend }),
+            None => {
+                let doc = self
+                    .cdp
+                    .call("DOM.getDocument", json!({ "depth": 0 }))
+                    .await?;
+                json!({ "nodeId": doc["root"]["nodeId"] })
+            }
+        };
+        let r = self.cdp.call("DOM.getOuterHTML", params).await?;
+        Ok(r["outerHTML"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// Cookies sent to `urls` (the active page's URL when empty).
+    pub async fn cookies(&mut self, urls: &[String]) -> Result<Vec<Cookie>> {
+        let urls = if urls.is_empty() {
+            vec![self.current_url().await?]
+        } else {
+            urls.to_vec()
+        };
+        let r = self
+            .cdp
+            .call("Network.getCookies", json!({ "urls": urls }))
+            .await?;
+        serde_json::from_value(r["cookies"].clone())
+            .map_err(|e| Error::Protocol(format!("cookies: {e}")))
+    }
+
+    /// Set cookies; each needs `url` or `domain`.
+    pub async fn set_cookies(&mut self, cookies: &[Cookie]) -> Result<()> {
+        if let Some(c) = cookies
+            .iter()
+            .find(|c| c.name.is_empty() || (c.url.is_none() && c.domain.is_none()))
+        {
+            return Err(Error::InvalidInput(format!(
+                "cookie {:?} needs a name and a url or domain",
+                c.name
+            )));
+        }
         self.cdp
-            .call("DOM.focus", json!({ "backendNodeId": node }))
+            .call("Network.setCookies", json!({ "cookies": cookies }))
+            .await
+            .map_err(|e| Error::InvalidInput(format!("cookies refused: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete cookies named `name` that `url` would receive (the active
+    /// page's URL when `None`).
+    pub async fn delete_cookies(&mut self, name: &str, url: Option<&str>) -> Result<()> {
+        let url = match url {
+            Some(u) => u.to_string(),
+            None => self.current_url().await?,
+        };
+        self.cdp
+            .call("Network.deleteCookies", json!({ "name": name, "url": url }))
+            .await?;
+        Ok(())
+    }
+
+    /// Delete every cookie of the profile.
+    pub async fn clear_cookies(&mut self) -> Result<()> {
+        self.browser_call("Storage.clearCookies", json!({})).await?;
+        Ok(())
+    }
+
+    /// A PNG of the page: its viewport, or the whole scrollable page (cut at
+    /// [`MAX_PAGE_HEIGHT`]). Browser chrome and native dialogs are not in it;
+    /// a desktop screenshot shows those.
+    pub async fn page_screenshot(&mut self, full_page: bool) -> Result<PageImage> {
+        let metrics = self.cdp.call("Page.getLayoutMetrics", json!({})).await?;
+        let size = |v: &Value| {
+            (
+                v["width"].as_f64().unwrap_or(0.0).ceil() as u32,
+                v["height"].as_f64().unwrap_or(0.0).ceil() as u32,
+            )
+        };
+        let (vw, vh) = size(&metrics["cssLayoutViewport"]);
+        let (cw, ch) = size(&metrics["cssContentSize"]);
+        let (width, height, truncated, params) = if full_page {
+            let width = cw.max(vw).max(1);
+            let full = ch.max(vh).max(1);
+            let height = full.min(MAX_PAGE_HEIGHT);
+            (
+                width,
+                height,
+                full > height,
+                json!({
+                    "format": "png",
+                    "captureBeyondViewport": true,
+                    "clip": { "x": 0, "y": 0, "width": width, "height": height, "scale": 1 },
+                }),
+            )
+        } else {
+            (vw, vh, false, json!({ "format": "png" }))
+        };
+        let r = self.cdp.call("Page.captureScreenshot", params).await?;
+        let png = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            r["data"].as_str().unwrap_or_default(),
+        )
+        .map_err(|e| Error::Protocol(format!("screenshot data: {e}")))?;
+        Ok(PageImage {
+            png,
+            width,
+            height,
+            truncated,
+        })
+    }
+
+    /// The node `target` names, in a document that is still current.
+    async fn resolve(&mut self, target: &str) -> Result<NodeRef> {
+        let frames = self.frames().await?;
+        match Locator::parse(target)? {
+            Locator::Css(selector) => {
+                let doc = self
+                    .cdp
+                    .call("DOM.getDocument", json!({ "depth": 0 }))
+                    .await?;
+                let found = self
+                    .cdp
+                    .call(
+                        "DOM.querySelector",
+                        json!({ "nodeId": doc["root"]["nodeId"], "selector": selector }),
+                    )
+                    .await
+                    .map_err(|e| Error::InvalidInput(format!("selector {selector:?}: {e}")))?;
+                let node_id = found["nodeId"].as_i64().unwrap_or(0);
+                if node_id == 0 {
+                    return Err(Error::NotFound(format!("no element matches {selector:?}")));
+                }
+                let described = self
+                    .cdp
+                    .call("DOM.describeNode", json!({ "nodeId": node_id }))
+                    .await?;
+                let backend = described["node"]["backendNodeId"]
+                    .as_i64()
+                    .ok_or_else(|| Error::Protocol("node has no backend id".into()))?;
+                Ok(NodeRef {
+                    backend,
+                    frame: frames.main,
+                })
+            }
+            Locator::Ref { snapshot, id } => {
+                let Some(refs) = &self.refs else {
+                    return Err(match &self.dropped {
+                        Some(why) => Error::StaleRef(format!(
+                            "{target}: {why} since the last snapshot; take a new snapshot"
+                        )),
+                        None => Error::NotFound(format!(
+                            "{target}: no snapshot of this page yet; take one first"
+                        )),
+                    });
+                };
+                if let Some(s) = snapshot.as_deref()
+                    && s != refs.id
+                {
+                    return Err(Error::StaleRef(format!(
+                        "{target} names snapshot {s}, which snapshot {} replaced",
+                        refs.id
+                    )));
+                }
+                let navigated = frames.main != refs.main_frame
+                    || frames.loaders.get(&frames.main) != refs.loaders.get(&refs.main_frame);
+                let node = refs.nodes.get(&id).cloned();
+                let frame_navigated = node
+                    .as_ref()
+                    .is_some_and(|n| frames.loaders.get(&n.frame) != refs.loaders.get(&n.frame));
+                if navigated {
+                    self.drop_refs("the page navigated");
+                    return Err(Error::StaleRef(format!(
+                        "{target}: the page navigated since the last snapshot; take a new snapshot"
+                    )));
+                }
+                let node = node.ok_or_else(|| {
+                    Error::NotFound(format!("{target} is not in the latest snapshot"))
+                })?;
+                if frame_navigated {
+                    return Err(Error::StaleRef(format!(
+                        "{target}: its frame navigated since the last snapshot; take a new snapshot"
+                    )));
+                }
+                Ok(node)
+            }
+        }
+    }
+
+    async fn frames(&mut self) -> Result<Frames> {
+        let tree = self.cdp.call("Page.getFrameTree", json!({})).await?;
+        let mut loaders = HashMap::new();
+        let mut stack = vec![&tree["frameTree"]];
+        while let Some(f) = stack.pop() {
+            loaders.insert(
+                frame_id(f)?,
+                f["frame"]["loaderId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            if let Some(children) = f["childFrames"].as_array() {
+                stack.extend(children);
+            }
+        }
+        Ok(Frames {
+            main: frame_id(&tree["frameTree"])?,
+            loaders,
+        })
+    }
+
+    fn drop_refs(&mut self, why: &str) {
+        if self.refs.take().is_some() || self.dropped.is_some() {
+            self.dropped = Some(why.to_string());
+        }
+    }
+
+    /// Hand native keyboard focus from the browser chrome (the address bar
+    /// after a DevTools navigation) to the page.
+    async fn focus_page(&mut self) -> Result<()> {
+        self.cdp.call("Page.bringToFront", json!({})).await?;
+        Ok(())
+    }
+
+    fn held_modifiers(&self) -> i64 {
+        self.held.iter().fold(0, |m, k| m | k.modifier)
+    }
+
+    async fn key_event(&mut self, down: bool, k: &keys::Key, modifiers: i64) -> Result<()> {
+        let text = if down { k.text_with(modifiers) } else { None };
+        let kind = match (down, text.is_some()) {
+            (true, true) => "keyDown",
+            (true, false) => "rawKeyDown",
+            (false, _) => "keyUp",
+        };
+        let mut params = json!({
+            "type": kind,
+            "key": k.key_with(modifiers),
+            "code": k.code,
+            "windowsVirtualKeyCode": k.vk,
+            "modifiers": modifiers,
+        });
+        if let Some(t) = text {
+            params["text"] = json!(t);
+            params["unmodifiedText"] = json!(t);
+        }
+        self.cdp.call("Input.dispatchKeyEvent", params).await?;
+        Ok(())
+    }
+
+    async fn focus_and_clear(&mut self, node: &NodeRef) -> Result<()> {
+        self.cdp
+            .call("DOM.focus", json!({ "backendNodeId": node.backend }))
             .await?;
         for (kind, key, code, vk, mods) in [
-            ("keyDown", "a", "KeyA", 65, 2),
-            ("keyUp", "a", "KeyA", 65, 2),
-            ("keyDown", "Delete", "Delete", 46, 0),
+            ("rawKeyDown", "a", "KeyA", 65, keys::CTRL),
+            ("keyUp", "a", "KeyA", 65, keys::CTRL),
+            ("rawKeyDown", "Delete", "Delete", 46, 0),
             ("keyUp", "Delete", "Delete", 46, 0),
         ] {
             self.cdp
@@ -515,31 +1198,25 @@ impl Web {
         Ok(())
     }
 
-    fn node(&self, reference: &str) -> Result<i64> {
-        let key = normalize_ref(reference);
-        self.refs
-            .get(&key)
-            .copied()
-            .ok_or_else(|| Error::NotFound(format!("{reference} is not in the latest snapshot")))
-    }
-
-    async fn center(&mut self, reference: &str) -> Result<(f64, f64)> {
-        let node = self.node(reference)?;
+    async fn center(&mut self, node: &NodeRef, target: &str) -> Result<(f64, f64)> {
         let _ = self
             .cdp
             .call(
                 "DOM.scrollIntoViewIfNeeded",
-                json!({ "backendNodeId": node }),
+                json!({ "backendNodeId": node.backend }),
             )
             .await;
         let q = self
             .cdp
-            .call("DOM.getContentQuads", json!({ "backendNodeId": node }))
+            .call(
+                "DOM.getContentQuads",
+                json!({ "backendNodeId": node.backend }),
+            )
             .await?;
         let quad = q["quads"][0]
             .as_array()
             .filter(|a| a.len() == 8)
-            .ok_or_else(|| Error::NotFound(format!("{reference} is not visible")))?;
+            .ok_or_else(|| Error::NotFound(format!("{target} is not visible")))?;
         let v: Vec<f64> = quad.iter().map(|n| n.as_f64().unwrap_or(0.0)).collect();
         Ok((
             (v[0] + v[2] + v[4] + v[6]) / 4.0,
@@ -576,6 +1253,24 @@ impl Web {
     }
 }
 
+/// Longest key hold.
+pub const MAX_HOLD: Duration = Duration::from_secs(10);
+
+fn frame_id(tree: &Value) -> Result<String> {
+    tree["frame"]["id"]
+        .as_str()
+        .map(String::from)
+        .ok_or_else(|| Error::Protocol("frame missing id".into()))
+}
+
+/// A short random id that tells one browser's snapshots from another's.
+fn nonce() -> Result<String> {
+    use std::io::Read as _;
+    let mut b = [0u8; 4];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect())
+}
+
 fn check_url(url: &str) -> Result<()> {
     let u = url::Url::parse(url).map_err(|e| Error::InvalidInput(format!("URL {url:?}: {e}")))?;
     match u.scheme() {
@@ -586,13 +1281,8 @@ fn check_url(url: &str) -> Result<()> {
     }
 }
 
-/// `@e3`, `e3` → `e3`.
-fn normalize_ref(r: &str) -> String {
-    r.trim().trim_start_matches('@').to_string()
-}
-
 /// Render AX nodes as an outline; interactive nodes get refs to their DOM node.
-fn render_tree(nodes: &[Value]) -> (String, HashMap<String, i64>) {
+fn render_tree(nodes: &[Value], start: usize) -> (String, HashMap<String, i64>) {
     let by_id: HashMap<&str, &Value> = nodes
         .iter()
         .filter_map(|n| Some((n["nodeId"].as_str()?, n)))
@@ -624,7 +1314,7 @@ fn render_tree(nodes: &[Value]) -> (String, HashMap<String, i64>) {
                 line.push_str(&format!(" {:?}", short));
             }
             if interactive && let Some(dom) = n["backendDOMNodeId"].as_i64() {
-                let r = format!("e{}", refs.len() + 1);
+                let r = format!("e{}", start + refs.len() + 1);
                 line.push_str(&format!(" [@{r}]"));
                 refs.insert(r, dom);
             }
@@ -676,7 +1366,7 @@ mod tests {
             {"nodeId": "5", "role": {"value": "button"}, "name": {"value": "Hidden"}, "ignored": true, "backendDOMNodeId": 43, "childIds": []}
         ]))
         .unwrap();
-        let (text, refs) = render_tree(&nodes);
+        let (text, refs) = render_tree(&nodes, 0);
         assert_eq!(
             text,
             "- heading \"Sign in\"\n- textbox \"Email\" [@e1]\n- button \"Continue\" [@e2]"
@@ -684,7 +1374,6 @@ mod tests {
         assert_eq!(refs.get("e1"), Some(&41));
         assert_eq!(refs.get("e2"), Some(&42));
         assert_eq!(refs.len(), 2);
-        assert_eq!(normalize_ref("@e2"), "e2");
     }
 
     #[test]

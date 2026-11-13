@@ -1,6 +1,6 @@
 [package]
 name = "agent-workstation"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -9,7 +9,7 @@ repository = "https://github.com/SylphxAI/agent-workstation"
 readme = "README.md"
 keywords = ["agent", "browser", "wayland", "automation", "vnc"]
 categories = ["web-programming", "api-bindings", "development-tools::testing"]
-include = ["/src/**", "/assets/**", "/tests/**", "/LICENSE", "/README.md"]
+include = ["/src/**", "/assets/**", "/tests/**", "/LICENSE", "/README.md", "/CHANGELOG.md"]
 
 [workspace]
 # `bench/` is an independent tree; it may depend on this crate by path.
@@ -31,7 +31,7 @@ png = "0.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["event", "fs", "pipe"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
@@ -39,6 +39,7 @@ wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [dev-dependencies]
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 
 [lints.rust]

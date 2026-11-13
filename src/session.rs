@@ -2,15 +2,18 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
+use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::browser::{Browser, BrowserConfig, Snapshot, Tab, Web};
+use crate::browser::{Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web};
 #[cfg(target_os = "linux")]
 use crate::compositor::Compositor;
 use crate::error::{Error, Result};
 use crate::fingerprint::{Fingerprint, FingerprintDefaults};
-use crate::gate::{ControlGate, HandBack};
+use crate::gate::{ControlGate, HandBack, Lease};
 use crate::profile::Profile;
 use crate::proxy::{Proxy, ProxyEndpoint};
 use crate::secret::SecretResolver;
@@ -20,6 +23,9 @@ use crate::vnc::Vnc;
 #[cfg(target_os = "linux")]
 use crate::wayland::{self, InputDevice};
 use crate::{Button, Frame, Input};
+
+/// Longest key hold on the desktop or in a page.
+pub const MAX_HOLD: Duration = crate::browser::MAX_HOLD;
 
 /// Everything a session needs; all paths and values are caller-owned.
 #[derive(Clone, Debug)]
@@ -58,8 +64,22 @@ impl SessionConfig {
     }
 }
 
+/// The session's helper processes, owned until [`DesktopSession::close`].
+#[derive(Debug, Default)]
+struct Processes {
+    #[cfg(target_os = "linux")]
+    vnc: Option<Vnc>,
+    browser: Option<Browser>,
+    #[cfg(target_os = "linux")]
+    compositor: Option<Compositor>,
+    proxy: Option<ProxyEndpoint>,
+}
+
 /// One headless Wayland desktop with one headful browser.
 ///
+/// One agent principal at a time owns it: [`DesktopSession::lease`] returns
+/// that principal's [`Agent`] view, through which every web and desktop
+/// operation goes, and refuses any other principal with [`Error::Leased`].
 /// Web and desktop operations act on the same window and share one control
 /// gate: while a person holds control, every call returns
 /// [`Error::HumanInControl`].
@@ -69,12 +89,8 @@ pub struct DesktopSession {
     fingerprint: Fingerprint,
     web: Mutex<Web>,
     takeover: Option<Takeover>,
-    #[cfg(target_os = "linux")]
-    vnc: Option<Vnc>,
-    browser: Option<Browser>,
-    #[cfg(target_os = "linux")]
-    compositor: Option<Compositor>,
-    _proxy: Option<ProxyEndpoint>,
+    processes: std::sync::Mutex<Processes>,
+    closed: AtomicBool,
     #[cfg(target_os = "linux")]
     socket: PathBuf,
     #[cfg(target_os = "linux")]
@@ -91,20 +107,41 @@ impl DesktopSession {
         let fingerprint = config.profile.fingerprint(&config.fingerprint_defaults)?;
         fingerprint.validate()?;
         let size = (fingerprint.screen_width, fingerprint.screen_height);
+        let gate = ControlGate::new();
         let compositor =
             Compositor::start(&config.compositor, &config.runtime_dir, size.0, size.1).await?;
         let env = compositor.client_env();
         let socket = compositor.socket_path();
         let proxy = match &config.proxy {
-            Some(p) => Some(p.start().await?),
+            Some(p) => match p.start().await {
+                Ok(endpoint) => Some(endpoint),
+                Err(e) => {
+                    compositor.shutdown().await;
+                    return Err(e);
+                }
+            },
             None => None,
         };
         // Register the seat's keyboard/pointer before Chromium binds wl_seat,
-        // rather than hoping it has processed a capability change after a delay.
+        // rather than hoping it has processed a capability change after a
+        // delay. The pointer starts at the centre, so its position is known.
         let input = {
             let (socket, size) = (socket.clone(), size);
-            match blocking(move || InputDevice::open(&socket, size)).await {
-                Ok(i) => Arc::new(std::sync::Mutex::new(i)),
+            let center = (f64::from(size.0 / 2), f64::from(size.1 / 2));
+            let opened = blocking(move || {
+                let mut device = InputDevice::open(&socket, size)?;
+                device.run(&[Input::Move {
+                    x: center.0,
+                    y: center.1,
+                }])?;
+                Ok(device)
+            })
+            .await;
+            match opened {
+                Ok(i) => {
+                    gate.note_pointer(center.0, center.1);
+                    Arc::new(std::sync::Mutex::new(i))
+                }
                 Err(e) => {
                     compositor.shutdown().await;
                     return Err(e);
@@ -128,55 +165,62 @@ impl DesktopSession {
                 return Err(e);
             }
         };
-        if let Err(e) = async { compositor.wait_for_focused_window(browser.pid()?).await }.await {
-            browser.shutdown().await;
-            compositor.shutdown().await;
-            return Err(e);
+        let web = async {
+            compositor.wait_for_focused_window(browser.pid()?).await?;
+            Web::connect(browser.endpoint()).await
         }
-        let mut session = Self {
-            gate: ControlGate::new(),
-            fingerprint,
-            web: Mutex::new(match Web::connect(browser.endpoint()).await {
-                Ok(w) => w,
-                Err(e) => {
-                    browser.shutdown().await;
-                    compositor.shutdown().await;
-                    return Err(e);
-                }
-            }),
-            takeover: None,
+        .await;
+        let web = match web {
+            Ok(w) => w,
+            Err(e) => {
+                browser.shutdown().await;
+                compositor.shutdown().await;
+                return Err(e);
+            }
+        };
+        let mut processes = Processes {
             vnc: None,
             browser: Some(browser),
             compositor: Some(compositor),
-            _proxy: proxy,
+            proxy,
+        };
+        let takeover = match config.takeover {
+            None => None,
+            Some(tc) => {
+                let started = async {
+                    let vnc = Vnc::start(&config.vnc, &env, &config.runtime_dir).await?;
+                    match Takeover::start(tc, vnc.socket().to_path_buf(), gate.clone()).await {
+                        Ok(t) => Ok((vnc, t)),
+                        Err(e) => {
+                            vnc.shutdown().await;
+                            Err(e)
+                        }
+                    }
+                }
+                .await;
+                match started {
+                    Ok((vnc, t)) => {
+                        processes.vnc = Some(vnc);
+                        Some(t)
+                    }
+                    Err(e) => {
+                        stop_processes(processes).await;
+                        return Err(e);
+                    }
+                }
+            }
+        };
+        Ok(Self {
+            gate,
+            fingerprint,
+            web: Mutex::new(web),
+            takeover,
+            processes: std::sync::Mutex::new(processes),
+            closed: AtomicBool::new(false),
             socket,
             input,
             size,
-        };
-        if let Some(tc) = config.takeover {
-            let started = async {
-                let vnc = Vnc::start(&config.vnc, &env, &config.runtime_dir).await?;
-                let t = Takeover::start(tc, vnc.socket().to_path_buf(), session.gate.clone()).await;
-                Ok::<_, Error>((vnc, t))
-            }
-            .await;
-            match started {
-                Ok((vnc, Ok(t))) => {
-                    session.vnc = Some(vnc);
-                    session.takeover = Some(t);
-                }
-                Ok((vnc, Err(e))) => {
-                    vnc.shutdown().await;
-                    session.shutdown().await;
-                    return Err(e);
-                }
-                Err(e) => {
-                    session.shutdown().await;
-                    return Err(e);
-                }
-            }
-        }
-        Ok(session)
+        })
     }
 
     /// Desktop sessions require Linux. No files or processes are created.
@@ -190,9 +234,56 @@ impl DesktopSession {
         &self.gate
     }
 
+    /// Acquire the session for `principal` (or confirm it already holds it)
+    /// and return its view. Another principal's lease is
+    /// [`Error::Leased`], naming the holder.
+    pub fn lease(&self, principal: &str) -> Result<Agent<'_>> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        self.gate.acquire(principal)?;
+        Ok(Agent {
+            session: self,
+            principal: principal.to_string(),
+        })
+    }
+
+    /// Release `principal`'s lease, so another principal may acquire the
+    /// session. `false` when it did not hold it. Held page keys are not
+    /// released; the next holder starts with [`Agent::release_keys`] if it
+    /// cares.
+    pub fn release(&self, principal: &str) -> bool {
+        self.gate.release_lease(principal)
+    }
+
+    /// Who holds the session, if anyone.
+    pub fn leaseholder(&self) -> Option<Lease> {
+        self.gate.lease()
+    }
+
     /// Takeover page URL (with its token), when takeover is enabled.
     pub fn takeover_url(&self) -> Option<url::Url> {
         self.takeover.as_ref().map(Takeover::url)
+    }
+
+    /// Change where people reach the takeover page; see
+    /// [`Takeover::set_public_url`].
+    pub fn set_takeover_public_url(&self, url: url::Url) -> Result<()> {
+        self.takeover
+            .as_ref()
+            .ok_or_else(|| Error::Unsupported("this session has no takeover page".into()))?
+            .set_public_url(url)
+    }
+
+    /// The takeover page as a router to mount in the caller's own HTTP
+    /// server; see [`Takeover::router`].
+    pub fn takeover_router(&self) -> Option<axum::Router> {
+        self.takeover.as_ref().map(Takeover::router)
+    }
+
+    /// The takeover page's own listener, when it has one.
+    pub fn takeover_addr(&self) -> Option<std::net::SocketAddr> {
+        self.takeover.as_ref().and_then(Takeover::local_addr)
     }
 
     /// The profile's fingerprint.
@@ -205,22 +296,95 @@ impl DesktopSession {
         self.size
     }
 
-    /// The most recent hand-back from a person (with their note), once.
-    pub fn take_hand_back(&self) -> Option<HandBack> {
-        self.gate.take_hand_back()
+    /// Whether [`DesktopSession::close`] has run.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
-    async fn web(&self) -> Result<tokio::sync::MutexGuard<'_, Web>> {
-        self.gate.check_agent()?;
-        let guard = self.web.lock().await;
-        // A person may have taken control while this call waited.
-        self.gate.check_agent()?;
+    /// Close the session: new calls fail with [`Error::Closed`], calls in
+    /// flight finish first, then the takeover page, the VNC server, the
+    /// browser (gracefully, so it flushes the profile) and the compositor
+    /// stop. Safe to call from any holder of a shared reference, and more
+    /// than once.
+    pub async fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let _in_flight = self.web.lock().await;
+        if let Some(t) = &self.takeover {
+            t.stop();
+        }
+        let processes =
+            std::mem::take(&mut *self.processes.lock().unwrap_or_else(|p| p.into_inner()));
+        stop_processes(processes).await;
+    }
+
+    fn check(&self, principal: &str) -> Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::Closed);
+        }
+        self.gate.check(principal)
+    }
+}
+
+async fn stop_processes(mut p: Processes) {
+    #[cfg(target_os = "linux")]
+    if let Some(v) = p.vnc.take() {
+        v.shutdown().await;
+    }
+    if let Some(b) = p.browser.take() {
+        b.shutdown().await;
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(c) = p.compositor.take() {
+        c.shutdown().await;
+    }
+    drop(p.proxy.take());
+}
+
+/// One agent principal's view of a [`DesktopSession`] it holds.
+///
+/// Every call first checks that the principal still holds the lease (another
+/// principal's is [`Error::Leased`]) and that no person holds control
+/// ([`Error::HumanInControl`]).
+#[derive(Debug, Clone)]
+pub struct Agent<'a> {
+    session: &'a DesktopSession,
+    principal: String,
+}
+
+impl<'a> Agent<'a> {
+    /// The principal this view acts for.
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// The session.
+    pub fn session(&self) -> &'a DesktopSession {
+        self.session
+    }
+
+    /// Release the lease.
+    pub fn release(self) -> bool {
+        self.session.release(&self.principal)
+    }
+
+    /// The most recent hand-back from a person (with their note), once.
+    pub fn take_hand_back(&self) -> Result<Option<HandBack>> {
+        self.session.check(&self.principal)?;
+        Ok(self.session.gate.take_hand_back())
+    }
+
+    async fn web(&self) -> Result<tokio::sync::MutexGuard<'a, Web>> {
+        self.session.check(&self.principal)?;
+        let guard = self.session.web.lock().await;
+        // The lease, a person, or close may have changed while this call waited.
+        self.session.check(&self.principal)?;
         Ok(guard)
     }
 
     // ---- web operations -------------------------------------------------
 
-    /// Navigate the active tab; returns the final URL.
+    /// Navigate the active tab; returns the final URL. Keyboard focus moves
+    /// into the page.
     pub async fn navigate(&self, url: &str) -> Result<String> {
         self.web().await?.navigate(url).await
     }
@@ -260,7 +424,7 @@ impl DesktopSession {
         self.web().await?.select_tab(id).await
     }
 
-    /// Close a tab.
+    /// Close a tab; returns once the browser has destroyed it.
     pub async fn close_tab(&self, id: &str) -> Result<()> {
         self.web().await?.close_tab(id).await
     }
@@ -275,55 +439,129 @@ impl DesktopSession {
         self.web().await?.read().await
     }
 
-    /// Click an element by ref.
-    pub async fn click(&self, reference: &str) -> Result<()> {
-        self.web().await?.click(reference).await
+    /// Click an element by ref or CSS selector.
+    pub async fn click(&self, target: &str) -> Result<()> {
+        self.web().await?.click(target).await
     }
 
     /// Replace a field's value.
-    pub async fn fill(&self, reference: &str, text: &str) -> Result<()> {
-        self.web().await?.fill(reference, text).await
+    pub async fn fill(&self, target: &str, text: &str) -> Result<()> {
+        self.web().await?.fill(target, text).await
     }
 
     /// Fill a field with the secret `secret_ref` names, resolved by
     /// `resolver` at the moment of insertion. When `expect_origin` is given,
-    /// the fill is refused unless the active tab is on that origin.
+    /// the fill is refused unless the field's owning frame has that origin.
+    /// Validation and node-bound DOM insertion are synchronous; emitted
+    /// input/change events are not trusted keyboard events.
     pub async fn fill_secret(
         &self,
-        reference: &str,
+        target: &str,
         secret_ref: &str,
         resolver: &dyn SecretResolver,
         expect_origin: Option<&str>,
     ) -> Result<()> {
         let mut web = self.web().await?;
         let secret = resolver.resolve(secret_ref).await?;
-        self.gate.check_agent()?;
-        web.fill_secret(reference, &secret, expect_origin).await
+        self.session.check(&self.principal)?;
+        web.fill_secret(target, &secret, expect_origin).await
+    }
+
+    /// Focus an element by ref or CSS selector.
+    pub async fn focus(&self, target: &str) -> Result<()> {
+        self.web().await?.focus(target).await
+    }
+
+    /// Press a chord inside the page (it reaches the page's focused element,
+    /// not the address bar).
+    pub async fn press(&self, chord: &str) -> Result<()> {
+        self.web().await?.press(chord).await
+    }
+
+    /// Press a chord inside the page, hold it for `duration` (at most
+    /// [`MAX_HOLD`]), and release it.
+    pub async fn press_and_hold(&self, chord: &str, duration: Duration) -> Result<()> {
+        self.web().await?.hold(chord, duration).await
+    }
+
+    /// Hold the keys of a chord down inside the page until
+    /// [`Agent::key_up`] or [`Agent::release_keys`].
+    pub async fn key_down(&self, chord: &str) -> Result<()> {
+        self.web().await?.key_down(chord).await
+    }
+
+    /// Release held page keys.
+    pub async fn key_up(&self, chord: &str) -> Result<()> {
+        self.web().await?.key_up(chord).await
+    }
+
+    /// Release every held page key.
+    pub async fn release_keys(&self) -> Result<()> {
+        self.web().await?.release_keys().await
+    }
+
+    /// Page keys held down, in press order.
+    pub async fn held_keys(&self) -> Result<Vec<String>> {
+        Ok(self.web().await?.held_keys())
+    }
+
+    /// Evaluate a script expression in the page.
+    pub async fn eval(&self, expression: &str) -> Result<Value> {
+        self.web().await?.eval(expression).await
+    }
+
+    /// Outer HTML of an element, or of the document.
+    pub async fn html(&self, target: Option<&str>) -> Result<String> {
+        self.web().await?.html(target).await
+    }
+
+    /// Cookies sent to `urls` (the active page's URL when empty).
+    pub async fn cookies(&self, urls: &[String]) -> Result<Vec<Cookie>> {
+        self.web().await?.cookies(urls).await
+    }
+
+    /// Set cookies.
+    pub async fn set_cookies(&self, cookies: &[Cookie]) -> Result<()> {
+        self.web().await?.set_cookies(cookies).await
+    }
+
+    /// Delete cookies by name for a URL (the active page's when `None`).
+    pub async fn delete_cookies(&self, name: &str, url: Option<&str>) -> Result<()> {
+        self.web().await?.delete_cookies(name, url).await
+    }
+
+    /// Delete every cookie of the profile.
+    pub async fn clear_cookies(&self) -> Result<()> {
+        self.web().await?.clear_cookies().await
+    }
+
+    /// PNG of the page's viewport or of the whole page.
+    pub async fn page_screenshot(&self, full_page: bool) -> Result<PageImage> {
+        self.web().await?.page_screenshot(full_page).await
     }
 
     // ---- desktop operations ---------------------------------------------
 
     /// Screenshot of the whole desktop.
     pub async fn screenshot(&self) -> Result<Frame> {
-        self.gate.check_agent()?;
+        self.session.check(&self.principal)?;
         #[cfg(not(target_os = "linux"))]
         return Err(Error::Unsupported(
             "desktop screenshots require Linux".into(),
         ));
         #[cfg(target_os = "linux")]
         {
-            let socket = self.socket.clone();
+            let socket = self.session.socket.clone();
             let frame = blocking(move || wayland::screenshot(&socket)).await?;
-            self.gate.check_agent()?;
+            self.session.check(&self.principal)?;
             Ok(frame)
         }
     }
 
-    /// Run pointer/keyboard steps on the desktop.
+    /// Run pointer/keyboard steps on the desktop. Keys held by
+    /// [`Input::KeyDown`] are released when the steps end.
     pub async fn input(&self, steps: Vec<Input>) -> Result<()> {
-        self.gate.check_agent()?;
-        let _web = self.web.lock().await;
-        self.gate.check_agent()?;
+        let _web = self.web().await?;
         #[cfg(not(target_os = "linux"))]
         {
             let _ = steps;
@@ -331,8 +569,19 @@ impl DesktopSession {
         }
         #[cfg(target_os = "linux")]
         {
-            let input = self.input.clone();
-            blocking(move || input.lock().map_err(|_| Error::Closed)?.run(&steps)).await
+            let input = self.session.input.clone();
+            let last = steps.iter().rev().find_map(|s| match s {
+                Input::Move { x, y } => Some((*x, *y)),
+                _ => None,
+            });
+            let result =
+                blocking(move || input.lock().map_err(|_| Error::Closed)?.run(&steps)).await;
+            if result.is_ok()
+                && let Some((x, y)) = last
+            {
+                self.session.gate.note_pointer(x, y);
+            }
+            result
         }
     }
 
@@ -352,7 +601,7 @@ impl DesktopSession {
         .await
     }
 
-    /// Press a key chord such as `ctrl+l`.
+    /// Press a key chord such as `ctrl+l` on the desktop keyboard.
     ///
     /// Completion acknowledges compositor processing, not the application's
     /// handling of the shortcut. Observe its effect before sending input that
@@ -361,10 +610,27 @@ impl DesktopSession {
         self.input(vec![Input::Key(chord.to_string())]).await
     }
 
+    /// Hold a chord on the desktop keyboard for `duration` (at most
+    /// [`MAX_HOLD`]), then release it.
+    pub async fn hold_key(&self, chord: &str, duration: Duration) -> Result<()> {
+        if duration > MAX_HOLD {
+            return Err(Error::InvalidInput(format!(
+                "a key is held for at most {} s",
+                MAX_HOLD.as_secs()
+            )));
+        }
+        self.input(vec![
+            Input::KeyDown(chord.to_string()),
+            Input::Wait(duration),
+            Input::KeyUp(chord.to_string()),
+        ])
+        .await
+    }
+
     /// Type text into whatever has keyboard focus.
     ///
     /// The caller must establish the intended application's focus first;
-    /// completing a preceding [`Self::key`] does not acknowledge a UI change.
+    /// completing a preceding [`Agent::key`] does not acknowledge a UI change.
     pub async fn type_text(&self, text: &str) -> Result<()> {
         self.input(vec![Input::Text(text.to_string())]).await
     }
@@ -375,21 +641,43 @@ impl DesktopSession {
             .await
     }
 
-    /// Stop everything. The profile is flushed by the browser's graceful close.
-    pub async fn shutdown(mut self) {
-        if let Some(t) = self.takeover.take() {
-            t.shutdown().await;
+    /// Where the desktop pointer is, as last placed by this agent or by a
+    /// person during takeover.
+    pub fn pointer_position(&self) -> Result<Option<(f64, f64)>> {
+        self.session.check(&self.principal)?;
+        Ok(self.session.gate.pointer())
+    }
+
+    /// The desktop clipboard's text (`None` when it holds no text).
+    pub async fn clipboard_text(&self) -> Result<Option<String>> {
+        self.session.check(&self.principal)?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(Error::Unsupported(
+            "the desktop clipboard requires Linux".into(),
+        ));
+        #[cfg(target_os = "linux")]
+        {
+            let socket = self.session.socket.clone();
+            let text = blocking(move || wayland::clipboard_text(&socket)).await?;
+            self.session.check(&self.principal)?;
+            Ok(text)
+        }
+    }
+
+    /// Put text on the desktop clipboard (paste it with `ctrl+v`).
+    pub async fn set_clipboard_text(&self, text: &str) -> Result<()> {
+        self.session.check(&self.principal)?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = text;
+            Err(Error::Unsupported(
+                "the desktop clipboard requires Linux".into(),
+            ))
         }
         #[cfg(target_os = "linux")]
-        if let Some(v) = self.vnc.take() {
-            v.shutdown().await;
-        }
-        if let Some(b) = self.browser.take() {
-            b.shutdown().await;
-        }
-        #[cfg(target_os = "linux")]
-        if let Some(c) = self.compositor.take() {
-            c.shutdown().await;
+        {
+            let (socket, text) = (self.session.socket.clone(), text.to_string());
+            blocking(move || wayland::set_clipboard_text(&socket, text)).await
         }
     }
 }

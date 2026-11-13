@@ -1,10 +1,19 @@
-//! Who controls the session desktop right now: the agent or a person.
+//! Who controls the session desktop right now: which agent, or a person.
 //!
 //! [`ControlGate`] is the single authority both views and the takeover server
-//! consult. While a person holds control, [`ControlGate::check_agent`] returns
-//! [`Error::HumanInControl`] for every agent action and observation, and only
-//! the person's VNC input reaches the display. Handing back (explicitly, or
-//! after [`IDLE_TIMEOUT`] without input) resumes the agent.
+//! consult. It answers two questions:
+//!
+//! - **Which agent owns the session.** One agent principal at a time holds
+//!   the session's [`Lease`]; every other principal gets [`Error::Leased`]
+//!   until the holder releases it or the session closes.
+//! - **Whether a person drives it.** While a person holds control,
+//!   [`ControlGate::check_agent`] returns [`Error::HumanInControl`] for every
+//!   agent action and observation, and only the person's VNC input reaches
+//!   the display. Handing back (explicitly, or after [`IDLE_TIMEOUT`] without
+//!   input) resumes the lease holder.
+//!
+//! It also records where the desktop pointer is, whichever side moved it
+//! last.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,12 +54,24 @@ pub enum HandBack {
     Idle,
 }
 
+/// One agent principal's exclusive hold on a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lease {
+    /// Caller-defined agent identity (compared exactly, never interpreted).
+    pub principal: String,
+    /// When it was acquired.
+    pub since: DateTime<Utc>,
+}
+
 /// Shared control state for one session.
 #[derive(Debug)]
 pub struct ControlGate {
     holder: watch::Sender<Holder>,
     last_hand_back: std::sync::Mutex<Option<HandBack>>,
     idle_timeout: Duration,
+    lease: std::sync::Mutex<Option<Lease>>,
+    pointer: std::sync::Mutex<Option<(f64, f64)>>,
+    hand_backs: std::sync::atomic::AtomicU64,
 }
 
 impl ControlGate {
@@ -65,7 +86,80 @@ impl ControlGate {
             holder: watch::channel(Holder::Agent).0,
             last_hand_back: std::sync::Mutex::new(None),
             idle_timeout,
+            lease: std::sync::Mutex::new(None),
+            pointer: std::sync::Mutex::new(None),
+            hand_backs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Acquire the lease for `principal`, or confirm that it already holds
+    /// it. [`Error::Leased`] names the holder when another principal has it.
+    pub fn acquire(&self, principal: &str) -> Result<Lease> {
+        if principal.trim().is_empty() {
+            return Err(Error::InvalidInput("empty agent principal".into()));
+        }
+        let mut lease = self.lease.lock().expect("lease lock");
+        match &*lease {
+            Some(held) if held.principal == principal => Ok(held.clone()),
+            Some(held) => Err(Error::Leased {
+                principal: held.principal.clone(),
+                since: held.since,
+            }),
+            None => {
+                let new = Lease {
+                    principal: principal.to_string(),
+                    since: Utc::now(),
+                };
+                *lease = Some(new.clone());
+                Ok(new)
+            }
+        }
+    }
+
+    /// Release `principal`'s lease. `false` when it did not hold it.
+    pub fn release_lease(&self, principal: &str) -> bool {
+        let mut lease = self.lease.lock().expect("lease lock");
+        if lease.as_ref().is_some_and(|l| l.principal == principal) {
+            *lease = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The current lease, if any.
+    pub fn lease(&self) -> Option<Lease> {
+        self.lease.lock().expect("lease lock").clone()
+    }
+
+    /// `Ok` when `principal` holds the lease and no person holds control.
+    pub fn check(&self, principal: &str) -> Result<()> {
+        match &*self.lease.lock().expect("lease lock") {
+            Some(l) if l.principal == principal => {}
+            Some(l) => {
+                return Err(Error::Leased {
+                    principal: l.principal.clone(),
+                    since: l.since,
+                });
+            }
+            None => {
+                return Err(Error::Refused(format!(
+                    "{principal} does not hold this desktop's lease; acquire it first"
+                )));
+            }
+        }
+        self.check_agent()
+    }
+
+    /// Record where the desktop pointer is now (in output pixels).
+    pub fn note_pointer(&self, x: f64, y: f64) {
+        *self.pointer.lock().expect("pointer lock") = Some((x, y));
+    }
+
+    /// Where the desktop pointer is, as last placed by the agent or the
+    /// person; `None` before anything placed it.
+    pub fn pointer(&self) -> Option<(f64, f64)> {
+        *self.pointer.lock().expect("pointer lock")
     }
 
     /// Current holder, after expiring an idle person.
@@ -129,9 +223,18 @@ impl ControlGate {
         self.last_hand_back.lock().expect("hand-back lock").take()
     }
 
-    /// Watch holder changes (for UIs and long-polls).
+    /// Watch holder changes (for UIs and long-polls). A watch keeps only
+    /// the latest holder, so a person who takes and hands back between two
+    /// observations is seen through [`ControlGate::hand_backs`], not as a
+    /// transition.
     pub fn subscribe(&self) -> watch::Receiver<Holder> {
         self.holder.subscribe()
+    }
+
+    /// How many times control has returned to the agent from a person. It
+    /// increases before subscribers are notified.
+    pub fn hand_backs(&self) -> u64 {
+        self.hand_backs.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Wait until the agent holds control again.
@@ -165,16 +268,19 @@ impl ControlGate {
     }
 
     fn hand_back(&self, why: HandBack) -> bool {
+        let mut last = self.last_hand_back.lock().expect("hand-back lock");
         let changed = self.holder.send_if_modified(|h| {
             if matches!(h, Holder::Human { .. }) {
                 *h = Holder::Agent;
+                self.hand_backs
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 true
             } else {
                 false
             }
         });
         if changed {
-            *self.last_hand_back.lock().expect("hand-back lock") = Some(why);
+            *last = Some(why);
         }
         changed
     }
@@ -203,6 +309,52 @@ mod tests {
         );
         assert_eq!(gate.take_hand_back(), None);
         assert!(!gate.release(None), "second release is a no-op");
+        assert_eq!(gate.hand_backs(), 1);
+        // An observer that wakes after a take and a hand-back sees only the
+        // agent holding control, but the count moved.
+        let mut rx = gate.subscribe();
+        rx.borrow_and_update();
+        gate.take(None);
+        gate.release(None);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow_and_update(), Holder::Agent);
+        assert_eq!(gate.hand_backs(), 2);
+    }
+
+    #[test]
+    fn one_principal_holds_the_lease_until_it_releases() {
+        let gate = ControlGate::new();
+        assert!(gate.check("a").is_err(), "no lease yet");
+        let lease = gate.acquire("a").unwrap();
+        assert_eq!(gate.acquire("a").unwrap(), lease, "re-acquiring is a no-op");
+        assert!(gate.check("a").is_ok());
+        let err = gate.acquire("b").unwrap_err();
+        assert!(
+            matches!(&err, Error::Leased { principal, .. } if principal == "a"),
+            "{err}"
+        );
+        assert_eq!(gate.check("b").unwrap_err().code(), "leased");
+        assert!(!gate.release_lease("b"), "only the holder releases");
+        assert_eq!(gate.lease().map(|l| l.principal), Some("a".into()));
+        // A person's control applies to the holder; others still see the lease.
+        gate.take(None);
+        assert_eq!(gate.check("a").unwrap_err().code(), "human-in-control");
+        assert_eq!(gate.check("b").unwrap_err().code(), "leased");
+        gate.release(None);
+        assert!(gate.release_lease("a"));
+        assert!(gate.check("a").is_err(), "a released view is refused");
+        assert!(gate.acquire("b").is_ok());
+        assert_eq!(gate.check("a").unwrap_err().code(), "leased");
+        assert!(gate.acquire(" ").is_err());
+    }
+
+    #[test]
+    fn pointer_is_whatever_moved_it_last() {
+        let gate = ControlGate::new();
+        assert_eq!(gate.pointer(), None);
+        gate.note_pointer(10.0, 20.0);
+        gate.note_pointer(30.0, 40.0);
+        assert_eq!(gate.pointer(), Some((30.0, 40.0)));
     }
 
     #[tokio::test]

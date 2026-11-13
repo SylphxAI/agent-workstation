@@ -5,13 +5,18 @@
 //! two ways that share one state:
 //!
 //! - **web operations** over the browser's loopback DevTools endpoint:
-//!   navigate, accessibility snapshots with `@eN` refs, click, fill (secrets
-//!   resolved by the caller and inserted without ever being returned), tabs;
+//!   navigate, accessibility snapshots with `@eN` refs bound to their
+//!   document, CSS selectors, click, fill (secrets resolved by the caller and
+//!   inserted without ever being returned), in-page keys, script evaluation,
+//!   HTML, cookies, page screenshots, tabs;
 //! - **desktop operations** through the Wayland output: screenshots of the
-//!   whole desktop, pointer and keyboard input, native dialogs included.
+//!   whole desktop, pointer and keyboard input (held keys and modifiers
+//!   included), the clipboard, native dialogs included.
 //!
-//! A person takes over through a full-desktop VNC stream behind a WebSocket
-//! and a noVNC page. While they hold control every agent call returns
+//! One agent principal at a time holds a session ([`DesktopSession::lease`]
+//! returns its [`Agent`] view); any other gets [`Error::Leased`]. A person
+//! takes over through a full-desktop VNC stream behind a WebSocket and a
+//! noVNC page. While they hold control every agent call returns
 //! [`Error::HumanInControl`]; the agent resumes when they hand back.
 //!
 //! Configuration, secrets, profile directories and the proxy URL belong to
@@ -36,13 +41,13 @@ pub mod vnc;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 
-pub use browser::{BrowserConfig, Snapshot, Tab};
+pub use browser::{BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab};
 pub use desktop::{Button, Frame, Input};
 pub use error::{Error, Result};
 pub use fingerprint::{Fingerprint, FingerprintDefaults};
-pub use gate::{ControlGate, HandBack, Holder};
+pub use gate::{ControlGate, HandBack, Holder, Lease};
 pub use profile::Profile;
 pub use proxy::Proxy;
 pub use secret::{Secret, SecretResolver};
-pub use session::{DesktopSession, SessionConfig};
+pub use session::{Agent, DesktopSession, MAX_HOLD, SessionConfig};
 pub use takeover::{Takeover, TakeoverConfig};

@@ -12,6 +12,13 @@
 //! Endpoints (relative to the page URL): `ws` (binary RFB), `state` (JSON),
 //! `events` (server-sent `state` events), `take` and `release` (POST,
 //! `{"note": "..."}` of at most [`MAX_NOTE_CHARS`] characters).
+//!
+//! The page can be served two ways, together or alone: on its own listener
+//! ([`TakeoverConfig::bind`]), and mounted in the caller's HTTP server under
+//! any path prefix ([`Takeover::router`]). Where people reach it is the
+//! public URL, which may change while the session runs
+//! ([`Takeover::set_public_url`]); the page accepts requests from that
+//! origin and scopes its cookie to that path.
 
 use std::convert::Infallible;
 use std::io::Read;
@@ -49,10 +56,13 @@ const MAX_CUT_TEXT: usize = 16 << 20;
 /// Where and how the takeover server listens.
 #[derive(Clone)]
 pub struct TakeoverConfig {
-    /// Listen address; defaults to `127.0.0.1:0`.
-    pub bind: SocketAddr,
-    /// URL people reach the page at (a reverse proxy); defaults to
-    /// `http://<local_addr>/`.
+    /// Own listener; defaults to `127.0.0.1:0`. `None` serves the page only
+    /// through [`Takeover::router`], which then needs a `public_url`.
+    pub bind: Option<SocketAddr>,
+    /// URL people reach the page at (a reverse proxy, a tunnel, or the
+    /// caller's own server where it mounts [`Takeover::router`]); defaults
+    /// to `http://<local_addr>/`. Settable later with
+    /// [`Takeover::set_public_url`].
     pub public_url: Option<Url>,
     /// Session token; `None` draws 32 random bytes (URL-safe base64).
     pub token: Option<String>,
@@ -61,7 +71,7 @@ pub struct TakeoverConfig {
 impl Default for TakeoverConfig {
     fn default() -> Self {
         Self {
-            bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+            bind: Some(SocketAddr::from(([127, 0, 0, 1], 0))),
             public_url: None,
             token: None,
         }
@@ -80,10 +90,11 @@ impl std::fmt::Debug for TakeoverConfig {
 
 /// A running takeover server. Dropping it stops the server too.
 pub struct Takeover {
-    url: Url,
-    addr: SocketAddr,
+    addr: Option<SocketAddr>,
+    shared: Arc<Shared>,
+    app: Router,
     stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl std::fmt::Debug for Takeover {
@@ -94,14 +105,43 @@ impl std::fmt::Debug for Takeover {
     }
 }
 
+/// Where people reach the page.
+struct Public {
+    base: Url,
+    origin: Option<String>,
+}
+
+impl Public {
+    fn new(mut base: Url) -> Result<Self> {
+        if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
+            return Err(Error::InvalidInput(format!(
+                "takeover public URL {base} must be http(s) with a host"
+            )));
+        }
+        if !base.path().ends_with('/') {
+            let path = format!("{}/", base.path());
+            base.set_path(&path);
+        }
+        base.set_query(None);
+        base.set_fragment(None);
+        let origin = Some(base.origin().ascii_serialization()).filter(|o| o != "null");
+        Ok(Self { base, origin })
+    }
+}
+
 struct Shared {
     token: String,
     cookie: String,
-    origin: Option<String>,
-    secure: bool,
+    public: std::sync::RwLock<Public>,
     vnc: PathBuf,
     gate: Arc<ControlGate>,
     stop: watch::Receiver<bool>,
+}
+
+impl Shared {
+    fn public(&self) -> std::sync::RwLockReadGuard<'_, Public> {
+        self.public.read().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 impl Takeover {
@@ -118,21 +158,26 @@ impl Takeover {
             Some(t) => t,
             None => random_token()?,
         };
-        let listener = TcpListener::bind(config.bind).await?;
-        let addr = listener.local_addr()?;
-        let base = match config.public_url {
-            Some(u) => u,
-            None => Url::parse(&format!("http://{addr}/"))
-                .map_err(|e| Error::InvalidInput(e.to_string()))?,
+        let listener = match config.bind {
+            Some(bind) => Some(TcpListener::bind(bind).await?),
+            None => None,
         };
-        let mut url = base.clone();
-        url.query_pairs_mut().clear().append_pair("token", &token);
+        let addr = listener.as_ref().map(TcpListener::local_addr).transpose()?;
+        let base = match (config.public_url, addr) {
+            (Some(u), _) => u,
+            (None, Some(addr)) => Url::parse(&format!("http://{addr}/"))
+                .map_err(|e| Error::InvalidInput(e.to_string()))?,
+            (None, None) => {
+                return Err(Error::InvalidInput(
+                    "a takeover without its own listener needs a public URL".into(),
+                ));
+            }
+        };
         let (stop, mut stop_rx) = watch::channel(false);
         let shared = Arc::new(Shared {
             token,
-            cookie: format!("awt{}", addr.port()),
-            origin: Some(base.origin().ascii_serialization()).filter(|o| o != "null"),
-            secure: base.scheme() == "https",
+            cookie: format!("awt{}", &random_token()?[..8]),
+            public: std::sync::RwLock::new(Public::new(base)?),
             vnc: vnc_socket,
             gate,
             stop: stop_rx.clone(),
@@ -146,38 +191,76 @@ impl Takeover {
             .route("/release", post(release))
             .route("/{*path}", get(asset))
             .layer(middleware::from_fn_with_state(shared.clone(), guard))
-            .with_state(shared);
-        let task = tokio::spawn(async move {
-            let shutdown = async move { stopped(&mut stop_rx).await };
-            if let Err(e) = axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown)
-                .await
-            {
-                tracing::warn!(error = %e, "takeover server stopped");
-            }
+            .with_state(shared.clone());
+        let task = listener.map(|listener| {
+            let app = app.clone();
+            tokio::spawn(async move {
+                let shutdown = async move { stopped(&mut stop_rx).await };
+                if let Err(e) = axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                {
+                    tracing::warn!(error = %e, "takeover server stopped");
+                }
+            })
         });
         Ok(Takeover {
-            url,
             addr,
+            shared,
+            app,
             stop,
             task,
         })
     }
 
-    /// Page URL including the token.
+    /// Page URL as people reach it, including the token.
     pub fn url(&self) -> Url {
-        self.url.clone()
+        let mut url = self.shared.public().base.clone();
+        url.query_pairs_mut()
+            .clear()
+            .append_pair("token", &self.shared.token);
+        url
     }
 
-    /// Bound listen address.
-    pub fn local_addr(&self) -> SocketAddr {
+    /// Change where people reach the page (a tunnel that started after the
+    /// session, or the caller's mount point). Requests from the new origin
+    /// are accepted from now on; the old origin's are refused unless it is
+    /// the same host the request names.
+    pub fn set_public_url(&self, url: Url) -> Result<()> {
+        let public = Public::new(url)?;
+        *self
+            .shared
+            .public
+            .write()
+            .unwrap_or_else(|p| p.into_inner()) = public;
+        Ok(())
+    }
+
+    /// The page and its endpoints as a router, for mounting in the caller's
+    /// own HTTP server under the public URL's path (for example with
+    /// `Router::nest_service`). Every request still needs the token.
+    pub fn router(&self) -> Router {
+        self.app.clone()
+    }
+
+    /// Own listener's address, when it has one.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
         self.addr
     }
 
-    /// Stop serving and close every bridge and event stream.
-    pub async fn shutdown(self) {
+    /// Stop serving and close every bridge and event stream; a mounted
+    /// router answers `410 Gone` from then on. The own listener's task ends
+    /// on its own.
+    pub fn stop(&self) {
         let _ = self.stop.send(true);
-        let _ = self.task.await;
+    }
+
+    /// [`Takeover::stop`], then wait for the own listener's task to end.
+    pub async fn shutdown(self) {
+        self.stop();
+        if let Some(task) = self.task {
+            let _ = task.await;
+        }
     }
 }
 
@@ -235,6 +318,9 @@ fn reject(status: StatusCode, msg: &str) -> Response {
 }
 
 async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Response {
+    if *s.stop.borrow() {
+        return StatusCode::GONE.into_response();
+    }
     let tokens = presented(req.headers(), req.uri(), &s.cookie);
     if tokens.is_empty() {
         return reject(StatusCode::UNAUTHORIZED, "token required");
@@ -256,7 +342,7 @@ async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Respon
             .get(header::HOST)
             .and_then(|h| h.to_str().ok());
         let same_host = origin.split_once("://").map(|(_, rest)| rest) == host;
-        if !same_host && s.origin.as_deref() != Some(origin) {
+        if !same_host && s.public().origin.as_deref() != Some(origin) {
             return reject(StatusCode::FORBIDDEN, "cross-origin request");
         }
     }
@@ -322,11 +408,20 @@ fn serve_asset(path: &str) -> Response {
 
 async fn page(State(s): State<Arc<Shared>>) -> Response {
     let mut res = serve_asset("index.html");
-    let secure = if s.secure { "; Secure" } else { "" };
-    let cookie = format!(
-        "{}={}; Path=/; HttpOnly; SameSite=Strict{secure}",
-        s.cookie, s.token
-    );
+    let cookie = {
+        let public = s.public();
+        let secure = if public.base.scheme() == "https" {
+            "; Secure"
+        } else {
+            ""
+        };
+        format!(
+            "{}={}; Path={}; HttpOnly; SameSite=Strict{secure}",
+            s.cookie,
+            s.token,
+            public.base.path()
+        )
+    };
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         res.headers_mut().insert(header::SET_COOKIE, v);
     }
@@ -451,6 +546,9 @@ async fn bridge(socket: WebSocket, s: Arc<Shared>) {
                         if inputs > 0 {
                             s.gate.note_input();
                         }
+                        if let Some((x, y)) = filter.pointer.take() {
+                            s.gate.note_pointer(f64::from(x), f64::from(y));
+                        }
                         if !out.is_empty() && vnc_tx.write_all(&out).await.is_err() {
                             break;
                         }
@@ -475,6 +573,8 @@ struct RfbFilter {
     /// 0 ProtocolVersion, 1 security type, 2 ClientInit, 3 normal messages.
     phase: u8,
     buf: Vec<u8>,
+    /// Position of the last pointer event forwarded, until taken.
+    pointer: Option<(u16, u16)>,
 }
 
 impl RfbFilter {
@@ -494,6 +594,12 @@ impl RfbFilter {
             if !input || may_input() {
                 out.extend_from_slice(frame);
                 inputs += usize::from(input);
+                if input && frame[0] == 5 {
+                    self.pointer = Some((
+                        u16::from_be_bytes([frame[2], frame[3]]),
+                        u16::from_be_bytes([frame[4], frame[5]]),
+                    ));
+                }
             }
             self.phase = (self.phase + 1).min(3);
             at += len;
@@ -625,6 +731,92 @@ mod tests {
         out
     }
 
+    #[test]
+    fn forwarded_pointer_events_report_their_position() {
+        let mut f = RfbFilter::default();
+        f.feed(&stream(&[&POINTER]), &|| false).unwrap();
+        assert_eq!(f.pointer, None, "dropped input moves nothing");
+        f.feed(&POINTER, &|| true).unwrap();
+        assert_eq!(f.pointer, Some((10, 20)));
+    }
+
+    #[tokio::test]
+    async fn mounted_page_follows_a_public_url_set_later() {
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ControlGate::new();
+        let config = TakeoverConfig {
+            bind: None,
+            public_url: Some(Url::parse("https://desk.example/old/").unwrap()),
+            token: Some("t0k".into()),
+        };
+        let t = Takeover::start(config, dir.path().join("vnc.sock"), gate)
+            .await
+            .unwrap();
+        assert_eq!(t.local_addr(), None);
+        assert!(
+            TakeoverConfig {
+                bind: None,
+                ..Default::default()
+            }
+            .public_url
+            .is_none()
+        );
+        t.set_public_url(Url::parse("https://desk.example/v1/takeover/k1").unwrap())
+            .unwrap();
+        assert_eq!(
+            t.url().as_str(),
+            "https://desk.example/v1/takeover/k1/?token=t0k"
+        );
+        assert!(
+            t.set_public_url(Url::parse("ftp://desk.example/").unwrap())
+                .is_err()
+        );
+        let call = |uri: &str, origin: Option<&str>| {
+            let mut req = axum::http::Request::get(uri).header("host", "127.0.0.1:9");
+            if let Some(o) = origin {
+                req = req.header("origin", o);
+            }
+            t.router().oneshot(req.body(Body::empty()).unwrap())
+        };
+        let page = call("/?token=t0k", None).await.unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let cookie = page.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(
+            cookie.contains("Path=/v1/takeover/k1/") && cookie.contains("; Secure"),
+            "{cookie}"
+        );
+        let status = |r: Response| r.status();
+        assert_eq!(
+            status(
+                call("/state?token=t0k", Some("https://desk.example"))
+                    .await
+                    .unwrap()
+            ),
+            StatusCode::OK,
+            "the public origin may drive the page through a proxy"
+        );
+        assert_eq!(
+            status(
+                call("/state?token=t0k", Some("https://other.example"))
+                    .await
+                    .unwrap()
+            ),
+            StatusCode::FORBIDDEN
+        );
+        let router = t.router();
+        t.shutdown().await;
+        let gone = router
+            .oneshot(
+                axum::http::Request::get("/state?token=t0k")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::GONE);
+    }
+
     #[tokio::test]
     async fn bridge_drops_input_until_a_person_takes_control() {
         let dir = tempfile::tempdir().unwrap();
@@ -636,7 +828,7 @@ mod tests {
             ..Default::default()
         };
         let t = Takeover::start(config, sock, gate.clone()).await.unwrap();
-        let addr = t.local_addr();
+        let addr = t.local_addr().unwrap();
         let get = |path: &str, extra: &str| {
             format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{extra}Connection: close\r\n\r\n")
         };
@@ -651,10 +843,15 @@ mod tests {
                 .starts_with("HTTP/1.1 403")
         );
         let page = http(addr, &get("/?token=t0k", "")).await;
-        assert!(
-            page.starts_with("HTTP/1.1 200") && page.contains(&format!("awt{}=t0k", addr.port()))
-        );
-        let cookie = format!("Cookie: awt{}=t0k\r\n", addr.port());
+        let set_cookie = page
+            .lines()
+            .find_map(|l| l.strip_prefix("set-cookie: "))
+            .expect("the page sets its cookie")
+            .to_string();
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(set_cookie.contains("=t0k; Path=/; HttpOnly; SameSite=Strict"));
+        let cookie_name = set_cookie.split('=').next().unwrap();
+        let cookie = format!("Cookie: {cookie_name}=t0k\r\n");
         assert!(
             http(addr, &get("/state", &cookie))
                 .await

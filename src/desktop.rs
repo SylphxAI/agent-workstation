@@ -49,6 +49,10 @@ pub enum Button {
     Middle,
     /// Secondary button.
     Right,
+    /// Side button that browsers map to history back.
+    Back,
+    /// Extra button that browsers map to history forward.
+    Forward,
 }
 
 /// One pointer or keyboard step.
@@ -62,6 +66,12 @@ pub enum Input {
     Scroll { dx: i32, dy: i32 },
     /// Press a chord such as `ctrl+l` or `Return`, then release it.
     Key(String),
+    /// Press the keys of a chord (`shift`, `ctrl+alt`, `w`) and keep them
+    /// down: held modifiers apply to later pointer and key steps. Keys still
+    /// held when the steps end are released then.
+    KeyDown(String),
+    /// Release keys held by [`Input::KeyDown`].
+    KeyUp(String),
     /// Type text.
     Text(String),
     /// Pause between steps.
