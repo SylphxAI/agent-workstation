@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use agent_workstation::cdp::Cdp;
 use agent_workstation::{
-    BrowserConfig, Button, DesktopSession, Error, Profile, Secret, SecretResolver, SessionConfig,
-    TakeoverConfig,
+    Agent, BrowserConfig, Button, DesktopSession, Error, Profile, Secret, SecretResolver,
+    SessionConfig, TakeoverConfig,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -41,7 +41,7 @@ addEventListener('keydown', event => {
 // The fixture owns the only browser window and tab. Observe a page-to-chrome
 // focus transition; CDP is used only for observation, never to inject input or
 // focus the omnibox. Blur alone is not a general-purpose omnibox detector.
-async fn focus_observer(s: &DesktopSession, profile: &std::path::Path) -> Cdp {
+async fn focus_observer(s: &Agent<'_>, profile: &std::path::Path) -> Cdp {
     let port = std::fs::read_to_string(profile.join("user-data/DevToolsActivePort")).unwrap();
     let mut lines = port.lines();
     let endpoint = format!(
@@ -129,7 +129,7 @@ fn config(
 }
 
 // Observe navigation completion, never repeat native input or hide its loss.
-async fn expect_url(s: &DesktopSession, expected: &str) {
+async fn expect_url(s: &Agent<'_>, expected: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let actual = s
@@ -164,11 +164,12 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     let fp_before = std::fs::read(profile.path().join("fingerprint.json")).unwrap();
     let rt = tempfile::tempdir().unwrap();
 
-    let s = DesktopSession::start(config(profile.path(), &rt.path().join("a"), false))
+    let desk = DesktopSession::start(config(profile.path(), &rt.path().join("a"), false))
         .await
         .expect("session starts");
-    assert_eq!(s.size(), (1280, 800));
-    assert_eq!(s.fingerprint().seed, 42);
+    assert_eq!(desk.size(), (1280, 800));
+    assert_eq!(desk.fingerprint().seed, 42);
+    let s = desk.lease("agent-a").unwrap();
 
     // Exercise the native keyboard immediately after startup, before any CDP
     // observation. Shortcut delivery does not acknowledge application handling.
@@ -284,7 +285,7 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     s.click_at(640.0, 400.0, Button::Left).await.unwrap();
 
     // Human control suspends every agent call and resumes on release.
-    s.gate().take(Some("tester".into()));
+    desk.gate().take(Some("tester".into()));
     for err in [
         s.navigate(&url).await.unwrap_err(),
         s.screenshot().await.unwrap_err(),
@@ -292,7 +293,7 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     ] {
         assert!(matches!(err, Error::HumanInControl { .. }), "{err}");
     }
-    assert!(s.gate().release(Some("done".into())));
+    assert!(desk.gate().release(Some("done".into())));
     s.navigate(&url).await.unwrap();
 
     // Tabs.
@@ -305,17 +306,18 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
         assert!(tabs[0].active);
         assert_ne!(tabs[0].id, id);
     }
-    s.shutdown().await;
+    desk.close().await;
 
     // Same profile, new session: the cookie set before survives; the
     // fingerprint file is untouched.
-    let s = DesktopSession::start(config(profile.path(), &rt.path().join("b"), true))
+    let desk = DesktopSession::start(config(profile.path(), &rt.path().join("b"), true))
         .await
         .expect("second session");
+    let s = desk.lease("agent-a").unwrap();
     s.navigate(&url).await.unwrap();
     assert!(s.read().await.unwrap().contains("cookie=kept=yes"));
     // The takeover page is served and guarded by its token.
-    let page = s.takeover_url().expect("takeover enabled");
+    let page = desk.takeover_url().expect("takeover enabled");
     let addr = page.socket_addrs(|| None).unwrap()[0];
     let get = |path: String| async move {
         let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -328,16 +330,16 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
         tcp.read_to_string(&mut out).await.unwrap();
         out
     };
-    let token = s.takeover_url().unwrap().query().unwrap().to_string();
+    let token = desk.takeover_url().unwrap().query().unwrap().to_string();
     assert!(get(format!("/?{token}")).await.starts_with("HTTP/1.1 200"));
     assert!(get("/".into()).await.starts_with("HTTP/1.1 401"));
-    let takeover = s.takeover_url().expect("takeover enabled");
+    let takeover = desk.takeover_url().expect("takeover enabled");
     assert!(takeover.query().unwrap_or_default().starts_with("token="));
     assert_eq!(
         std::fs::read(profile.path().join("fingerprint.json")).unwrap(),
         fp_before
     );
-    s.shutdown().await;
+    desk.close().await;
 }
 
 // These fixtures use same-site, different-port frames, exercising different
@@ -464,7 +466,10 @@ fn secret_ref(snapshot: &agent_workstation::Snapshot, name: &str) -> String {
 }
 
 fn assert_secret_refusal(error: Error) {
-    assert!(matches!(error, Error::Refused(_) | Error::NotFound(_)));
+    assert!(matches!(
+        error,
+        Error::Refused(_) | Error::NotFound(_) | Error::StaleRef(_)
+    ));
     assert!(!error.to_string().contains(SECRET));
     assert!(!format!("{error:?}").contains(SECRET));
 }
@@ -481,9 +486,10 @@ async fn secret_fill_is_node_and_owning_origin_bound() {
     let cross_origin = cross.trim_end_matches('/');
     let profile = tempfile::tempdir().unwrap();
     let runtime = tempfile::tempdir().unwrap();
-    let session = DesktopSession::start(config(profile.path(), runtime.path(), false))
+    let desk = DesktopSession::start(config(profile.path(), runtime.path(), false))
         .await
         .unwrap();
+    let session = desk.lease("agent-a").unwrap();
     session.navigate(&url).await.unwrap();
     let mut observer = focus_observer(&session, profile.path()).await;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -591,7 +597,7 @@ async fn secret_fill_is_node_and_owning_origin_bound() {
             .unwrap_err(),
     );
     field_state(&mut *observer.lock().await, root, false).await;
-    session.shutdown().await;
+    desk.close().await;
 }
 
 struct NavigatingResolver<'a> {

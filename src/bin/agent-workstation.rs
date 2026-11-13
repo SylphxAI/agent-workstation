@@ -10,7 +10,10 @@
 //! standard output (one trailing newline trimmed) as the value.
 //!
 //! - `POST /sessions` `{"profile": "name", "profile_dir": "/path", "proxy": "http://…"?}` → `{"id", "takeover_url"}`
-//! - `POST /sessions/{id}/call` `{"op": "navigate", "url": "https://example.com"}` → result JSON
+//! - `POST /sessions/{id}/call` `{"principal": "agent-a", "op": "navigate", "url": "https://example.com"}`
+//!   → result JSON. The first principal to call holds the session until it
+//!   calls `{"op": "release"}`; another principal gets `409` with code
+//!   `leased`.
 //! - `DELETE /sessions/{id}`
 
 use std::collections::HashMap;
@@ -18,8 +21,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_workstation::{
-    BrowserConfig, Button, DesktopSession, Error, Profile, Proxy, Secret, SecretResolver,
-    SessionConfig,
+    BrowserConfig, Button, Cookie, DesktopSession, Error, Input, Profile, Proxy, Secret,
+    SecretResolver, SessionConfig,
 };
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -116,7 +119,9 @@ impl IntoResponse for ApiError {
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
         let status = match &e {
-            Error::HumanInControl { .. } => StatusCode::CONFLICT,
+            Error::HumanInControl { .. } | Error::Leased { .. } => StatusCode::CONFLICT,
+            Error::StaleRef(_) => StatusCode::CONFLICT,
+            Error::Closed => StatusCode::GONE,
             Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Refused(_) => StatusCode::FORBIDDEN,
@@ -208,11 +213,15 @@ async fn remove(
         .await
         .remove(&id)
         .ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
-    match Arc::try_unwrap(s) {
-        Ok(s) => s.shutdown().await,
-        Err(_) => return Err(ApiError(StatusCode::CONFLICT, json!({ "code": "busy" }))),
-    }
+    s.close().await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct Call {
+    principal: String,
+    #[serde(flatten)]
+    op: Op,
 }
 
 #[derive(Deserialize)]
@@ -249,14 +258,55 @@ enum Op {
         secret_ref: String,
         expect_origin: Option<String>,
     },
+    Focus {
+        r#ref: String,
+    },
+    Press {
+        key: String,
+        hold_ms: Option<u64>,
+    },
+    KeyDown {
+        key: String,
+    },
+    KeyUp {
+        key: String,
+    },
+    ReleaseKeys,
+    Eval {
+        expression: String,
+    },
+    Html {
+        r#ref: Option<String>,
+    },
+    Cookies {
+        #[serde(default)]
+        urls: Vec<String>,
+    },
+    SetCookies {
+        cookies: Vec<Cookie>,
+    },
+    DeleteCookies {
+        name: String,
+        url: Option<String>,
+    },
+    ClearCookies,
+    PageScreenshot {
+        #[serde(default)]
+        full_page: bool,
+    },
     Screenshot,
     ClickAt {
         x: f64,
         y: f64,
         button: Option<Button>,
+        modifiers: Option<String>,
     },
     Key {
         chord: String,
+    },
+    HoldKey {
+        chord: String,
+        ms: u64,
     },
     Type {
         text: String,
@@ -267,23 +317,31 @@ enum Op {
         dx: i32,
         dy: i32,
     },
+    PointerPosition,
+    ClipboardGet,
+    ClipboardSet {
+        text: String,
+    },
     HandBack,
+    Release,
 }
 
 async fn call(
     State(app): State<Shared>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    Json(op): Json<Op>,
+    Json(Call { principal, op }): Json<Call>,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&app, &headers)?;
-    let s = app
+    let session = app
         .sessions
         .read()
         .await
         .get(&id)
         .cloned()
         .ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
+    let s = session.lease(&principal)?;
+    let png = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
     let v = match op {
         Op::Navigate { url } => json!({ "url": s.navigate(&url).await? }),
         Op::Back => json!({ "url": s.back().await? }),
@@ -312,18 +370,83 @@ async fn call(
                 .await?;
             json!({ "ok": true })
         }
+        Op::Focus { r#ref } => json!({ "ok": s.focus(&r#ref).await? }),
+        Op::Press { key, hold_ms } => {
+            match hold_ms.filter(|ms| *ms > 0) {
+                Some(ms) => {
+                    s.press_and_hold(&key, std::time::Duration::from_millis(ms))
+                        .await?
+                }
+                None => s.press(&key).await?,
+            }
+            json!({ "ok": true })
+        }
+        Op::KeyDown { key } => {
+            s.key_down(&key).await?;
+            json!({ "held": s.held_keys().await? })
+        }
+        Op::KeyUp { key } => {
+            s.key_up(&key).await?;
+            json!({ "held": s.held_keys().await? })
+        }
+        Op::ReleaseKeys => json!({ "ok": s.release_keys().await? }),
+        Op::Eval { expression } => json!({ "value": s.eval(&expression).await? }),
+        Op::Html { r#ref } => json!({ "html": s.html(r#ref.as_deref()).await? }),
+        Op::Cookies { urls } => json!({ "cookies": s.cookies(&urls).await? }),
+        Op::SetCookies { cookies } => json!({ "ok": s.set_cookies(&cookies).await? }),
+        Op::DeleteCookies { name, url } => {
+            json!({ "ok": s.delete_cookies(&name, url.as_deref()).await? })
+        }
+        Op::ClearCookies => json!({ "ok": s.clear_cookies().await? }),
+        Op::PageScreenshot { full_page } => {
+            let shot = s.page_screenshot(full_page).await?;
+            json!({ "width": shot.width, "height": shot.height, "truncated": shot.truncated, "png_base64": png(shot.png) })
+        }
         Op::Screenshot => {
             let f = s.screenshot().await?;
-            let png = f.to_png()?;
-            json!({ "width": f.width, "height": f.height, "png_base64": base64::engine::general_purpose::STANDARD.encode(png) })
+            json!({ "width": f.width, "height": f.height, "png_base64": png(f.to_png()?) })
         }
-        Op::ClickAt { x, y, button } => {
-            json!({ "ok": s.click_at(x, y, button.unwrap_or(Button::Left)).await? })
+        Op::ClickAt {
+            x,
+            y,
+            button,
+            modifiers,
+        } => {
+            let button = button.unwrap_or(Button::Left);
+            let mut steps = Vec::new();
+            if let Some(m) = &modifiers {
+                steps.push(Input::KeyDown(m.clone()));
+            }
+            steps.extend([
+                Input::Move { x, y },
+                Input::Button {
+                    button,
+                    pressed: true,
+                },
+                Input::Button {
+                    button,
+                    pressed: false,
+                },
+            ]);
+            if let Some(m) = modifiers {
+                steps.push(Input::KeyUp(m));
+            }
+            json!({ "ok": s.input(steps).await? })
         }
         Op::Key { chord } => json!({ "ok": s.key(&chord).await? }),
+        Op::HoldKey { chord, ms } => {
+            json!({ "ok": s.hold_key(&chord, std::time::Duration::from_millis(ms)).await? })
+        }
         Op::Type { text } => json!({ "ok": s.type_text(&text).await? }),
         Op::Scroll { x, y, dx, dy } => json!({ "ok": s.scroll(x, y, dx, dy).await? }),
-        Op::HandBack => json!({ "hand_back": s.take_hand_back().map(|h| format!("{h:?}")) }),
+        Op::PointerPosition => {
+            let p = s.pointer_position()?;
+            json!({ "x": p.map(|p| p.0), "y": p.map(|p| p.1) })
+        }
+        Op::ClipboardGet => json!({ "text": s.clipboard_text().await? }),
+        Op::ClipboardSet { text } => json!({ "ok": s.set_clipboard_text(&text).await? }),
+        Op::HandBack => json!({ "hand_back": s.take_hand_back()?.map(|h| format!("{h:?}")) }),
+        Op::Release => json!({ "released": s.release() }),
     };
     Ok(Json(v))
 }
