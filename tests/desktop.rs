@@ -75,6 +75,25 @@ fn config(
     cfg
 }
 
+// Observe navigation completion, never repeat native input or hide its loss.
+async fn expect_url(s: &DesktopSession, expected: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let actual = s
+            .current_url()
+            .await
+            .unwrap_or_else(|e| panic!("observing {expected}: {e}"));
+        if actual == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "native URL-bar input: expected {expected}, got {actual}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     if std::env::var("AGENT_WORKSTATION_HEADFUL").as_deref() != Ok("1") {
@@ -97,6 +116,12 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
         .expect("session starts");
     assert_eq!(s.size(), (1280, 800));
     assert_eq!(s.fingerprint().seed, 42);
+
+    // Exercise native input immediately after startup, before any page/CDP
+    // operation that might incidentally give the browser time to get focus.
+    s.key("ctrl+l").await.unwrap();
+    s.type_text(&format!("{url}?startup=1\n")).await.unwrap();
+    expect_url(&s, &format!("{url}?startup=1")).await;
 
     // Web operations.
     assert_eq!(s.navigate(&url).await.unwrap(), url);
@@ -162,7 +187,7 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     s.snapshot().await.unwrap();
     s.key("ctrl+l").await.unwrap();
     s.type_text(&format!("{url}?typed=1\n")).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    expect_url(&s, &format!("{url}?typed=1")).await;
     if let Ok(dir) = std::env::var("AGENT_WORKSTATION_DEBUG_DIR") {
         std::fs::write(
             format!("{dir}/after-typing.png"),
@@ -189,10 +214,15 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     s.navigate(&url).await.unwrap();
 
     // Tabs.
-    let id = s.new_tab(&url).await.unwrap();
-    assert_eq!(s.tabs().await.unwrap().len(), 2);
-    s.close_tab(&id).await.unwrap();
-    assert_eq!(s.tabs().await.unwrap().len(), 1);
+    for _ in 0..20 {
+        let id = s.new_tab(&url).await.unwrap();
+        assert_eq!(s.tabs().await.unwrap().len(), 2);
+        s.close_tab(&id).await.unwrap();
+        let tabs = s.tabs().await.unwrap();
+        assert_eq!(tabs.len(), 1);
+        assert!(tabs[0].active);
+        assert_ne!(tabs[0].id, id);
+    }
     s.shutdown().await;
 
     // Same profile, new session: the cookie set before survives; the

@@ -149,6 +149,12 @@ impl Browser {
         }
     }
 
+    pub(crate) fn pid(&self) -> Result<u32> {
+        self.child
+            .id()
+            .ok_or_else(|| Error::Process("browser exited during start-up".into()))
+    }
+
     /// Browser-level DevTools WebSocket URL (loopback).
     pub fn endpoint(&self) -> &str {
         &self.endpoint
@@ -257,6 +263,8 @@ impl Web {
             active: None,
             refs: HashMap::new(),
         };
+        web.browser_call("Target.setDiscoverTargets", json!({ "discover": true }))
+            .await?;
         let first = web
             .cdp
             .pages()
@@ -320,7 +328,14 @@ impl Web {
 
     /// Close tab `id`; the first remaining tab becomes active.
     pub async fn close_tab(&mut self, id: &str) -> Result<()> {
-        self.browser_call("Target.closeTarget", json!({ "targetId": id }))
+        let result = self
+            .browser_call("Target.closeTarget", json!({ "targetId": id }))
+            .await?;
+        if result["success"].as_bool() != Some(true) {
+            return Err(Error::Protocol("target close was not accepted".into()));
+        }
+        self.cdp
+            .wait_target_destroyed(id, Duration::from_secs(10))
             .await?;
         if self.active.as_deref() == Some(id) {
             self.cdp.detach();
@@ -330,7 +345,8 @@ impl Web {
                 .pages()
                 .await?
                 .into_iter()
-                .find_map(|t| t["targetId"].as_str().map(String::from));
+                .filter_map(|t| t["targetId"].as_str().map(String::from))
+                .find(|target| target != id);
             match next {
                 Some(n) => self.select_tab(&n).await?,
                 None => {
@@ -388,15 +404,17 @@ impl Web {
 
     /// URL of the active tab.
     pub async fn current_url(&mut self) -> Result<String> {
-        let h = self
-            .cdp
-            .call("Page.getNavigationHistory", json!({}))
+        // Browser-owned target metadata survives renderer replacement during
+        // native navigation; Page.getNavigationHistory requires an active
+        // renderer and can fail between the old page and its replacement.
+        let id = self.active.clone().ok_or(Error::Closed)?;
+        let result = self
+            .browser_call("Target.getTargetInfo", json!({ "targetId": id }))
             .await?;
-        let i = h["currentIndex"].as_u64().unwrap_or(0) as usize;
-        Ok(h["entries"][i]["url"]
+        result["targetInfo"]["url"]
             .as_str()
-            .unwrap_or_default()
-            .to_string())
+            .map(String::from)
+            .ok_or_else(|| Error::Protocol("target info missing URL".into()))
     }
 
     /// Visible text of the active tab (form field values are not included).

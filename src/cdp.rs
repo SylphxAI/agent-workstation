@@ -133,6 +133,35 @@ impl Cdp {
         }
     }
 
+    /// Consume the matching destruction event without discarding unrelated
+    /// events. Target discovery must be enabled before requesting the close.
+    pub async fn wait_target_destroyed(
+        &mut self,
+        target_id: &str,
+        timeout: Duration,
+    ) -> Result<()> {
+        let matches = |v: &Value| {
+            v["method"] == "Target.targetDestroyed" && v["params"]["targetId"] == target_id
+        };
+        if let Some(index) = self.events.iter().position(matches) {
+            self.events.remove(index);
+            return Ok(());
+        }
+        tokio::time::timeout(timeout, async {
+            loop {
+                let event = self.read_one().await?;
+                if matches(&event) {
+                    return Ok(());
+                }
+                if event.get("method").is_some() {
+                    self.events.push_back(event);
+                }
+            }
+        })
+        .await
+        .map_err(|_| Error::Timeout("target destruction".into()))?
+    }
+
     /// Attach to a page target with a flat session; later [`Cdp::call`]s go to it.
     pub async fn attach(&mut self, target_id: &str) -> Result<String> {
         let r = self
@@ -191,5 +220,74 @@ impl Cdp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn destruction_wait_matches_identity_and_preserves_other_events() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for event in [
+                json!({"method":"Target.targetDestroyed","params":{"targetId":"other"}}),
+                json!({"method":"Page.frameNavigated","params":{}}),
+                json!({"method":"Target.targetDestroyed","params":{"targetId":"closed"}}),
+            ] {
+                ws.send(Message::Text(event.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            // Keep the transport alive until the client is done.
+            while ws.next().await.is_some() {}
+        });
+        let mut cdp = Cdp::connect(&format!("ws://{address}")).await.unwrap();
+        cdp.wait_target_destroyed("closed", Duration::from_secs(1))
+            .await
+            .unwrap();
+        let first = cdp.next_event(Duration::ZERO).await.unwrap().unwrap();
+        assert_eq!(first["params"]["targetId"], "other");
+        assert_eq!(
+            cdp.next_event(Duration::ZERO).await.unwrap().unwrap()["method"],
+            "Page.frameNavigated"
+        );
+        cdp.events
+            .push_back(json!({"method":"Target.targetDestroyed","params":{"targetId":"buffered"}}));
+        cdp.wait_target_destroyed("buffered", Duration::ZERO)
+            .await
+            .unwrap();
+        assert!(matches!(
+            cdp.wait_target_destroyed("absent", Duration::from_millis(10))
+                .await,
+            Err(Error::Timeout(_))
+        ));
+        assert!(cdp.is_healthy());
+        drop(cdp);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn destruction_wait_propagates_transport_loss() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            ws.close(None).await.unwrap();
+        });
+        let mut cdp = Cdp::connect(&format!("ws://{address}")).await.unwrap();
+        assert!(matches!(
+            cdp.wait_target_destroyed("closed", Duration::from_secs(1))
+                .await,
+            Err(Error::Protocol(_))
+        ));
+        assert!(!cdp.is_healthy());
+        server.await.unwrap();
     }
 }

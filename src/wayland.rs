@@ -341,8 +341,6 @@ impl InputDevice {
             .create_virtual_keyboard(&seat, &qh, ());
         upload_keymap(&keyboard, &[(1, "Escape".to_string())])?;
         c.roundtrip()?;
-        // Give clients a moment to bind the seat's new keyboard and pointer.
-        std::thread::sleep(Duration::from_millis(300));
         Ok(Self {
             c,
             pointer,
