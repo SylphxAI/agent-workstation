@@ -4,6 +4,8 @@
 //! Chromium-family browser (`AGENT_WORKSTATION_BROWSER`, default
 //! `/usr/bin/chromium`); `AGENT_WORKSTATION_BROWSER_ARGS` adds browser flags.
 
+#![cfg(target_os = "linux")]
+
 use std::time::Duration;
 
 use agent_workstation::cdp::Cdp;

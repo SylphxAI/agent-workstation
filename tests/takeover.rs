@@ -1,6 +1,8 @@
 //! Takeover against a real headless sway + wayvnc. Runs only with
 //! `AGENT_WORKSTATION_HEADFUL=1` and `sway` and `wayvnc` on `PATH`.
 
+#![cfg(target_os = "linux")]
+
 use std::path::Path;
 use std::time::Duration;
 

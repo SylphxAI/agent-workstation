@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::browser::{Browser, BrowserConfig, Snapshot, Tab, Web};
+#[cfg(target_os = "linux")]
 use crate::compositor::Compositor;
 use crate::error::{Error, Result};
 use crate::fingerprint::{Fingerprint, FingerprintDefaults};
@@ -14,8 +15,11 @@ use crate::profile::Profile;
 use crate::proxy::{Proxy, ProxyEndpoint};
 use crate::secret::SecretResolver;
 use crate::takeover::{Takeover, TakeoverConfig};
+#[cfg(target_os = "linux")]
 use crate::vnc::Vnc;
-use crate::wayland::{self, Button, Frame, Input, InputDevice};
+#[cfg(target_os = "linux")]
+use crate::wayland::{self, InputDevice};
+use crate::{Button, Frame, Input};
 
 /// Everything a session needs; all paths and values are caller-owned.
 #[derive(Clone, Debug)]
@@ -65,11 +69,15 @@ pub struct DesktopSession {
     fingerprint: Fingerprint,
     web: Mutex<Web>,
     takeover: Option<Takeover>,
+    #[cfg(target_os = "linux")]
     vnc: Option<Vnc>,
     browser: Option<Browser>,
+    #[cfg(target_os = "linux")]
     compositor: Option<Compositor>,
     _proxy: Option<ProxyEndpoint>,
+    #[cfg(target_os = "linux")]
     socket: PathBuf,
+    #[cfg(target_os = "linux")]
     input: Arc<std::sync::Mutex<InputDevice>>,
     size: (u32, u32),
 }
@@ -78,6 +86,7 @@ impl DesktopSession {
     /// Start the compositor, the browser, the VNC server and (when
     /// configured) the takeover page. Anything started is stopped again if a
     /// later step fails.
+    #[cfg(target_os = "linux")]
     pub async fn start(config: SessionConfig) -> Result<Self> {
         let fingerprint = config.profile.fingerprint(&config.fingerprint_defaults)?;
         fingerprint.validate()?;
@@ -168,6 +177,12 @@ impl DesktopSession {
             }
         }
         Ok(session)
+    }
+
+    /// Desktop sessions require Linux. No files or processes are created.
+    #[cfg(not(target_os = "linux"))]
+    pub async fn start(_config: SessionConfig) -> Result<Self> {
+        Err(Error::Unsupported("desktop sessions require Linux".into()))
     }
 
     /// The control gate (for consumers that surface takeover state).
@@ -291,10 +306,17 @@ impl DesktopSession {
     /// Screenshot of the whole desktop.
     pub async fn screenshot(&self) -> Result<Frame> {
         self.gate.check_agent()?;
-        let socket = self.socket.clone();
-        let frame = blocking(move || wayland::screenshot(&socket)).await?;
-        self.gate.check_agent()?;
-        Ok(frame)
+        #[cfg(not(target_os = "linux"))]
+        return Err(Error::Unsupported(
+            "desktop screenshots require Linux".into(),
+        ));
+        #[cfg(target_os = "linux")]
+        {
+            let socket = self.socket.clone();
+            let frame = blocking(move || wayland::screenshot(&socket)).await?;
+            self.gate.check_agent()?;
+            Ok(frame)
+        }
     }
 
     /// Run pointer/keyboard steps on the desktop.
@@ -302,8 +324,16 @@ impl DesktopSession {
         self.gate.check_agent()?;
         let _web = self.web.lock().await;
         self.gate.check_agent()?;
-        let input = self.input.clone();
-        blocking(move || input.lock().map_err(|_| Error::Closed)?.run(&steps)).await
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = steps;
+            Err(Error::Unsupported("desktop input requires Linux".into()))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let input = self.input.clone();
+            blocking(move || input.lock().map_err(|_| Error::Closed)?.run(&steps)).await
+        }
     }
 
     /// Click at desktop coordinates.
@@ -350,18 +380,21 @@ impl DesktopSession {
         if let Some(t) = self.takeover.take() {
             t.shutdown().await;
         }
+        #[cfg(target_os = "linux")]
         if let Some(v) = self.vnc.take() {
             v.shutdown().await;
         }
         if let Some(b) = self.browser.take() {
             b.shutdown().await;
         }
+        #[cfg(target_os = "linux")]
         if let Some(c) = self.compositor.take() {
             c.shutdown().await;
         }
     }
 }
 
+#[cfg(target_os = "linux")]
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     tokio::task::spawn_blocking(f)
         .await

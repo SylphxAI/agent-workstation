@@ -29,6 +29,8 @@ tracing = "0.1"
 url = "2"
 png = "0.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
