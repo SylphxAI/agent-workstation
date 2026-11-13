@@ -6,10 +6,12 @@
 
 use std::time::Duration;
 
+use agent_workstation::cdp::Cdp;
 use agent_workstation::{
     BrowserConfig, Button, DesktopSession, Error, Profile, Secret, SecretResolver, SessionConfig,
     TakeoverConfig,
 };
+use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const PAGE: &str = r#"<!doctype html><html><head><title>Fixture</title></head><body>
@@ -22,8 +24,57 @@ const PAGE: &str = r#"<!doctype html><html><head><title>Fixture</title></head><b
 <script>
 document.getElementById('cookie').textContent = 'cookie=' + document.cookie;
 document.cookie = 'kept=yes; max-age=86400; path=/';
+// Fault injection: Chromium must wait for the renderer's shortcut handling
+// before moving focus to its omnibox. This is not an input-readiness sleep.
+addEventListener('keydown', event => {
+  if (event.ctrlKey && event.key === 'l') {
+    sessionStorage.setItem('delayedShortcutCount', Number(sessionStorage.getItem('delayedShortcutCount') || 0) + 1);
+    const until = performance.now() + 500;
+    while (performance.now() < until) {} // deliberately stall shortcut ACK
+  }
+});
 </script>
 </body></html>"#;
+
+// The fixture owns the only browser window and tab. Observe a page-to-chrome
+// focus transition; CDP is used only for observation, never to inject input or
+// focus the omnibox. Blur alone is not a general-purpose omnibox detector.
+async fn focus_observer(s: &DesktopSession, profile: &std::path::Path) -> Cdp {
+    let port = std::fs::read_to_string(profile.join("user-data/DevToolsActivePort")).unwrap();
+    let mut lines = port.lines();
+    let endpoint = format!(
+        "ws://127.0.0.1:{}{}",
+        lines.next().unwrap(),
+        lines.next().unwrap()
+    );
+    let mut observer = Cdp::connect(&endpoint).await.unwrap();
+    let tabs = s.tabs().await.unwrap();
+    assert_eq!(tabs.len(), 1, "focus observation requires one tab");
+    observer.attach(&tabs[0].id).await.unwrap();
+    observer
+}
+
+async fn expect_document_focus(observer: &mut Cdp, expected: bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let result = observer
+                .call(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": "document.hasFocus()", "returnByValue": true
+                    }),
+                )
+                .await
+                .unwrap();
+            if result["result"]["value"] == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native input must produce the expected document focus transition");
+}
 
 const SECRET: &str = "s3cret-Value-42";
 
@@ -117,9 +168,11 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     assert_eq!(s.size(), (1280, 800));
     assert_eq!(s.fingerprint().seed, 42);
 
-    // Exercise native input immediately after startup, before any page/CDP
-    // operation that might incidentally give the browser time to get focus.
+    // Exercise the native keyboard immediately after startup, before any CDP
+    // observation. Shortcut delivery does not acknowledge application handling.
     s.key("ctrl+l").await.unwrap();
+    let mut observer = focus_observer(&s, profile.path()).await;
+    expect_document_focus(&mut observer, false).await;
     s.type_text(&format!("{url}?startup=1\n")).await.unwrap();
     expect_url(&s, &format!("{url}?startup=1")).await;
 
@@ -171,8 +224,8 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
     );
     assert!(!text.contains(SECRET) && !s.snapshot().await.unwrap().text.contains(SECRET));
 
-    // Desktop operations on the same window: click the email field by its
-    // on-screen position and type through the virtual keyboard.
+    // Desktop operations on the same window: use the real browser omnibox
+    // and virtual keyboard, including a deliberately slow renderer shortcut.
     let frame = s.screenshot().await.unwrap();
     assert_eq!((frame.width, frame.height), (1280, 800));
     assert!(
@@ -184,10 +237,37 @@ async fn one_desktop_web_and_desktop_ops_share_state_and_profile_persists() {
             .any(|p| p[..3] != frame.rgba[..3]),
         "desktop is not blank"
     );
-    s.snapshot().await.unwrap();
+    s.click_at(640.0, 400.0, Button::Left).await.unwrap();
+    expect_document_focus(&mut observer, true).await;
+    // A focused document must not satisfy the chrome-focus observation. No
+    // shortcut or typing is sent while this bounded negative check runs.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            expect_document_focus(&mut observer, false)
+        )
+        .await
+        .is_err(),
+        "page focus must not be mistaken for shortcut completion"
+    );
     s.key("ctrl+l").await.unwrap();
+    expect_document_focus(&mut observer, false).await;
     s.type_text(&format!("{url}?typed=1\n")).await.unwrap();
     expect_url(&s, &format!("{url}?typed=1")).await;
+    let delayed = observer
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": "Number(sessionStorage.getItem('delayedShortcutCount'))", "returnByValue": true
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        delayed["result"]["value"], 1,
+        "slow shortcut path was exercised"
+    );
+
     if let Ok(dir) = std::env::var("AGENT_WORKSTATION_DEBUG_DIR") {
         std::fs::write(
             format!("{dir}/after-typing.png"),
