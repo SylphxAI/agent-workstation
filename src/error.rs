@@ -22,6 +22,22 @@ pub enum Error {
         /// When the person took control.
         since: DateTime<Utc>,
     },
+    /// Another agent holds the session's lease. It stays theirs until they
+    /// release it or the session closes.
+    #[error("this desktop is in use by {principal} since {since}")]
+    Leased {
+        /// The agent principal that holds the lease.
+        principal: String,
+        /// When they acquired it.
+        since: DateTime<Utc>,
+    },
+    /// A ref names a snapshot that a newer snapshot or a navigation of its
+    /// document replaced. Take a new snapshot; retrying the same ref fails.
+    #[error("stale ref: {0}")]
+    StaleRef(String),
+    /// A page script the caller asked to evaluate threw.
+    #[error("script: {0}")]
+    Script(String),
     /// The browser protocol (CDP) failed or answered with an error.
     #[error("browser protocol: {0}")]
     Protocol(String),
@@ -68,6 +84,9 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Error::HumanInControl { .. } => "human-in-control",
+            Error::Leased { .. } => "leased",
+            Error::StaleRef(_) => "stale-ref",
+            Error::Script(_) => "script",
             Error::Protocol(_) => "protocol",
             Error::Starting { .. } => "starting",
             Error::Timeout(_) => "timeout",
@@ -107,5 +126,14 @@ mod tests {
         assert!(e.is_transient());
         assert!(!Error::InvalidInput("x".into()).is_transient());
         assert_eq!(Error::protocol("x").code(), "protocol");
+        let leased = Error::Leased {
+            principal: "agent-b".into(),
+            since: Utc::now(),
+        };
+        assert_eq!(leased.code(), "leased");
+        assert!(!leased.is_transient(), "waiting does not release a lease");
+        assert!(leased.to_string().contains("agent-b"));
+        assert_eq!(Error::StaleRef("x".into()).code(), "stale-ref");
+        assert!(!Error::StaleRef("x".into()).is_transient());
     }
 }
