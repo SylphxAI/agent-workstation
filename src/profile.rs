@@ -63,6 +63,7 @@ impl Profile {
 /// Remove Chromium's `SingletonLock` family when the process that holds it is
 /// gone. Refuses with [`Error::Profile`] when a live process on this host
 /// still holds the profile, so two browsers never share one profile.
+#[cfg(target_os = "linux")]
 pub fn clear_stale_singleton(user_data_dir: &Path) -> Result<()> {
     let lock = user_data_dir.join("SingletonLock");
     let target = match std::fs::read_link(&lock) {
@@ -102,6 +103,15 @@ pub fn clear_stale_singleton(user_data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Profile lock inspection requires Linux process state.
+#[cfg(not(target_os = "linux"))]
+pub fn clear_stale_singleton(_user_data_dir: &Path) -> Result<()> {
+    Err(Error::Unsupported(
+        "profile lock inspection requires Linux".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn hostname() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
@@ -110,6 +120,7 @@ fn hostname() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     // A zombie has exited; it holds nothing.
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
@@ -120,7 +131,7 @@ fn process_alive(pid: u32) -> bool {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -138,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn stale_lock_is_cleared_and_live_lock_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let host = hostname().unwrap();
@@ -160,6 +172,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn foreign_host_lock_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink("other-host.example.com-1", dir.path().join("SingletonLock"))
@@ -168,6 +181,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn no_lock_is_fine() {
         let dir = tempfile::tempdir().unwrap();
         clear_stale_singleton(dir.path()).unwrap();

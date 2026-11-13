@@ -149,6 +149,7 @@ impl Browser {
         }
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn pid(&self) -> Result<u32> {
         self.child
             .id()

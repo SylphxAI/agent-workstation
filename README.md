@@ -71,6 +71,12 @@ with code `human-in-control`.
 
 ## Runtime requirements (Linux)
 
+The crate compiles on macOS for callers that share configuration and types.
+Desktop execution is Linux-only: `DesktopSession::start` returns `Error::Unsupported`
+on other platforms before touching the profile or runtime directory. The
+compositor, VNC and Wayland backend modules are Linux-only; `Button`, `Frame` and
+`Input` remain available at the crate root.
+
 `sway`, `wayvnc` and a Chromium-family browser with Wayland support:
 
 ```sh
