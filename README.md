@@ -7,8 +7,13 @@ ways that share one state, and a person can take over the whole desktop.
 - **Web operations** over the browser's loopback DevTools endpoint: navigate,
   accessibility snapshots with `@eN` refs, click, fill, tabs, page text.
   Secrets are named by a `secret_ref`, resolved by the caller's
-  `SecretResolver` at the moment of insertion, inserted with
-  `Input.insertText`, and never returned or logged.
+  `SecretResolver` at the moment of insertion, and never returned or logged.
+  Secret fills validate the field's owning-frame origin when an expected origin
+  is supplied, and update that exact input/textarea synchronously in an isolated
+  world, independent of focus.
+  They emit untrusted input/change events, not keyboard events; ordinary fills
+  continue to use trusted browser input. Detached or replaced nodes fail closed.
+  Snapshots include local child frames; out-of-process frames are not yet supported.
 - **Desktop operations** through the Wayland output: full-desktop screenshots
   (`wlr-screencopy`), pointer input (`wlr-virtual-pointer`) and keyboard input
   (`virtual-keyboard`, any Unicode text), browser chrome and native dialogs
