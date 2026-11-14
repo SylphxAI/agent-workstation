@@ -37,19 +37,30 @@ pub struct BrowserConfig {
     pub seed_flag: Option<String>,
     /// Extra arguments appended verbatim.
     pub extra_args: Vec<String>,
+    /// Optional executable and leading arguments prepended to the browser command.
+    /// Empty launches the browser directly; entries are passed verbatim, not through a shell.
+    pub wrapper: Vec<String>,
+    /// Clear the inherited environment instead of only removing `DISPLAY`.
+    pub clear_env: bool,
+    /// Environment applied after inheritance is cleared or `DISPLAY` is removed,
+    /// but before the authoritative desktop and fingerprint environment.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl BrowserConfig {
-    /// A config for `binary` with no seed flag and no extra arguments.
+    /// A direct-launch config for `binary` with inherited environment and no extras.
     pub fn new(binary: impl Into<PathBuf>) -> Self {
         Self {
             binary: binary.into(),
             seed_flag: None,
             extra_args: Vec::new(),
+            wrapper: Vec::new(),
+            clear_env: false,
+            extra_env: Vec::new(),
         }
     }
 
-    /// Command-line arguments (exposed for inspection).
+    /// Browser arguments only, excluding any wrapper (exposed for inspection).
     pub fn args(
         &self,
         user_data_dir: &Path,
@@ -84,6 +95,33 @@ impl BrowserConfig {
         a.push(start_url.to_string());
         a
     }
+
+    fn build_command(
+        &self,
+        desktop_env: &[(String, String)],
+        user_data_dir: &Path,
+        fp: &Fingerprint,
+        proxy_url: Option<&str>,
+    ) -> Command {
+        let mut cmd = match self.wrapper.split_first() {
+            Some((program, prefix)) => {
+                let mut cmd = Command::new(program);
+                cmd.args(prefix).arg(&self.binary);
+                cmd
+            }
+            None => Command::new(&self.binary),
+        };
+        cmd.args(self.args(user_data_dir, fp, proxy_url, "about:blank"));
+        if self.clear_env {
+            cmd.env_clear();
+        } else {
+            cmd.env_remove("DISPLAY");
+        }
+        cmd.envs(self.extra_env.iter().cloned())
+            .envs(desktop_env.iter().cloned())
+            .envs(fp.launch_env());
+        cmd
+    }
 }
 
 /// The running browser.
@@ -113,11 +151,8 @@ impl Browser {
             return Err(e.into());
         }
         let log = std::fs::File::create(log)?;
-        let mut child = Command::new(&config.binary)
-            .args(config.args(user_data_dir, fp, proxy_url, "about:blank"))
-            .env_remove("DISPLAY")
-            .envs(desktop_env.iter().cloned())
-            .envs(fp.launch_env())
+        let mut child = config
+            .build_command(desktop_env, user_data_dir, fp, proxy_url)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
@@ -1354,6 +1389,132 @@ mod tests {
         assert!(a.contains(&"--user-data-dir=/profiles/p/user-data".to_string()));
         let joined = a.join(" ");
         assert!(!joined.contains("headless") && !joined.contains("enable-automation"));
+    }
+
+    #[test]
+    fn default_launch_command_runs_the_browser_directly() {
+        let fp = Fingerprint::generate("p", &FingerprintDefaults::default());
+        let cfg = BrowserConfig::new("/usr/bin/chromium");
+        let profile = Path::new("/profiles/p/user data");
+        assert!(cfg.wrapper.is_empty());
+        assert!(!cfg.clear_env);
+        assert!(cfg.extra_env.is_empty());
+        let cmd = cfg.build_command(&[], profile, &fp, None);
+        let cmd = cmd.as_std();
+        assert_eq!(cmd.get_program(), cfg.binary.as_os_str());
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            cfg.args(profile, &fp, None, "about:blank")
+                .iter()
+                .map(std::ffi::OsStr::new)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == "DISPLAY" && value.is_none())
+        );
+    }
+
+    #[test]
+    fn wrapper_prefix_precedes_binary_and_browser_arguments_verbatim() {
+        let fp = Fingerprint::generate("p", &FingerprintDefaults::default());
+        let mut cfg = BrowserConfig::new("/opt/browser dir/chromium");
+        cfg.seed_flag = Some("--fingerprint".into());
+        cfg.extra_args = vec!["--custom=two words".into()];
+        let profile = Path::new("/profiles/p/user data");
+        let proxy = Some("http://127.0.0.1:9000");
+        let browser_args = cfg.args(profile, &fp, proxy, "about:blank");
+        for wrapper in [
+            vec!["/opt/jail"],
+            vec!["/opt/jail", "--root", "/sandbox dir", "--"],
+        ] {
+            cfg.wrapper = wrapper.into_iter().map(String::from).collect();
+            let cmd = cfg.build_command(&[], profile, &fp, proxy);
+            let cmd = cmd.as_std();
+            assert_eq!(cmd.get_program(), std::ffi::OsStr::new(&cfg.wrapper[0]));
+            let expected = cfg.wrapper[1..]
+                .iter()
+                .map(std::ffi::OsStr::new)
+                .chain(std::iter::once(cfg.binary.as_os_str()))
+                .chain(browser_args.iter().map(std::ffi::OsStr::new))
+                .collect::<Vec<_>>();
+            assert_eq!(cmd.get_args().collect::<Vec<_>>(), expected);
+            assert_eq!(cfg.args(profile, &fp, proxy, "about:blank"), browser_args);
+        }
+    }
+
+    #[test]
+    fn launch_environment_keeps_desktop_and_fingerprint_authoritative() {
+        let fp = Fingerprint::generate("p", &FingerprintDefaults::default());
+        let desktop: Vec<(String, String)> = vec![
+            ("WAYLAND_DISPLAY".into(), "wayland-session".into()),
+            ("XDG_RUNTIME_DIR".into(), "/run/session".into()),
+            ("XDG_SESSION_TYPE".into(), "wayland".into()),
+            ("TZ".into(), "desktop-timezone".into()),
+            ("LANG".into(), "desktop-locale".into()),
+            ("LANGUAGE".into(), "desktop-languages".into()),
+        ];
+        for clear_env in [false, true] {
+            let mut cfg = BrowserConfig::new("/usr/bin/chromium");
+            cfg.clear_env = clear_env;
+            cfg.extra_env = desktop
+                .iter()
+                .map(|(key, _)| (key.clone(), "caller".into()))
+                .collect();
+            cfg.extra_env.push(("CUSTOM_ENV".into(), "kept".into()));
+            cfg.extra_env.push(("DISPLAY".into(), ":caller".into()));
+            let cmd = cfg.build_command(&desktop, Path::new("/profile"), &fp, None);
+            let env = cmd.as_std().get_envs().collect::<HashMap<_, _>>();
+            for (key, value) in desktop.iter().take(3).cloned().chain(fp.launch_env()) {
+                assert_eq!(
+                    env[std::ffi::OsStr::new(&key)],
+                    Some(std::ffi::OsStr::new(&value))
+                );
+            }
+            assert_eq!(
+                env[std::ffi::OsStr::new("CUSTOM_ENV")],
+                Some(std::ffi::OsStr::new("kept"))
+            );
+            assert_eq!(
+                env[std::ffi::OsStr::new("DISPLAY")],
+                Some(std::ffi::OsStr::new(":caller"))
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn launch_environment_inherits_or_clears_without_global_mutation() {
+        let fp = Fingerprint::generate("p", &FingerprintDefaults::default());
+        for clear_env in [false, true] {
+            let mut cfg = BrowserConfig::new("/unused/browser");
+            cfg.clear_env = clear_env;
+            // The shell probe ignores browser arguments and reports only these two variables.
+            cfg.wrapper = vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf '%s\n' \"${HOME-unset}\" \"${DISPLAY-unset}\"".into(),
+                "probe".into(),
+            ];
+            let mut cmd = cfg.build_command(&[], Path::new("/profile"), &fp, None);
+            let output = cmd.as_std_mut().output().unwrap();
+            assert!(output.status.success());
+            let home = if clear_env {
+                "unset".into()
+            } else {
+                std::env::var("HOME").unwrap_or_else(|_| "unset".into())
+            };
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{home}\nunset\n")
+            );
+            let env = cmd.as_std().get_envs().collect::<HashMap<_, _>>();
+            if clear_env {
+                assert!(!env.contains_key(std::ffi::OsStr::new("DISPLAY")));
+            } else {
+                assert_eq!(env[std::ffi::OsStr::new("DISPLAY")], None);
+            }
+        }
     }
 
     #[test]
