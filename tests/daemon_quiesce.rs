@@ -79,7 +79,23 @@ impl Daemon {
             let response = String::from_utf8(response).unwrap();
             let (headers, body) = response.split_once("\r\n\r\n").unwrap();
             let status = headers.split_whitespace().nth(1).unwrap().parse().unwrap();
-            let value = if body.is_empty() { Value::Null } else { serde_json::from_str(body).unwrap() };
+            let is_json = headers.lines().any(|line| {
+                line.split_once(':').is_some_and(|(name, value)| {
+                    name.eq_ignore_ascii_case("content-type")
+                        && value.trim().split(';').next() == Some("application/json")
+                })
+            });
+            let value = if body.is_empty() {
+                Value::Null
+            } else if is_json {
+                serde_json::from_str(body).unwrap_or_else(|error| {
+                    panic!("{method} {path}: HTTP {status}, invalid JSON: {error}; body={:?}",
+                        body.chars().take(512).collect::<String>())
+                })
+            } else {
+                // Axum extractor rejections use text/plain, not the API JSON envelope.
+                Value::String(body.to_owned())
+            };
             (status, value)
         }).await.expect("HTTP response deadline")
     }
@@ -99,6 +115,18 @@ impl Daemon {
         stream
     }
 }
+#[tokio::test]
+async fn malformed_mutation_body_preserves_plain_text_rejection() {
+    let daemon = Daemon::start().await;
+    let (status, body) = daemon.auth("POST", "/sessions", "{").await;
+    assert_eq!(status, 400);
+    assert!(
+        body.as_str()
+            .unwrap()
+            .starts_with("Failed to parse the request body as JSON:")
+    );
+}
+
 #[tokio::test]
 async fn authentication_precedes_body_and_admission() {
     let daemon = Daemon::start().await;
