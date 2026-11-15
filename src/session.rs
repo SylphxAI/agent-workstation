@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -90,7 +89,6 @@ pub struct DesktopSession {
     web: Mutex<Web>,
     takeover: Option<Takeover>,
     processes: std::sync::Mutex<Processes>,
-    closed: AtomicBool,
     #[cfg(target_os = "linux")]
     socket: PathBuf,
     #[cfg(target_os = "linux")]
@@ -216,7 +214,6 @@ impl DesktopSession {
             web: Mutex::new(web),
             takeover,
             processes: std::sync::Mutex::new(processes),
-            closed: AtomicBool::new(false),
             socket,
             input,
             size,
@@ -234,11 +231,23 @@ impl DesktopSession {
         &self.gate
     }
 
+    /// Capture the current human handoff for a trusted session supervisor.
+    /// This is a host capability, not an Agent operation. Do not expose the
+    /// session or this handle as an untrusted caller's browser tool.
+    /// No active lease/handoff, lease replacement, or closure fails closed.
+    pub fn handoff(&self, principal: &str) -> Result<crate::Handoff<'_>> {
+        Ok(crate::Handoff::new(
+            &self.gate,
+            &self.web,
+            self.gate.handoff(principal)?,
+        ))
+    }
+
     /// Acquire the session for `principal` (or confirm it already holds it)
     /// and return its view. Another principal's lease is
     /// [`Error::Leased`], naming the holder.
     pub fn lease(&self, principal: &str) -> Result<Agent<'_>> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.gate.is_closed() {
             return Err(Error::Closed);
         }
         self.gate.acquire(principal)?;
@@ -298,7 +307,7 @@ impl DesktopSession {
 
     /// Whether [`DesktopSession::close`] has run.
     pub fn is_closed(&self) -> bool {
-        self.closed.load(Ordering::Acquire)
+        self.gate.is_closed()
     }
 
     /// Close the session: new calls fail with [`Error::Closed`], calls in
@@ -307,7 +316,7 @@ impl DesktopSession {
     /// stop. Safe to call from any holder of a shared reference, and more
     /// than once.
     pub async fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        self.gate.close();
         let _in_flight = self.web.lock().await;
         if let Some(t) = &self.takeover {
             t.stop();
@@ -318,7 +327,7 @@ impl DesktopSession {
     }
 
     fn check(&self, principal: &str) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.gate.is_closed() {
             return Err(Error::Closed);
         }
         self.gate.check(principal)

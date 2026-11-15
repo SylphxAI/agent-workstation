@@ -488,7 +488,102 @@ pub struct Web {
     held: Vec<keys::Key>,
 }
 
+// Inputs are serialized as an argument, never interpolated into source.
+const HANDOFF_READ: &str = r#"function(selectors) {
+    let truncated = false;
+    const bound = (s, n) => { if (s.length > n) truncated = true; return s.slice(0, n); };
+    const controls = document.querySelectorAll('input,textarea');
+    if (controls.length > 256) truncated = true;
+    const forms = [];
+    for (let i = 0; i < Math.min(controls.length, 256); i++) {
+        const e = controls[i];
+        const tag = e.localName;
+        const proto = tag === 'input' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+        const value = Object.getOwnPropertyDescriptor(proto, 'value').get.call(e);
+        forms.push({tag, id: bound(e.getAttribute('id') || '', 1024),
+            name: bound(e.getAttribute('name') || '', 1024), value_nonempty: value.length > 0});
+    }
+    const predicates = selectors.map(selector => {
+        const nodes = document.querySelectorAll(selector);
+        if (nodes.length > 256) truncated = true;
+        let visible = false;
+        for (let i = 0; i < Math.min(nodes.length, 256); i++) {
+            if (nodes[i].checkVisibility({checkOpacity: true, checkVisibilityCSS: true})) visible = true;
+        }
+        return {matched: nodes.length > 0, visible};
+    });
+    const url = bound(location.href, 8192);
+    return {target_id: '', url, forms, selectors: predicates, truncated};
+}"#;
+
 impl Web {
+    // Fixed read in an isolated world: page scripts cannot replace the DOM
+    // getters. No caller code, DOM writes, target activation or ordinary refs.
+    pub(crate) async fn handoff_evidence(
+        &mut self,
+        selectors: &[&str],
+    ) -> Result<crate::PageEvidence> {
+        let refused = || Error::Refused("handoff document unreadable or replaced".into());
+        let target = self.active.clone().ok_or_else(refused)?;
+        let info = self.cdp.call("Target.getTargetInfo", json!({})).await?;
+        if info["targetInfo"]["targetId"].as_str() != Some(target.as_str()) {
+            return Err(refused());
+        }
+        let before = self.cdp.call("Page.getFrameTree", json!({})).await?;
+        let frame = &before["frameTree"]["frame"];
+        let id = frame["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(refused)?;
+        if frame["loaderId"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
+            return Err(refused());
+        }
+        let world = self
+            .cdp
+            .call(
+                "Page.createIsolatedWorld",
+                json!({
+                    "frameId": id, "worldName": "handoff-read"
+                }),
+            )
+            .await?;
+        let context = world["executionContextId"].as_i64().ok_or_else(refused)?;
+        let read = self
+            .cdp
+            .call(
+                "Runtime.callFunctionOn",
+                json!({
+                    "executionContextId": context,
+                    "functionDeclaration": HANDOFF_READ,
+                    "arguments": [{"value": selectors}],
+                    "returnByValue": true,
+                    "silent": true
+                }),
+            )
+            .await?;
+        if read.get("exceptionDetails").is_some() {
+            return Err(refused());
+        }
+        let value = read["result"].get("value").cloned().ok_or_else(refused)?;
+        let mut evidence: crate::PageEvidence =
+            serde_json::from_value(value).map_err(|_| refused())?;
+        let after = self.cdp.call("Page.getFrameTree", json!({})).await?;
+        let current = &after["frameTree"]["frame"];
+        if frame["id"] != current["id"]
+            || frame["loaderId"] != current["loaderId"]
+            || frame["url"] != current["url"]
+            || self.active.as_ref() != Some(&target)
+        {
+            return Err(refused());
+        }
+        evidence.target_id = target;
+        Ok(evidence)
+    }
+
     /// Connect to the browser endpoint and attach to its first tab.
     pub async fn connect(endpoint: &str) -> Result<Self> {
         let mut web = Self {
@@ -1545,3 +1640,7 @@ mod tests {
         assert!(check_url("nope").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "browser/handoff_tests.rs"]
+mod handoff_tests;

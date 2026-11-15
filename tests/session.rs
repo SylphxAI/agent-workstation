@@ -551,3 +551,140 @@ async fn close_after_a_login_is_a_clean_exit_that_keeps_the_login() {
     assert_eq!(a.eval("c.textContent").await.unwrap(), "session=signed-in");
     desk.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn supervisor_observes_live_properties_without_agent_access_or_input() {
+    if !headful() {
+        return;
+    }
+    let url = serve().await;
+    let profile = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let session = DesktopSession::start(config(profile.path(), &runtime.path().join("handoff")))
+        .await
+        .unwrap();
+    let a = session.lease("agent-a").unwrap();
+    a.navigate(&url).await.unwrap();
+    let snapshot = a.snapshot().await.unwrap();
+    let next = ref_of(&snapshot, "link \"Next\"");
+    a.fill("#q", "").await.unwrap();
+    let mut cdp = observer(&a, profile.path()).await;
+    eval(
+        &mut cdp,
+        r#"(() => {
+        document.querySelector('#q').value = 'private-live-value';
+        const token = document.createElement('input'); token.id = 'token';
+        token.name = 'proof'; token.type = 'hidden'; token.value = 'private-token';
+        document.body.append(token);
+        const area = document.createElement('textarea'); area.id = 'area';
+        area.value = 'private-area'; document.body.append(area);
+        window.inputEvents = 0;
+        document.addEventListener('input', () => window.inputEvents++);
+        document.addEventListener('change', () => window.inputEvents++);
+        // Poison the page world; the fixed reader must use isolated intrinsics.
+        HTMLInputElement.prototype.checkVisibility = () => { throw Error('page override'); };
+        return true;
+    })()"#,
+    )
+    .await;
+    let before = eval(
+        &mut cdp,
+        "[document.hasFocus(), document.activeElement.id, window.keys.length, window.inputEvents]",
+    )
+    .await;
+    session.gate().take(None);
+    let h = session.handoff("agent-a").unwrap();
+    assert!(matches!(
+        a.current_url().await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(matches!(
+        a.eval("1").await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(matches!(
+        a.snapshot().await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(matches!(
+        a.fill("#q", "blocked").await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(matches!(
+        a.key("Return").await,
+        Err(Error::HumanInControl { .. })
+    ));
+    let first = h.observe(&["#q", "#token", "#missing"]).await.unwrap();
+    let e = first.evidence();
+    assert_eq!(e.url, url);
+    assert!(!e.truncated);
+    for id in ["q", "token", "area"] {
+        assert!(e.forms.iter().find(|f| f.id == id).unwrap().value_nonempty);
+    }
+    assert!(e.selectors[0].matched && e.selectors[0].visible);
+    assert!(e.selectors[1].matched && !e.selectors[1].visible);
+    assert!(!e.selectors[2].matched && !e.selectors[2].visible);
+    assert!(!serde_json::to_string(e).unwrap().contains("private-"));
+    assert_eq!(eval(&mut cdp, "[document.hasFocus(), document.activeElement.id, window.keys.length, window.inputEvents]").await, before);
+    assert!(h.observe(&["["]).await.is_err()); // syntax failure is not absent evidence
+    drop(first);
+    // Navigate to another challenged document via the fixture's human connection.
+    let second_url = format!("{url}?second=1");
+    cdp.call("Page.navigate", json!({"url":second_url}))
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if eval(&mut cdp, "location.href + ':' + document.readyState").await
+            == format!("{second_url}:complete")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fixture navigation did not settle"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let second = h.observe(&["#q"]).await.unwrap();
+    assert_eq!(second.evidence().url, second_url);
+    assert!(second.evidence().selectors[0].matched); // URL change is not solve evidence
+    assert!(matches!(
+        a.current_url().await,
+        Err(Error::HumanInControl { .. })
+    ));
+    drop(second);
+    eval(&mut cdp, "document.querySelector('#q').remove(); true").await;
+    let solved = h.observe(&["#q"]).await.unwrap();
+    assert!(!solved.evidence().selectors[0].matched);
+    solved.complete().unwrap();
+    assert_eq!(
+        session.gate().take_hand_back(),
+        Some(agent_workstation::HandBack::Confirmed)
+    );
+    assert_eq!(a.current_url().await.unwrap(), second_url);
+    // A navigation, not the supervisor reader, invalidated the old ordinary ref.
+    assert!(matches!(
+        a.click(next.as_str()).await,
+        Err(Error::StaleRef(_))
+    ));
+    session.gate().take(None);
+    let old = session
+        .handoff("agent-a")
+        .unwrap()
+        .observe(&[])
+        .await
+        .unwrap();
+    session.gate().release(None);
+    session.gate().take(None);
+    assert!(matches!(old.complete(), Err(Error::StaleHandoff)));
+    let current = session
+        .handoff("agent-a")
+        .unwrap()
+        .observe(&[])
+        .await
+        .unwrap();
+    session.close().await;
+    assert!(matches!(current.complete(), Err(Error::Closed)));
+    assert!(matches!(h.observe(&[]).await, Err(Error::Closed)));
+}
