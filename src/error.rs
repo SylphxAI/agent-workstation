@@ -35,6 +35,9 @@ pub enum Error {
     /// document replaced. Take a new snapshot; retrying the same ref fails.
     #[error("stale ref: {0}")]
     StaleRef(String),
+    /// The observed handoff or owning lease is no longer current.
+    #[error("stale handoff")]
+    StaleHandoff,
     /// A page script the caller asked to evaluate threw.
     #[error("script: {0}")]
     Script(String),
@@ -86,6 +89,7 @@ impl Error {
             Error::HumanInControl { .. } => "human-in-control",
             Error::Leased { .. } => "leased",
             Error::StaleRef(_) => "stale-ref",
+            Error::StaleHandoff => "stale-handoff",
             Error::Script(_) => "script",
             Error::Protocol(_) => "protocol",
             Error::Starting { .. } => "starting",
