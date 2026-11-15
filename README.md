@@ -109,6 +109,52 @@ The first principal to call holds the session until it calls `release`;
 another principal gets `409` with code `leased`, and a person holding control
 answers `409` with code `human-in-control`.
 
+### Supervision and snapshot admission
+
+Every daemon route requires `Authorization: Bearer <token>`, using the
+16-or-more-character `AGENT_WORKSTATION_TOKEN` supplied at startup. Missing
+or invalid credentials return `401` before request-body validation.
+
+| Route | Response |
+| --- | --- |
+| `GET /healthz` | `{"status":"ok","sessions":0,"quiesced":false}` |
+| `GET /sessions` | `{"sessions":[{"id":"…","takeover_url":"…","quiesced":false,"in_flight":0}]}` |
+| `POST /quiesce`, `POST /sessions/{id}/quiesce` | Fence admission, then wait for in-flight work to drain |
+| `POST /resume`, `POST /sessions/{id}/resume` | Clear that scope's fence; `{"quiesced":false}` |
+
+Quiesce accepts an empty body, `{}`, or `{"timeout_ms":250}`. The default
+budget is 250 ms, clamped to 1–250 ms. Success returns
+`{"quiesced":true,"drained_ms":0}`. If work remains at the deadline, it
+returns `503 Service Unavailable` with `{"code":"quiesce_timeout","message":"in-flight calls did not drain within budget"}`.
+**A timeout leaves the fence set**: retry quiesce to verify drain, or resume
+to restore admission. Do not snapshot after a timeout.
+
+While fenced, new calls (and creation under the daemon-wide fence) return
+`409` with `{"code":"quiesced","message":"session is quiesced for snapshot"}`.
+Counters include admitted requests waiting for their bodies and are released
+even on validation errors, cancellation, or unwinding. Daemon-wide drain also
+covers session creation and deletion; per-session counters include deletion
+so lifecycle changes cannot race a successful drain. Reads and resume remain
+available. Unknown session quiesce/resume returns `404`.
+
+Resume accepts an empty body or `{}`. A global resume does not clear local
+session fences, and a local resume does not clear the global fence. The list
+reports the effective (global OR local) fence. A concurrent resume interrupts
+a waiting quiesce with `409` / `quiesce_cancelled`; serialize snapshot
+ownership in the caller. Session IDs are sorted; a disabled takeover endpoint
+is represented by an empty URL string.
+
+These hooks drain **daemon HTTP operations**, not autonomous browser writes,
+background tasks, or filesystem buffers. A snapshot controller must arrange
+VM/filesystem consistency separately, retain the fence until snapshot capture
+finishes, and resume afterward (including recovery paths). Each control handler
+starts its deadline before reading the body (limited to 64 KiB). Quiesce shares
+one deadline across body reading and drain, capped at 250 ms from handler entry;
+resume body reading has the same cap. A stalled control body returns
+`408` / `control_body_timeout` without changing fences. The 250 ms server-side
+budget leaves margin below 300 ms; it is not an end-to-end network, scheduler,
+filesystem, or VM snapshot latency guarantee.
+
 ## Runtime requirements (Linux)
 
 The crate compiles on macOS for callers that share configuration and types.

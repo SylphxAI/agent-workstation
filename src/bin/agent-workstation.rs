@@ -19,21 +19,25 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use agent_workstation::{
     BrowserConfig, Button, Cookie, DesktopSession, Error, Input, Profile, Proxy, Secret,
     SecretResolver, SessionConfig,
 };
-use axum::extract::{Path, State};
+use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::rejection::PathRejection;
+use axum::extract::{Path, Request, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, post};
-use axum::{Json, Router};
+use axum::routing::{delete, get, post};
+use axum::{Extension, Json, Router};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
+use tokio::sync::Notify;
 
 #[derive(Debug)]
 struct Options {
@@ -107,10 +111,296 @@ struct App {
     token: String,
     opts: Options,
     resolver: Option<CommandResolver>,
-    sessions: RwLock<HashMap<String, Arc<DesktopSession>>>,
+    registry: Mutex<Registry>,
+    changed: Notify,
 }
 
 type Shared = Arc<App>;
+
+// A single short-held lock serializes admission with both kinds of fence.
+// No lock is held across I/O or an await.
+#[derive(Debug, Default)]
+struct Fence {
+    quiesced: bool,
+    generation: u64,
+    in_flight: usize,
+}
+
+struct ManagedSession {
+    session: Arc<DesktopSession>,
+    fence: Fence,
+}
+
+#[derive(Default)]
+struct Registry {
+    daemon: Fence,
+    sessions: HashMap<String, ManagedSession>,
+}
+
+struct InFlight {
+    app: Shared,
+    id: Option<String>,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        let mut registry = self.app.registry.lock().expect("registry lock poisoned");
+        registry.daemon.in_flight -= 1;
+        if let Some(entry) = self
+            .id
+            .as_ref()
+            .and_then(|id| registry.sessions.get_mut(id))
+        {
+            entry.fence.in_flight -= 1;
+        }
+        drop(registry);
+        self.app.changed.notify_waiters();
+    }
+}
+
+fn conflict(code: &str, message: &str) -> ApiError {
+    ApiError(
+        StatusCode::CONFLICT,
+        json!({ "code": code, "message": message }),
+    )
+}
+
+fn quiesced() -> ApiError {
+    conflict("quiesced", "session is quiesced for snapshot")
+}
+
+impl App {
+    fn admit(
+        self: &Shared,
+        id: Option<String>,
+    ) -> Result<(InFlight, Option<Arc<DesktopSession>>), ApiError> {
+        let mut registry = self.registry.lock().expect("registry lock poisoned");
+        if registry.daemon.quiesced {
+            return Err(quiesced());
+        }
+        let session = if let Some(id) = &id {
+            let entry = registry
+                .sessions
+                .get_mut(id)
+                .ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
+            if entry.fence.quiesced {
+                return Err(quiesced());
+            }
+            entry.fence.in_flight += 1;
+            Some(Arc::clone(&entry.session))
+        } else {
+            None
+        };
+        registry.daemon.in_flight += 1;
+        Ok((
+            InFlight {
+                app: Arc::clone(self),
+                id,
+            },
+            session,
+        ))
+    }
+}
+
+// Authentication and admission run before body extraction. In particular, a
+// stalled upload is already counted and cannot slip past a snapshot fence.
+async fn authenticate(
+    State(app): State<Shared>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    authorize(&app, request.headers())?;
+    Ok(next.run(request).await)
+}
+
+async fn supervise(
+    State((app, needs_session)): State<(Shared, bool)>,
+    path: Result<Path<String>, PathRejection>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let id = if needs_session {
+        Some(path.map_err(|e| bad(e.to_string()))?.0)
+    } else {
+        None
+    };
+    let (_guard, session) = app.admit(id)?;
+    if let Some(session) = session {
+        request.extensions_mut().insert(session);
+    }
+    Ok(next.run(request).await)
+}
+
+async fn health(State(app): State<Shared>) -> Json<Value> {
+    let registry = app.registry.lock().expect("registry lock poisoned");
+    Json(
+        json!({ "status": "ok", "sessions": registry.sessions.len(), "quiesced": registry.daemon.quiesced }),
+    )
+}
+
+async fn sessions(State(app): State<Shared>) -> Json<Value> {
+    let registry = app.registry.lock().expect("registry lock poisoned");
+    let mut entries: Vec<_> = registry.sessions.iter().map(|(id, entry)| json!({
+        "id": id,
+        "takeover_url": entry.session.takeover_url().map(|url| url.to_string()).unwrap_or_default(),
+        "quiesced": registry.daemon.quiesced || entry.fence.quiesced,
+        "in_flight": entry.fence.in_flight,
+    })).collect();
+    entries.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    Json(json!({ "sessions": entries }))
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct QuiesceRequest {
+    timeout_ms: u64,
+}
+
+impl Default for QuiesceRequest {
+    fn default() -> Self {
+        Self { timeout_ms: 250 }
+    }
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResumeRequest {}
+
+fn optional_body<T: serde::de::DeserializeOwned + Default>(body: &Bytes) -> Result<T, ApiError> {
+    if body.is_empty() {
+        Ok(T::default())
+    } else {
+        serde_json::from_slice(body).map_err(|e| bad(e.to_string()))
+    }
+}
+
+fn fence_mut<'a>(registry: &'a mut Registry, id: Option<&str>) -> Result<&'a mut Fence, ApiError> {
+    match id {
+        None => Ok(&mut registry.daemon),
+        Some(id) => registry
+            .sessions
+            .get_mut(id)
+            .map(|entry| &mut entry.fence)
+            .ok_or_else(|| ApiError::from(Error::NotFound(id.to_owned()))),
+    }
+}
+
+const CONTROL_BUDGET: Duration = Duration::from_millis(250);
+const CONTROL_BODY_LIMIT: usize = 64 * 1024;
+
+async fn control_body(body: Body, started: Instant) -> Result<Bytes, ApiError> {
+    tokio::time::timeout_at(
+        tokio::time::Instant::from_std(started + CONTROL_BUDGET),
+        to_bytes(body, CONTROL_BODY_LIMIT),
+    )
+    .await
+    .map_err(|_| ApiError(
+        StatusCode::REQUEST_TIMEOUT,
+        json!({ "code": "control_body_timeout", "message": "control body did not arrive within budget" }),
+    ))?
+    .map_err(|e| bad(e.to_string()))
+}
+
+fn drain_timeout() -> ApiError {
+    ApiError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({ "code": "quiesce_timeout", "message": "in-flight calls did not drain within budget" }),
+    )
+}
+
+async fn drain(
+    app: &App,
+    id: Option<&str>,
+    body: Body,
+    started: Instant,
+) -> Result<Json<Value>, ApiError> {
+    let body = control_body(body, started).await?;
+    let req: QuiesceRequest = optional_body(&body)?;
+    let deadline = started + Duration::from_millis(req.timeout_ms.clamp(1, 250));
+    let generation = {
+        let mut registry = app.registry.lock().expect("registry lock poisoned");
+        let fence = fence_mut(&mut registry, id)?;
+        fence.quiesced = true;
+        fence.generation
+    };
+    let wait = async {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(drain_timeout());
+            }
+            // Register before testing the predicate: dropping the last call
+            // between the predicate and await must not lose its notification.
+            let changed = app.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut registry = app.registry.lock().expect("registry lock poisoned");
+                let fence = fence_mut(&mut registry, id)?;
+                if !fence.quiesced || fence.generation != generation {
+                    return Err(conflict(
+                        "quiesce_cancelled",
+                        "quiesce was interrupted by resume",
+                    ));
+                }
+                if fence.in_flight == 0 {
+                    return Ok(Json(
+                        json!({ "quiesced": true, "drained_ms": started.elapsed().as_millis() as u64 }),
+                    ));
+                }
+            }
+            changed.await;
+        }
+    };
+    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), wait)
+        .await
+        .unwrap_or_else(|_| Err(drain_timeout()))
+}
+
+async fn quiesce_all(State(app): State<Shared>, body: Body) -> Result<Json<Value>, ApiError> {
+    let started = Instant::now();
+    drain(&app, None, body, started).await
+}
+
+async fn quiesce_session(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    let started = Instant::now();
+    drain(&app, Some(&id), body, started).await
+}
+
+async fn clear(
+    app: &App,
+    id: Option<&str>,
+    body: Body,
+    started: Instant,
+) -> Result<Json<Value>, ApiError> {
+    let body = control_body(body, started).await?;
+    let _: ResumeRequest = optional_body(&body)?;
+    {
+        let mut registry = app.registry.lock().expect("registry lock poisoned");
+        let fence = fence_mut(&mut registry, id)?;
+        fence.quiesced = false;
+        fence.generation += 1;
+    }
+    app.changed.notify_waiters();
+    Ok(Json(json!({ "quiesced": false })))
+}
+
+async fn resume_all(State(app): State<Shared>, body: Body) -> Result<Json<Value>, ApiError> {
+    let started = Instant::now();
+    clear(&app, None, body, started).await
+}
+
+async fn resume_session(
+    State(app): State<Shared>,
+    Path(id): Path<String>,
+    body: Body,
+) -> Result<Json<Value>, ApiError> {
+    let started = Instant::now();
+    clear(&app, Some(&id), body, started).await
+}
 
 struct ApiError(StatusCode, Value);
 
@@ -177,10 +467,8 @@ struct CreateSession {
 
 async fn create(
     State(app): State<Shared>,
-    headers: HeaderMap,
     Json(req): Json<CreateSession>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&app, &headers)?;
     if req.profile.is_empty()
         || !req
             .profile
@@ -198,26 +486,31 @@ async fn create(
     cfg.proxy = req.proxy.as_deref().map(Proxy::parse).transpose()?;
     let session = DesktopSession::start(cfg).await?;
     let url = session.takeover_url().map(|u| u.to_string());
-    app.sessions
-        .write()
-        .await
-        .insert(id.clone(), Arc::new(session));
+    app.registry
+        .lock()
+        .expect("registry lock poisoned")
+        .sessions
+        .insert(
+            id.clone(),
+            ManagedSession {
+                session: Arc::new(session),
+                fence: Fence::default(),
+            },
+        );
     Ok(Json(json!({ "id": id, "takeover_url": url })))
 }
 
 async fn remove(
     State(app): State<Shared>,
-    headers: HeaderMap,
+    Extension(session): Extension<Arc<DesktopSession>>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    authorize(&app, &headers)?;
-    let s = app
+    session.close().await;
+    app.registry
+        .lock()
+        .expect("registry lock poisoned")
         .sessions
-        .write()
-        .await
-        .remove(&id)
-        .ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
-    s.close().await;
+        .remove(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -332,18 +625,9 @@ enum Op {
 
 async fn call(
     State(app): State<Shared>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
+    Extension(session): Extension<Arc<DesktopSession>>,
     Json(Call { principal, op }): Json<Call>,
 ) -> Result<Json<Value>, ApiError> {
-    authorize(&app, &headers)?;
-    let session = app
-        .sessions
-        .read()
-        .await
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| ApiError::from(Error::NotFound(id.clone())))?;
     let s = session.lease(&principal)?;
     let png = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
     let v = match op {
@@ -485,12 +769,40 @@ async fn main() {
         token,
         resolver: opts.secret_command.clone().map(CommandResolver),
         opts,
-        sessions: RwLock::new(HashMap::new()),
+        registry: Mutex::new(Registry::default()),
+        changed: Notify::new(),
     });
     let router = Router::new()
-        .route("/sessions", post(create))
-        .route("/sessions/{id}", delete(remove))
-        .route("/sessions/{id}/call", post(call))
+        .route("/healthz", get(health))
+        .route(
+            "/sessions",
+            get(sessions).merge(post(create).route_layer(middleware::from_fn_with_state(
+                (Arc::clone(&app), false),
+                supervise,
+            ))),
+        )
+        .route("/quiesce", post(quiesce_all))
+        .route("/resume", post(resume_all))
+        .route("/sessions/{id}/quiesce", post(quiesce_session))
+        .route("/sessions/{id}/resume", post(resume_session))
+        .route(
+            "/sessions/{id}",
+            delete(remove).route_layer(middleware::from_fn_with_state(
+                (Arc::clone(&app), true),
+                supervise,
+            )),
+        )
+        .route(
+            "/sessions/{id}/call",
+            post(call).route_layer(middleware::from_fn_with_state(
+                (Arc::clone(&app), true),
+                supervise,
+            )),
+        )
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&app),
+            authenticate,
+        ))
         .with_state(app);
     let listener = match tokio::net::TcpListener::bind(listen).await {
         Ok(l) => l,
@@ -499,9 +811,49 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("agent-workstation listening on {listen}");
+    eprintln!(
+        "agent-workstation listening on {}",
+        listener.local_addr().expect("listener address")
+    );
     if let Err(e) = axum::serve(listener, router).await {
         eprintln!("agent-workstation: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn panic_unwind_releases_admission_and_allows_immediate_drain() {
+        let app = Arc::new(App {
+            token: "daemon-test-token-0123456789".into(),
+            opts: Options {
+                listen: "127.0.0.1:0".parse().unwrap(),
+                state_dir: PathBuf::new(),
+                browser: BrowserConfig::new("/unused/browser"),
+                secret_command: None,
+            },
+            resolver: None,
+            registry: Mutex::new(Registry::default()),
+            changed: Notify::new(),
+        });
+        let (guard, _) = app
+            .admit(None)
+            .unwrap_or_else(|_| panic!("admission failed"));
+        assert_eq!(app.registry.lock().unwrap().daemon.in_flight, 1);
+        let task = tokio::spawn(async move {
+            let _guard = guard;
+            panic!("exercise admission unwind");
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        assert_eq!(app.registry.lock().unwrap().daemon.in_flight, 0);
+        let started = Instant::now();
+        let result = drain(&app, None, Body::empty(), started)
+            .await
+            .unwrap_or_else(|_| panic!("drain failed after unwind"));
+        assert_eq!(result.0["quiesced"], true);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }
