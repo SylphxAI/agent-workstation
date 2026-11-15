@@ -1,4 +1,4 @@
-//! Exercise the compiled daemon without a compositor or browser.
+//! Exercise the compiled daemon; real-session tests opt in with the headful suite.
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::process::Stdio;
@@ -19,11 +19,26 @@ impl Drop for Daemon {
 }
 impl Daemon {
     async fn start() -> Self {
+        Self::start_with_browser(false).await
+    }
+    async fn start_with_browser(real: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_agent-workstation"))
+        let browser = if real {
+            std::env::var("AGENT_WORKSTATION_BROWSER")
+                .unwrap_or_else(|_| "/usr/bin/chromium".into())
+        } else {
+            "/unused/browser".into()
+        };
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-workstation"));
+        if real && let Ok(args) = std::env::var("AGENT_WORKSTATION_BROWSER_ARGS") {
+            for arg in args.split_whitespace() {
+                command.args(["--browser-arg", arg]);
+            }
+        }
+        let mut child = command
             .args(["--listen", "127.0.0.1:0", "--state-dir"])
             .arg(dir.path())
-            .args(["--browser", "/unused/browser"])
+            .args(["--browser", &browser])
             .env("AGENT_WORKSTATION_TOKEN", TOKEN)
             .stderr(Stdio::piped())
             .stdout(Stdio::null())
@@ -54,7 +69,7 @@ impl Daemon {
         body: &str,
         token: Option<&str>,
     ) -> (u16, Value) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::time::timeout(Duration::from_secs(40), async {
             let mut stream = TcpStream::connect(self.addr).await.unwrap();
             let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
             let request = format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
@@ -174,15 +189,15 @@ async fn timeout_retains_fence_and_disconnect_releases_admission() {
     let start = Instant::now();
     assert_eq!(
         daemon
-            .auth("POST", "/quiesce", r#"{"timeout_ms":10}"#)
+            .auth("POST", "/quiesce", r#"{"timeout_ms":120}"#)
             .await,
         (
-            409,
+            503,
             json!({"code":"quiesce_timeout","message":"in-flight calls did not drain within budget"})
         )
     );
     assert!(
-        start.elapsed() < Duration::from_secs(1),
+        start.elapsed() < Duration::from_millis(260),
         "unbounded quiesce"
     );
     assert_eq!(daemon.auth("GET", "/healthz", "").await.1["quiesced"], true);
@@ -240,4 +255,149 @@ async fn resume_interrupts_wait_without_claiming_snapshot_safety() {
         daemon.auth("GET", "/healthz", "").await.1["quiesced"],
         false
     );
+}
+
+// Return once the final status line arrives; an unread upload need not reach EOF.
+async fn stalled_control(daemon: &Daemon, path: &str) {
+    let mut stream = TcpStream::connect(daemon.addr).await.unwrap();
+    let started = Instant::now();
+    stream.write_all(format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{{").as_bytes()).await.unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_millis(295), reader.read_line(&mut line))
+        .await
+        .expect("control body deadline")
+        .unwrap();
+    assert!(line.starts_with("HTTP/1.1 408 "), "{path}: {line}");
+    assert!(started.elapsed() < Duration::from_millis(300));
+}
+
+#[tokio::test]
+async fn stalled_control_bodies_are_bounded_without_changing_fences() {
+    let daemon = Daemon::start().await;
+    for path in ["/quiesce", "/sessions/missing/quiesce"] {
+        stalled_control(&daemon, path).await;
+        assert_eq!(
+            daemon.auth("GET", "/healthz", "").await.1["quiesced"],
+            false
+        );
+    }
+    assert_eq!(daemon.auth("POST", "/quiesce", "{}").await.0, 200);
+    for path in ["/resume", "/sessions/missing/resume"] {
+        stalled_control(&daemon, path).await;
+        assert_eq!(daemon.auth("GET", "/healthz", "").await.1["quiesced"], true);
+    }
+}
+
+#[tokio::test]
+async fn default_and_excessive_drain_budgets_are_clamped_below_300ms() {
+    let daemon = Daemon::start().await;
+    let _stalled = daemon.stalled_create().await;
+    for body in ["{}", r#"{"timeout_ms":99999}"#] {
+        let started = Instant::now();
+        let (status, value) = daemon.auth("POST", "/quiesce", body).await;
+        assert_eq!(status, 503);
+        assert_eq!(value["code"], "quiesce_timeout");
+        assert!(started.elapsed() < Duration::from_millis(300));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn registered_session_controls_preserve_independent_nested_fences() {
+    if std::env::var("AGENT_WORKSTATION_HEADFUL").as_deref() != Ok("1") {
+        eprintln!("skipping real-session daemon test; set AGENT_WORKSTATION_HEADFUL=1");
+        return;
+    }
+    let daemon = Daemon::start_with_browser(true).await;
+    let profile = tempfile::tempdir().unwrap();
+    let (status, created) = daemon
+        .auth(
+            "POST",
+            "/sessions",
+            &json!({
+                "profile": "fixture", "profile_dir": profile.path()
+            })
+            .to_string(),
+        )
+        .await;
+    assert_eq!(status, 200, "{created}");
+    let id = created["id"].as_str().unwrap();
+    let local_quiesce = format!("/sessions/{id}/quiesce");
+    let local_resume = format!("/sessions/{id}/resume");
+    let call = format!("/sessions/{id}/call");
+    assert_eq!(daemon.auth("POST", &local_quiesce, "{}").await.0, 200);
+    assert_eq!(
+        daemon.auth("GET", "/sessions", "").await.1["sessions"][0]["id"],
+        id
+    );
+    assert_eq!(daemon.auth("POST", "/quiesce", "{}").await.0, 200);
+    assert_eq!(daemon.auth("POST", "/resume", "{}").await.0, 200);
+    assert_eq!(
+        daemon.auth("GET", "/healthz", "").await.1["quiesced"],
+        false
+    );
+    assert_eq!(daemon.auth("POST", &call, "{").await.1["code"], "quiesced");
+    assert_eq!(
+        daemon.auth("GET", "/sessions", "").await.1["sessions"][0]["quiesced"],
+        true
+    );
+
+    assert_eq!(daemon.auth("POST", "/quiesce", "{}").await.0, 200);
+    assert_eq!(daemon.auth("POST", &local_resume, "{}").await.0, 200);
+    assert_eq!(daemon.auth("POST", &call, "{").await.1["code"], "quiesced");
+    assert_eq!(
+        daemon.auth("GET", "/sessions", "").await.1["sessions"][0]["quiesced"],
+        true
+    );
+    stalled_control(&daemon, &local_resume).await;
+    assert_eq!(daemon.auth("POST", "/resume", "{}").await.0, 200);
+    assert_eq!(
+        daemon.auth("GET", "/sessions", "").await.1["sessions"][0]["quiesced"],
+        false
+    );
+    assert_eq!(daemon.auth("POST", &call, "{").await.0, 400);
+    assert_eq!(daemon.auth("POST", &local_quiesce, "{}").await.0, 200);
+    stalled_control(&daemon, &local_resume).await;
+    assert_eq!(
+        daemon.auth("GET", "/sessions", "").await.1["sessions"][0]["quiesced"],
+        true
+    );
+    assert_eq!(daemon.auth("POST", &local_resume, "{}").await.0, 200);
+    assert_eq!(
+        daemon
+            .auth("DELETE", &format!("/sessions/{id}"), "")
+            .await
+            .0,
+        204
+    );
+}
+
+#[tokio::test]
+async fn control_body_time_is_charged_to_the_drain_deadline() {
+    let d = Daemon::start().await;
+    let _pending = d.stalled_create().await;
+    let body = r#"{"timeout_ms":120}"#;
+    let mut stream = TcpStream::connect(d.addr).await.unwrap();
+    let started = Instant::now();
+    stream.write_all(format!("POST /quiesce HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {TOKEN}\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+    let mut interim = [0; 25];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut interim))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+    tokio::time::sleep(Duration::from_millis(180)).await;
+    stream.write_all(body.as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_millis(80),
+        stream.read_to_string(&mut response),
+    )
+    .await
+    .expect("body reading must not reset the drain deadline")
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+    assert!(started.elapsed() < Duration::from_millis(280));
+    assert_eq!(d.auth("GET", "/healthz", "").await.1["quiesced"], true);
 }
