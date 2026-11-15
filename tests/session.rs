@@ -358,7 +358,11 @@ async fn desktop_clipboard_pointer_held_keys_and_history_buttons() {
     assert_eq!(a.clipboard_text().await.unwrap().as_deref(), Some(text));
     a.focus("#q").await.unwrap();
     a.key("ctrl+v").await.unwrap();
-    assert_eq!(a.eval("q.value").await.unwrap(), text);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while a.eval("q.value").await.unwrap() != text {
+        assert!(tokio::time::Instant::now() < deadline, "paste never landed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     a.eval("q.value = 'copied from the page'").await.unwrap();
     a.focus("#q").await.unwrap();
     a.key("ctrl+a").await.unwrap();
