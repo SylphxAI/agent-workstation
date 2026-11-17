@@ -19,3 +19,6 @@ dialog label { display: block; margin-bottom: 6px; }
 dialog textarea { width: 100%; font: inherit; background: #111; color: inherit; border: 1px solid #555; border-radius: 6px; padding: 6px; }
 dialog menu { display: flex; justify-content: flex-end; gap: 6px; padding: 0; margin: 8px 0 0; }
 [hidden] { display: none !important; }
+
+#browser-exited { position: fixed; z-index: 10; top: 5rem; left: 50%; transform: translateX(-50%); width: min(36rem, 90vw); padding: 1.5rem; border: 2px solid #ffbe60; border-radius: .75rem; background: #24211b; color: #fff; box-shadow: 0 1rem 4rem #0008; }
+#browser-exited p { line-height: 1.5; margin-bottom: 0; }

@@ -70,7 +70,7 @@ pub struct Lease {
 pub struct ControlGate {
     holder: watch::Sender<Holder>,
     state: std::sync::Mutex<State>,
-    idle_timeout: Duration,
+    idle_timeout: Option<Duration>,
     pointer: std::sync::Mutex<Option<(f64, f64)>>,
     hand_backs: std::sync::atomic::AtomicU64,
 }
@@ -99,6 +99,11 @@ impl ControlGate {
 
     /// A gate whose human control ends after the timeout without input.
     pub fn with_idle_timeout(idle_timeout: Duration) -> Arc<Self> {
+        Self::with_human_idle_timeout(Some(idle_timeout))
+    }
+
+    /// A gate with optional human idle expiry. None keeps control until release.
+    pub fn with_human_idle_timeout(idle_timeout: Option<Duration>) -> Arc<Self> {
         Arc::new(Self {
             holder: watch::channel(Holder::Agent).0,
             state: std::sync::Mutex::new(State::default()),
@@ -106,6 +111,11 @@ impl ControlGate {
             pointer: std::sync::Mutex::new(None),
             hand_backs: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Configured human idle expiry; None means explicit hand-back only.
+    pub fn human_idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
     }
 
     /// Acquire the lease or confirm the same principal already holds it.
@@ -279,24 +289,26 @@ impl ControlGate {
             if matches!(h, Holder::Agent) || self.state.lock().expect("state lock").closed {
                 return;
             }
-            let wait = match h {
-                Holder::Human { last_input, .. } => {
-                    let deadline = last_input
-                        + chrono::Duration::from_std(self.idle_timeout).unwrap_or_default();
-                    (deadline - Utc::now())
-                        .to_std()
-                        .unwrap_or(Duration::ZERO)
-                        .max(Duration::from_millis(50))
-                }
-                Holder::Agent => Duration::ZERO,
-            };
-            let _ = tokio::time::timeout(wait, rx.changed()).await;
+            if let (Some(timeout), Holder::Human { last_input, .. }) = (self.idle_timeout, h) {
+                let idle = (Utc::now() - last_input).to_std().unwrap_or_default();
+                // Bound timer size, not the configured expiry (including Duration::MAX).
+                let wait = timeout
+                    .saturating_sub(idle)
+                    .max(Duration::from_millis(50))
+                    .min(Duration::from_secs(3600));
+                let _ = tokio::time::timeout(wait, rx.changed()).await;
+            } else if rx.changed().await.is_err() {
+                return;
+            }
         }
     }
     // Called only while holding state; idle testing and transition are atomic.
     fn expire_idle(&self, s: &mut State, now: DateTime<Utc>) {
-        let idle = chrono::Duration::from_std(self.idle_timeout).unwrap_or_default();
-        let expired = matches!(&*self.holder.borrow(), Holder::Human { last_input, .. } if now - *last_input >= idle);
+        let Some(timeout) = self.idle_timeout else {
+            return;
+        };
+        let expired = matches!(&*self.holder.borrow(), Holder::Human { last_input, .. }
+            if (now - *last_input).to_std().unwrap_or_default() >= timeout);
         if expired && !s.closed {
             self.hand_back(s, HandBack::Idle);
         }
@@ -383,6 +395,44 @@ impl ControlGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn human_idle_expiry_is_optional_and_uses_the_configured_duration() {
+        for timeout in [
+            None,
+            Some(Duration::from_secs(4 * 3600)),
+            Some(Duration::MAX),
+        ] {
+            let gate = ControlGate::with_human_idle_timeout(timeout);
+            gate.take(None);
+            gate.holder.send_modify(|h| {
+                if let Holder::Human { last_input, .. } = h {
+                    *last_input -= chrono::Duration::minutes(21);
+                }
+            });
+            assert_eq!(gate.human_idle_timeout(), timeout);
+            assert!(matches!(gate.holder(), Holder::Human { .. }));
+            assert!(!gate.close_if_agent());
+            assert_eq!(gate.hand_backs(), 0);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), gate.wait_for_agent())
+                    .await
+                    .is_err()
+            );
+            gate.release(None);
+            gate.wait_for_agent().await;
+        }
+        let gate = ControlGate::with_idle_timeout(Duration::from_secs(4 * 3600));
+        gate.take(None);
+        gate.holder.send_modify(|h| {
+            if let Holder::Human { last_input, .. } = h {
+                *last_input -= chrono::Duration::hours(5);
+            }
+        });
+        gate.wait_for_agent().await;
+        assert_eq!(gate.holder(), Holder::Agent);
+        assert_eq!(gate.take_hand_back(), Some(HandBack::Idle));
+    }
 
     #[test]
     fn conditional_close_rechecks_holder_without_mutating_a_refusal() {

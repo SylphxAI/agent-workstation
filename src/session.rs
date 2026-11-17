@@ -45,6 +45,8 @@ pub struct SessionConfig {
     pub vnc: PathBuf,
     /// Serve the takeover page; `None` disables takeover.
     pub takeover: Option<TakeoverConfig>,
+    /// Human idle expiry; defaults to five minutes. None requires explicit hand-back.
+    pub human_idle_timeout: Option<Duration>,
 }
 
 impl SessionConfig {
@@ -59,6 +61,7 @@ impl SessionConfig {
             compositor: "sway".into(),
             vnc: "wayvnc".into(),
             takeover: Some(TakeoverConfig::default()),
+            human_idle_timeout: Some(crate::gate::IDLE_TIMEOUT),
         }
     }
 }
@@ -88,7 +91,7 @@ pub struct DesktopSession {
     fingerprint: Fingerprint,
     web: Mutex<Web>,
     takeover: Option<Takeover>,
-    processes: std::sync::Mutex<Processes>,
+    processes: Arc<std::sync::Mutex<Processes>>,
     #[cfg(target_os = "linux")]
     socket: PathBuf,
     #[cfg(target_os = "linux")]
@@ -105,7 +108,7 @@ impl DesktopSession {
         let fingerprint = config.profile.fingerprint(&config.fingerprint_defaults)?;
         fingerprint.validate()?;
         let size = (fingerprint.screen_width, fingerprint.screen_height);
-        let gate = ControlGate::new();
+        let gate = ControlGate::with_human_idle_timeout(config.human_idle_timeout);
         let compositor =
             Compositor::start(&config.compositor, &config.runtime_dir, size.0, size.1).await?;
         let env = compositor.client_env();
@@ -208,12 +211,33 @@ impl DesktopSession {
                 }
             }
         };
+        let processes = Arc::new(std::sync::Mutex::new(processes));
+        if let Some(t) = &takeover {
+            let exited = t.browser_exited_flag();
+            let processes = Arc::downgrade(&processes);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    let Some(processes) = processes.upgrade() else {
+                        break;
+                    };
+                    let mut processes = processes.lock().unwrap_or_else(|p| p.into_inner());
+                    let Some(browser) = &mut processes.browser else {
+                        break;
+                    };
+                    if !browser.is_running() {
+                        exited.store(true, std::sync::atomic::Ordering::Release);
+                        break;
+                    }
+                }
+            });
+        }
         Ok(Self {
             gate,
             fingerprint,
             web: Mutex::new(web),
             takeover,
-            processes: std::sync::Mutex::new(processes),
+            processes,
             socket,
             input,
             size,
