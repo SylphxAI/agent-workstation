@@ -199,3 +199,10 @@ publication as separate deliberate operations.
 ## License
 
 MIT. The takeover page bundles noVNC (MPL-2.0); see `assets/takeover/novnc/`.
+
+Human idle expiry is configurable through `SessionConfig::human_idle_timeout`
+(default `Some(Duration::from_secs(300))`). Set `None` to require an explicit
+hand-back, or use a longer duration. Takeover state reports nullable
+`idle_timeout_ms`/`idle_remaining_ms` for indefinite control. If the browser
+exits, the takeover page reports it without releasing control or restarting
+into a new page; use Hand back to request recovery with the existing profile.

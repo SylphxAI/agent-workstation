@@ -46,7 +46,7 @@ use tokio::task::JoinHandle;
 use url::Url;
 
 use crate::error::{Error, Result};
-use crate::gate::{ControlGate, Holder, IDLE_TIMEOUT};
+use crate::gate::{ControlGate, Holder};
 
 /// Longest hand-back note accepted, in characters.
 pub const MAX_NOTE_CHARS: usize = 2000;
@@ -133,6 +133,7 @@ struct Shared {
     token: String,
     cookie: String,
     public: std::sync::RwLock<Public>,
+    browser_exited: Arc<std::sync::atomic::AtomicBool>,
     vnc: PathBuf,
     gate: Arc<ControlGate>,
     stop: watch::Receiver<bool>,
@@ -145,6 +146,11 @@ impl Shared {
 }
 
 impl Takeover {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn browser_exited_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.shared.browser_exited.clone()
+    }
+
     /// Bind and serve the page and bridge for the VNC server at `vnc_socket`.
     pub async fn start(
         config: TakeoverConfig,
@@ -178,6 +184,7 @@ impl Takeover {
             token,
             cookie: format!("awt{}", &random_token()?[..8]),
             public: std::sync::RwLock::new(Public::new(base)?),
+            browser_exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             vnc: vnc_socket,
             gate,
             stop: stop_rx.clone(),
@@ -433,8 +440,12 @@ async fn asset(uri: Uri) -> Response {
 }
 
 /// The holder as JSON, plus a key that changes whenever a client should hear.
-fn snapshot(gate: &ControlGate) -> (serde_json::Value, String) {
-    match gate.holder() {
+fn snapshot(shared: &Shared) -> (serde_json::Value, String) {
+    let gate = &shared.gate;
+    let running = !shared
+        .browser_exited
+        .load(std::sync::atomic::Ordering::Acquire);
+    let (mut json, key) = match gate.holder() {
         Holder::Agent => (serde_json::json!({ "holder": "agent" }), "agent".into()),
         Holder::Human {
             since,
@@ -442,23 +453,27 @@ fn snapshot(gate: &ControlGate) -> (serde_json::Value, String) {
             last_input,
         } => {
             let idle = (Utc::now() - last_input).to_std().unwrap_or_default();
-            let remaining = IDLE_TIMEOUT.saturating_sub(idle).as_millis() as u64;
+            let timeout = gate.human_idle_timeout();
+            let millis = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+            let remaining = timeout.map(|t| millis(t.saturating_sub(idle)));
             let json = serde_json::json!({
                 "holder": "human", "since": since, "principal": principal,
-                "idle_timeout_ms": IDLE_TIMEOUT.as_millis() as u64, "idle_remaining_ms": remaining,
+                "idle_timeout_ms": timeout.map(millis), "idle_remaining_ms": remaining,
             });
             (json, format!("human {since} {last_input}"))
         }
-    }
+    };
+    json["browser_running"] = running.into();
+    (json, format!("{key} browser={running}"))
 }
 
 async fn state(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
-    Json(snapshot(&s.gate).0)
+    Json(snapshot(&s).0)
 }
 
 async fn take(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
     s.gate.take(None);
-    Json(snapshot(&s.gate).0)
+    Json(snapshot(&s).0)
 }
 
 async fn release(State(s): State<Arc<Shared>>, body: Bytes) -> Response {
@@ -488,7 +503,7 @@ async fn release(State(s): State<Arc<Shared>>, body: Bytes) -> Response {
             .into_response();
     }
     s.gate.release(note);
-    Json(snapshot(&s.gate).0).into_response()
+    Json(snapshot(&s).0).into_response()
 }
 
 async fn events(
@@ -499,7 +514,7 @@ async fn events(
         loop {
             rx.borrow_and_update();
             // `holder()` also expires an idle person, so polling drives the idle hand-back.
-            let (json, key) = snapshot(&s.gate);
+            let (json, key) = snapshot(&s);
             if last.as_ref() != Some(&key) {
                 let event = Event::default().event("state").data(json.to_string());
                 return Some((Ok(event), (rx, stop, Some(key), s)));
@@ -855,7 +870,7 @@ mod tests {
         assert!(
             http(addr, &get("/state", &cookie))
                 .await
-                .contains(r#"{"holder":"agent"}"#)
+                .contains(r#""holder":"agent""#)
         );
         let foreign = format!("{cookie}Origin: http://127.0.0.1:1\r\n");
         assert!(

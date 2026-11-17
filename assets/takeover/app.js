@@ -8,6 +8,7 @@ const $ = id => document.getElementById(id);
 history.replaceState(null, '', location.pathname);
 
 const WARN_MS = 30_000;
+let browserRunning = true;
 let rfb = null, holder = 'agent', deadline = 0, remoteClip = '', fit = true, sendClip = false;
 const sticky = new Set();
 
@@ -26,7 +27,8 @@ function connect() {
 
 function render() {
   const human = holder === 'human';
-  $('status').textContent = !rfb ? 'Disconnected, reconnecting…'
+  $('browser-exited').hidden = browserRunning;
+  $('status').textContent = !browserRunning ? 'The browser has stopped.' : !rfb ? 'Disconnected, reconnecting…'
     : human ? 'You are in control. The agent is paused.' : 'The agent is in control (view only).';
   $('take').hidden = human;
   $('handback').hidden = !human;
@@ -43,13 +45,14 @@ function render() {
 
 function apply(state) {
   holder = state.holder;
-  deadline = holder === 'human' ? Date.now() + state.idle_remaining_ms : 0;
+  browserRunning = state.browser_running !== false;
+  deadline = holder === 'human' && state.idle_remaining_ms != null ? Date.now() + state.idle_remaining_ms : 0;
   render();
 }
 
 function tickIdle() {
   const left = deadline - Date.now();
-  const warn = holder === 'human' && left <= WARN_MS;
+  const warn = holder === 'human' && deadline !== 0 && left <= WARN_MS;
   $('idle').hidden = !warn;
   if (warn) {
     $('idle').textContent = `No input for a while: control returns to the agent in ${Math.max(0, Math.ceil(left / 1000))} s. Tap, click or type to keep it.`;
