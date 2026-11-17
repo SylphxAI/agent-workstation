@@ -431,6 +431,67 @@ async fn desktop_clipboard_pointer_held_keys_and_history_buttons() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conditional_close_preserves_takeover_and_drains_admitted_work() {
+    if !headful() {
+        return;
+    }
+    let url = serve().await;
+    let (profile, rt) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let desk = DesktopSession::start(config(profile.path(), &rt.path().join("a")))
+        .await
+        .unwrap();
+    let a = desk.lease("a").unwrap();
+    a.navigate(&url).await.unwrap();
+    a.fill("#q", "unsaved").await.unwrap();
+    let mut monitor = observer(&a, profile.path()).await;
+
+    // A caller's Agent snapshot is no longer authoritative after take().
+    assert_eq!(desk.gate().holder(), agent_workstation::Holder::Agent);
+    let human = desk.gate().take(Some("viewer".into()));
+    assert!(!desk.close_if_agent().await);
+    assert!(!desk.is_closed());
+    assert_eq!(desk.gate().holder(), human);
+    assert_eq!(desk.leaseholder().unwrap().principal, "a");
+    assert_eq!(a.read().await.unwrap_err().code(), "human-in-control");
+    assert_eq!(
+        eval(&mut monitor, "document.querySelector('#q').value").await,
+        "unsaved"
+    );
+    assert!(desk.gate().release(None));
+    assert_eq!(a.current_url().await.unwrap(), url);
+
+    // The observer confirms that eval holds the work mutex before close
+    // begins. Resolve it only after closure has refused new admissions.
+    let (held, ()) = tokio::join!(
+        a.eval("window.inFlight = true; new Promise(resolve => { window.finish = () => resolve('finished'); })"),
+        async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while eval(&mut monitor, "window.inFlight === true").await != true {
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            let closing = desk.close_if_agent();
+            tokio::pin!(closing);
+            tokio::select! {
+                result = &mut closing => panic!("closed before admitted work finished: {result}"),
+                () = async {
+                    while !desk.is_closed() {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            assert_eq!(a.read().await.unwrap_err().code(), "closed");
+            eval(&mut monitor, "window.finish(); true").await;
+            assert!(closing.await);
+        }
+    );
+    assert_eq!(held.unwrap(), "finished");
+    assert!(!desk.close_if_agent().await);
+    assert_eq!(desk.lease("a").unwrap_err().code(), "closed");
+    desk.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_agent_holds_a_desktop_and_close_waits_for_calls() {
     if !headful() {
         return;

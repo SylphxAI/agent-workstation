@@ -361,6 +361,17 @@ impl ControlGate {
     }
     pub(crate) fn close(&self) {
         let mut s = self.state.lock().expect("state lock");
+        self.close_locked(&mut s);
+    }
+    pub(crate) fn close_if_agent(&self) -> bool {
+        let mut s = self.state.lock().expect("state lock");
+        if s.closed || !matches!(*self.holder.borrow(), Holder::Agent) {
+            return false;
+        }
+        self.close_locked(&mut s);
+        true
+    }
+    fn close_locked(&self, s: &mut State) {
         s.closed = true;
         s.lease = None;
         s.lease_id = None;
@@ -372,6 +383,50 @@ impl ControlGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conditional_close_rechecks_holder_without_mutating_a_refusal() {
+        let gate = ControlGate::new();
+        let lease = gate.acquire("a").unwrap();
+        assert_eq!(gate.holder(), Holder::Agent); // A caller's stale snapshot.
+        let human = gate.take(Some("viewer".into()));
+        let handoff = gate.handoff("a").unwrap();
+        let rx = gate.subscribe();
+        assert!(!gate.close_if_agent());
+        assert!(!gate.is_closed());
+        assert_eq!(gate.holder(), human);
+        assert_eq!(gate.lease(), Some(lease));
+        assert!(!rx.has_changed().unwrap());
+        assert!(gate.check_handoff(&handoff).is_ok());
+        assert!(gate.human_may_input());
+        assert!(gate.release(None));
+        assert!(gate.close_if_agent());
+        assert!(gate.is_closed());
+        assert!(gate.lease().is_none());
+        assert_eq!(gate.acquire("a").unwrap_err().code(), "closed");
+        assert_eq!(gate.take(None), Holder::Agent);
+        assert!(!gate.close_if_agent());
+    }
+
+    #[test]
+    fn conditional_close_and_take_have_one_atomic_winner() {
+        for _ in 0..64 {
+            let gate = ControlGate::new();
+            let barrier = std::sync::Barrier::new(2);
+            let (closed, holder) = std::thread::scope(|s| {
+                let close = s.spawn(|| {
+                    barrier.wait();
+                    gate.close_if_agent()
+                });
+                barrier.wait();
+                let holder = gate.take(None);
+                (close.join().unwrap(), holder)
+            });
+            assert_eq!(gate.is_closed(), closed);
+            assert_eq!(matches!(holder, Holder::Agent), closed);
+            assert_eq!(gate.holder(), holder);
+        }
+    }
 
     #[test]
     fn agent_is_refused_while_a_person_holds_control_and_resumes_on_release() {

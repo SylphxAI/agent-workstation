@@ -317,6 +317,28 @@ impl DesktopSession {
     /// than once.
     pub async fn close(&self) {
         self.gate.close();
+        self.finish_close().await;
+    }
+
+    /// Close only if the agent still holds control, atomically with a
+    /// person's takeover. Returns false, without stopping anything, if a
+    /// person holds control or closure already began. A true result means
+    /// this call closed the gate and completed the normal shutdown.
+    ///
+    /// Like [`close`](Self::close), admitted web/input calls finish before
+    /// processes stop. Caller-owned conditions (such as session identity
+    /// and last activity) must be validated and kept stable by the caller's
+    /// admission lock through this call; this method checks only control
+    /// ownership, not idleness. It does not expire a human's idle timeout.
+    pub async fn close_if_agent(&self) -> bool {
+        if !self.gate.close_if_agent() {
+            return false;
+        }
+        self.finish_close().await;
+        true
+    }
+
+    async fn finish_close(&self) {
         let _in_flight = self.web.lock().await;
         if let Some(t) = &self.takeover {
             t.stop();
