@@ -1204,6 +1204,11 @@ export default class RFB extends EventTargetMixin {
     }
 
     _sendMouse(x, y, mask) {
+        this.sendPointer(this._display.absX(x), this._display.absY(y), mask);
+    }
+
+    // Framebuffer coordinates for embedders that own the viewport and pointer.
+    sendPointer(x, y, mask) {
         if (this._rfbConnectionState !== 'connected') { return; }
         if (this._viewOnly) { return; } // View only, skip mouse events
 
@@ -1212,14 +1217,13 @@ export default class RFB extends EventTargetMixin {
             throw new Error("Illegal mouse button mask (mask: " + mask + ")");
         }
 
-        let extendedMouseButtons = mask & 0x7f80;
-
-        if (this._extendedPointerEventSupported && extendedMouseButtons) {
-            RFB.messages.extendedPointerEvent(this._sock, this._display.absX(x),
-                                              this._display.absY(y), mask);
+        if (!this._fbWidth || !this._fbHeight || !Number.isFinite(x) || !Number.isFinite(y)) { return; }
+        x = Math.max(0, Math.min(this._fbWidth - 1, Math.round(x)));
+        y = Math.max(0, Math.min(this._fbHeight - 1, Math.round(y)));
+        if (this._extendedPointerEventSupported && (mask & 0x7f80)) {
+            RFB.messages.extendedPointerEvent(this._sock, x, y, mask);
         } else {
-            RFB.messages.pointerEvent(this._sock, this._display.absX(x),
-                                      this._display.absY(y), mask);
+            RFB.messages.pointerEvent(this._sock, x, y, mask);
         }
     }
 
