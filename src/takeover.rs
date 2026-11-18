@@ -376,7 +376,7 @@ macro_rules! assets {
 }
 
 static ASSETS: &[(&str, &[u8])] = assets! {
-    "index.html", "app.js", "app.css", "novnc/LICENSE.txt", "novnc/docs/LICENSE.MPL-2.0",
+    "index.html", "app.js", "app.css", "viewport.js", "novnc/LICENSE.txt", "novnc/docs/LICENSE.MPL-2.0",
     "novnc/core/base64.js", "novnc/core/crypto/aes.js", "novnc/core/crypto/bigint.js",
     "novnc/core/crypto/crypto.js", "novnc/core/crypto/des.js", "novnc/core/crypto/dh.js",
     "novnc/core/crypto/md5.js", "novnc/core/crypto/rsa.js", "novnc/core/decoders/copyrect.js",

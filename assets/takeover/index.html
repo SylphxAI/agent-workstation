@@ -2,33 +2,48 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="referrer" content="no-referrer">
 <title>Desktop takeover</title>
 <link rel="stylesheet" href="app.css">
 <script type="module" src="app.js"></script>
 </head>
 <body>
-<header id="bar">
-  <span id="status" role="status">Connecting…</span>
-  <button id="take" class="primary" hidden>Take control</button>
-  <button id="handback" class="primary" hidden>Hand back</button>
-  <span class="tools">
-    <button id="kbd" class="needs-control" title="Keyboard" aria-label="Keyboard">⌨</button>
-    <button id="keys-btn" class="needs-control" title="Special keys">Keys</button>
-    <button id="paste" class="needs-control" title="Paste your clipboard into the desktop">Paste</button>
-    <button id="copy" disabled title="Copy the desktop clipboard">Copy</button>
-    <button id="fit" title="Switch between fit-to-window and actual size">1:1</button>
-    <button id="pan" hidden title="Drag to pan instead of sending input">Pan</button>
-  </span>
-</header>
-<div id="idle" role="alert" hidden></div>
-<section id="browser-exited" role="alert" hidden>
-  <strong>The browser has stopped.</strong>
-  <p>Your control has not been handed back. The browser will not restart automatically.
-  Use <b>Hand back</b> and tell the agent what happened so it can help you resume with this profile.</p>
-</section>
-<nav id="keys" hidden>
+<main id="screen" aria-label="Remote desktop">
+  <div id="frame"></div>
+  <div id="cursor" aria-hidden="true" hidden>
+    <svg viewBox="0 0 23 27" width="23" height="27"><path d="M2 2l18 15-8 .3 3.5 7-3.5 1.5-3.6-7L2 24z"/></svg>
+  </div>
+</main>
+<aside id="hud" data-dock="bottom" data-align="center" aria-label="Takeover controls">
+  <header id="bar">
+    <button id="dock" aria-label="Move toolbar" title="Drag to dock, or click to switch edges"><span class="grip" aria-hidden="true"></span></button>
+    <button id="tools-btn" aria-label="Show controls" aria-expanded="false" aria-controls="tools" title="Controls">
+      <span id="signal" aria-hidden="true"></span>
+      <svg aria-hidden="true" viewBox="0 0 20 20" width="17" height="17"><path d="m5 12 5-5 5 5"/></svg>
+    </button>
+    <button id="take" class="primary" hidden>Take control</button>
+    <button id="handback" class="primary" hidden>Hand back</button>
+  </header>
+  <section id="tools" hidden>
+    <div class="session-line">
+      <span class="eyebrow">REMOTE DESKTOP</span>
+      <output id="zoom" aria-label="View scale">—</output>
+    </div>
+    <div class="view row" role="group" aria-label="View controls">
+      <button id="mode" aria-label="Direct Touch mode" aria-pressed="false"><span id="mode-label">Trackpad</span><span class="swap" aria-hidden="true">⇄</span></button>
+      <button id="fit">Fit</button>
+    </div>
+    <p id="gesture-hint"></p>
+    <div class="row actions" role="group" aria-label="Desktop input">
+      <button id="kbd" class="needs-control" aria-pressed="false">Keyboard</button>
+      <button id="keys-btn" class="needs-control" aria-controls="keys" aria-expanded="false">Keys</button>
+      <button id="paste" class="needs-control">Paste</button>
+      <button id="copy" disabled>Copy</button>
+      <button id="scroll-up" class="needs-control" aria-label="Scroll up">Scroll ↑</button>
+      <button id="scroll-down" class="needs-control" aria-label="Scroll down">Scroll ↓</button>
+    </div>
+<nav id="keys" aria-label="Special keys" hidden>
   <button data-key="XK_Escape">Esc</button>
   <button data-key="XK_Tab">Tab</button>
   <button data-mod="XK_Control_L">Ctrl</button>
@@ -43,13 +58,27 @@
   <button data-key="XK_BackSpace" aria-label="Backspace">⌫</button>
   <button data-key="XK_Return" aria-label="Enter">⏎</button>
 </nav>
-<main id="screen"></main>
-<textarea id="ime" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Type into the desktop"></textarea>
+  </section>
+</aside>
+<p id="status" role="status" class="sr-only">Connecting…</p>
+<div id="announcements">
+  <div id="idle" role="alert" hidden></div>
+  <div id="feedback" role="status" hidden></div>
+  <section id="browser-exited" role="alert" hidden>
+    <strong>The browser has stopped.</strong>
+    <p>The browser will not restart automatically.</p>
+    <p id="browser-exited-human" hidden>Your control has not been handed back.
+    Use <b>Hand back</b> and tell the agent what happened so it can help you resume with this profile.</p>
+    <p id="browser-exited-agent" hidden>The agent still has control.
+    Tell it that the browser stopped so it can help you resume with this profile.</p>
+  </section>
+</div>
+<textarea id="ime" aria-label="Type into the desktop" inputmode="text" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false" tabindex="-1"></textarea>
 <dialog id="note-dlg">
   <form method="dialog">
     <label for="note">Note for the agent (optional)</label>
     <textarea id="note" maxlength="2000" rows="4"></textarea>
-    <menu><button value="cancel">Cancel</button><button value="ok" class="primary">Hand back</button></menu>
+    <menu><button value="cancel" autofocus>Cancel</button><button value="ok" class="primary">Hand back</button></menu>
   </form>
 </dialog>
 <dialog id="clip-dlg">

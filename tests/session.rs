@@ -753,3 +753,157 @@ async fn supervisor_observes_live_properties_without_agent_access_or_input() {
     assert!(matches!(current.complete(), Err(Error::Closed)));
     assert!(matches!(h.observe(&[]).await, Err(Error::Closed)));
 }
+
+/// The actual takeover page must never prescribe an action hidden from its holder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn browser_exit_guidance_follows_the_holder_without_restarting() {
+    if !headful() {
+        return;
+    }
+    use agent_workstation::browser::Web;
+
+    let viewer = tempfile::tempdir().unwrap();
+    let executable =
+        std::env::var("AGENT_WORKSTATION_BROWSER").unwrap_or_else(|_| "/usr/bin/chromium".into());
+    let mut command = tokio::process::Command::new(executable);
+    command.args([
+        "--headless",
+        "--remote-debugging-port=0",
+        "--disable-dev-shm-usage",
+    ]);
+    if let Ok(extra) = std::env::var("AGENT_WORKSTATION_BROWSER_ARGS") {
+        command.args(extra.split_whitespace());
+    }
+    let mut viewer_process = command
+        .arg(format!("--user-data-dir={}", viewer.path().display()))
+        .arg("about:blank")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let port_file = viewer.path().join("DevToolsActivePort");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while !port_file.exists() {
+            assert!(viewer_process.try_wait().unwrap().is_none());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let port = std::fs::read_to_string(port_file).unwrap();
+    let mut lines = port.lines();
+    let mut web = Web::connect(&format!(
+        "ws://127.0.0.1:{}{}",
+        lines.next().unwrap(),
+        lines.next().unwrap()
+    ))
+    .await
+    .unwrap();
+
+    for human_first in [false, true] {
+        let (profile, rt) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mut cfg = config(profile.path(), &rt.path().join("a"));
+        cfg.takeover = Some(Default::default());
+        cfg.human_idle_timeout = None;
+        let desk = DesktopSession::start(cfg).await.unwrap();
+        let a = desk.lease("fixture").unwrap();
+        a.navigate(&serve().await).await.unwrap();
+        let mut cdp = observer(&a, profile.path()).await;
+        let processes = cdp
+            .call_in(
+                None,
+                "SystemInfo.getProcessInfo",
+                json!({}),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let pid = processes["processInfo"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["type"] == "browser")
+            .unwrap()["id"]
+            .as_u64()
+            .unwrap();
+        web.navigate(desk.takeover_url().unwrap().as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            web.eval("document.getElementById('browser-exited').hidden")
+                .await
+                .unwrap(),
+            true
+        );
+        if human_first {
+            desk.gate().take(None);
+        }
+        // Kill only this disposable session's validated browser main process.
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap();
+        assert!(String::from_utf8_lossy(&cmdline).contains(profile.path().to_str().unwrap()));
+        assert!(
+            tokio::process::Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        let expected = if human_first { "human" } else { "agent" };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let ready = web.eval(&format!(
+                    "!document.getElementById('browser-exited').hidden && !document.getElementById('browser-exited-{expected}').hidden"
+                )).await.unwrap();
+                if ready == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await.unwrap();
+        let ui = web.eval("({text:document.getElementById('browser-exited').innerText,handback:!document.getElementById('handback').hidden && !document.getElementById('handback').disabled,human:!document.getElementById('browser-exited-human').hidden,agent:!document.getElementById('browser-exited-agent').hidden})").await.unwrap();
+        assert_eq!(ui["handback"], human_first, "{ui}");
+        assert_eq!(ui["human"], human_first, "{ui}");
+        assert_eq!(ui["agent"], !human_first, "{ui}");
+        let text = ui["text"].as_str().unwrap();
+        assert!(text.contains("will not restart automatically"), "{ui}");
+        assert_eq!(text.contains("Hand back"), human_first, "{ui}");
+        assert_eq!(
+            text.contains("Your control has not been handed back"),
+            human_first,
+            "{ui}"
+        );
+        assert_eq!(
+            matches!(
+                desk.gate().holder(),
+                agent_workstation::gate::Holder::Human { .. }
+            ),
+            human_first
+        );
+        println!("BROWSER_EXIT holder={expected} {ui}");
+        if human_first {
+            assert!(!desk.close_if_agent().await);
+            web.eval("document.getElementById('handback').click(); document.getElementById('note').value='browser stopped'; document.getElementById('note-dlg').close('ok'); true").await.unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while matches!(
+                    desk.gate().holder(),
+                    agent_workstation::gate::Holder::Human { .. }
+                ) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // The SSE hand-back transition also replaces the guidance in-place.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while web.eval("document.getElementById('browser-exited-agent').hidden || !document.getElementById('handback').hidden").await.unwrap() == true {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.unwrap();
+        }
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        assert!(desk.close_if_agent().await);
+    }
+    viewer_process.kill().await.unwrap();
+}
