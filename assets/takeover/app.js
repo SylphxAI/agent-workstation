@@ -28,6 +28,8 @@ function connect() {
 function render() {
   const human = holder === 'human';
   $('browser-exited').hidden = browserRunning;
+  $('browser-exited-human').hidden = !human;
+  $('browser-exited-agent').hidden = human;
   $('status').textContent = !browserRunning ? 'The browser has stopped.' : !rfb ? 'Disconnected, reconnecting…'
     : human ? 'You are in control. The agent is paused.' : 'The agent is in control (view only).';
   $('take').hidden = human;
