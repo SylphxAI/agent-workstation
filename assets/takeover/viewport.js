@@ -24,8 +24,12 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
     cursor.hidden = !width || !trackpad || !touchCursor || !enabled();
     if (cursor.hidden) return;
     const x = left + pos.x * scale, y = top + pos.y * scale;
-    cursor.classList.toggle('offscreen', x < 0 || x >= viewW || y < 0 || y >= viewH);
-    cursor.style.transform = 'translate(' + (clamp(x, 2, viewW - 23) - 2) + 'px,' + (clamp(y, 2, viewH - 27) - 2) + 'px)';
+    const offscreen = x < 0 || x >= viewW || y < 0 || y >= viewH;
+    cursor.classList.toggle('offscreen', offscreen);
+    // At an on-screen location the arrow tip must mark the click point, even if the art clips.
+    const tipX = offscreen ? clamp(x, 2, viewW - 22) : x;
+    const tipY = offscreen ? clamp(y, 2, viewH - 26) : y;
+    cursor.style.transform = 'translate(' + (tipX - 2) + 'px,' + (tipY - 2) + 'px)';
   }
 
   function paint() {

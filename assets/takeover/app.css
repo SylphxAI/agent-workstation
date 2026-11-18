@@ -30,8 +30,10 @@ button {
   white-space: nowrap;
   cursor: pointer;
   touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
 }
 @media (hover: hover) { button:not(:disabled):hover { background: #36494e; } }
+button:not(:disabled):active { box-shadow: inset 0 0 0 1px currentColor; }
 button:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 button:disabled { color: #a4b2b0; opacity: .65; cursor: default; }
 button.on { color: var(--accent); border-color: var(--accent); }

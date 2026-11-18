@@ -257,6 +257,8 @@ dock.addEventListener('pointermove', e => {
   hud.dataset.dock = e.clientY - rect.top < rect.height / 2 ? 'top' : 'bottom';
   hud.dataset.align = x < .32 ? 'start' : x > .68 ? 'end' : 'center';
 });
+// Prevent a recognized dock drag from becoming a native touch scroll/fling.
+dock.addEventListener('touchmove', e => { if (dragged) e.preventDefault(); }, { passive: false });
 for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
   dock.addEventListener(event, e => { if (docking?.id === e.pointerId) docking = null; });
 }
