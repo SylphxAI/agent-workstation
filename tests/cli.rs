@@ -1,7 +1,6 @@
 //! End-to-end tests for the compact CLI subcommands and `skills` subcommand.
 
 use std::collections::VecDeque;
-use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{Arc, Mutex};
 
@@ -626,6 +625,7 @@ async fn compact_cli_exercises_all_subcommands_against_daemon_wire_protocol() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn headful_compact_cli_drives_real_daemon_session() {
+    use std::path::Path;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command as AsyncCommand;
 
