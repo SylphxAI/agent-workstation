@@ -25,6 +25,7 @@
 
 pub mod browser;
 pub mod cdp;
+pub mod cli;
 #[cfg(target_os = "linux")]
 pub mod compositor;
 mod desktop;
@@ -36,6 +37,7 @@ pub mod profile;
 pub mod proxy;
 mod secret;
 pub mod session;
+pub mod skills;
 pub mod takeover;
 #[cfg(target_os = "linux")]
 pub mod vnc;
@@ -43,7 +45,9 @@ pub mod vnc;
 pub mod wayland;
 
 pub use browser::{BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab};
-pub use desktop::{Button, Frame, Input};
+pub use desktop::{
+    Button, DesktopRect, DesktopSnapshot, DesktopWindow, DesktopWindowRef, Frame, Input,
+};
 pub use error::{Error, Result};
 pub use fingerprint::{Fingerprint, FingerprintDefaults};
 pub use gate::{ControlGate, HandBack, Holder, Lease};
@@ -52,4 +56,4 @@ pub use profile::Profile;
 pub use proxy::Proxy;
 pub use secret::{Secret, SecretResolver};
 pub use session::{Agent, DesktopSession, MAX_HOLD, SessionConfig};
-pub use takeover::{Takeover, TakeoverConfig};
+pub use takeover::{Takeover, TakeoverConfig, TakeoverStatus};

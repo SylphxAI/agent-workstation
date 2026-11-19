@@ -89,21 +89,49 @@ text that depends on it. The generic input layer does not recognize browser
 shortcuts or resend input. Keys held by `Input::KeyDown` are released when
 the steps of that `input` call end.
 
-## Daemon
+## Daemon & Compact CLI
 
 ```sh
 AGENT_WORKSTATION_TOKEN=... agent-workstation --state-dir /var/lib/agent-workstation \
   --browser /usr/bin/chromium [--browser-arg FLAG]... --secret-command my-secret-reader --
 ```
 
+Compact CLI subcommands drive a running daemon using `AGENT_WORKSTATION_URL`
+(default `http://127.0.0.1:7600`) and `AGENT_WORKSTATION_TOKEN`:
+
+```sh
+agent-workstation open https://example.com
+agent-workstation snapshot
+agent-workstation click @e1
+agent-workstation fill @e2 "person@example.com"
+agent-workstation fill-secret @e3 vault/item/password --expect-origin https://example.com
+agent-workstation eval "document.title"
+agent-workstation screenshot ./page.png
+agent-workstation desktop snapshot
+agent-workstation desktop focus @e1
+agent-workstation takeover start
+agent-workstation close
+```
+
+Version-synced progressive-disclosure agent instructions are built into the binary
+and work offline:
+
+```sh
+agent-workstation skills            # compact topic index + exact binary version
+agent-workstation skills core       # browser workflow & secret hygiene
+agent-workstation skills desktop    # Wayland desktop window & input controls
+agent-workstation skills takeover   # human noVNC handoff & atomic close
+```
+
 `POST /sessions`, `POST /sessions/{id}/call` with
-`{"principal": "agent-a", "op": "navigate", "url": "…"}`, `DELETE
-/sessions/{id}`. Ops: `navigate`, `back`, `forward`, `reload`, `current_url`,
+`{"principal": "agent-a", "op": "navigate", "url": "…"}`, `GET /sessions/{id}/takeover`,
+`POST /sessions/{id}/takeover/{start,end}`, `DELETE /sessions/{id}[?if_agent=true]`. Ops: `navigate`, `back`, `forward`, `reload`, `current_url`,
 `tabs`, `new_tab`, `select_tab`, `close_tab`, `snapshot`, `read`, `click`,
 `fill`, `fill_secret`, `focus`, `press` (optional `hold_ms`), `key_down`,
 `key_up`, `release_keys`, `eval`, `html`, `cookies`, `set_cookies`,
 `delete_cookies`, `clear_cookies`, `page_screenshot`, `screenshot`,
-`click_at` (optional `modifiers`), `key`, `hold_key`, `type`, `scroll`,
+`click_at` (optional `modifiers`), `desktop_windows`, `desktop_snapshot`,
+`desktop_focus`, `desktop_click_ref`, `key`, `hold_key`, `type`, `scroll`,
 `pointer_position`, `clipboard_get`, `clipboard_set`, `hand_back`, `release`.
 The first principal to call holds the session until it calls `release`;
 another principal gets `409` with code `leased`, and a person holding control

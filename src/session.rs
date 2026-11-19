@@ -9,14 +9,15 @@ use tokio::sync::Mutex;
 
 use crate::browser::{Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web};
 #[cfg(target_os = "linux")]
-use crate::compositor::Compositor;
+use crate::compositor::{self, Compositor};
+use crate::desktop::{DesktopSnapshot, DesktopSnapshotStore, DesktopWindow};
 use crate::error::{Error, Result};
 use crate::fingerprint::{Fingerprint, FingerprintDefaults};
 use crate::gate::{ControlGate, HandBack, Lease};
 use crate::profile::Profile;
 use crate::proxy::{Proxy, ProxyEndpoint};
 use crate::secret::SecretResolver;
-use crate::takeover::{Takeover, TakeoverConfig};
+use crate::takeover::{Takeover, TakeoverConfig, TakeoverStatus};
 #[cfg(target_os = "linux")]
 use crate::vnc::Vnc;
 #[cfg(target_os = "linux")]
@@ -92,8 +93,11 @@ pub struct DesktopSession {
     web: Mutex<Web>,
     takeover: Option<Takeover>,
     processes: Arc<std::sync::Mutex<Processes>>,
+    desktop_snap: std::sync::Mutex<DesktopSnapshotStore>,
     #[cfg(target_os = "linux")]
     socket: PathBuf,
+    #[cfg(target_os = "linux")]
+    ipc_socket: PathBuf,
     #[cfg(target_os = "linux")]
     input: Arc<std::sync::Mutex<InputDevice>>,
     size: (u32, u32),
@@ -113,6 +117,7 @@ impl DesktopSession {
             Compositor::start(&config.compositor, &config.runtime_dir, size.0, size.1).await?;
         let env = compositor.client_env();
         let socket = compositor.socket_path();
+        let ipc_socket = compositor.ipc_socket().to_path_buf();
         let proxy = match &config.proxy {
             Some(p) => match p.start().await {
                 Ok(endpoint) => Some(endpoint),
@@ -238,7 +243,9 @@ impl DesktopSession {
             web: Mutex::new(web),
             takeover,
             processes,
+            desktop_snap: std::sync::Mutex::new(DesktopSnapshotStore::default()),
             socket,
+            ipc_socket,
             input,
             size,
         })
@@ -297,6 +304,25 @@ impl DesktopSession {
     /// Takeover page URL (with its token), when takeover is enabled.
     pub fn takeover_url(&self) -> Option<url::Url> {
         self.takeover.as_ref().map(Takeover::url)
+    }
+
+    /// Current takeover status including holder, noVNC URL, idle expiry and browser liveness.
+    pub fn takeover_status(&self) -> TakeoverStatus {
+        let browser_running = match &self.takeover {
+            Some(t) => t.is_browser_running(),
+            None => self
+                .processes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .browser
+                .as_mut()
+                .is_some_and(Browser::is_running),
+        };
+        TakeoverStatus::from_gate(
+            &self.gate,
+            self.takeover_url().map(|u| u.to_string()),
+            browser_running,
+        )
     }
 
     /// Change where people reach the takeover page; see
@@ -734,6 +760,106 @@ impl<'a> Agent<'a> {
             let (socket, text) = (self.session.socket.clone(), text.to_string());
             blocking(move || wayland::set_clipboard_text(&socket, text)).await
         }
+    }
+
+    /// Mapped desktop windows reported by the session compositor.
+    pub async fn desktop_windows(&self) -> Result<Vec<DesktopWindow>> {
+        self.session.check(&self.principal)?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(Error::Unsupported(
+            "desktop window inspection requires Linux".into(),
+        ));
+        #[cfg(target_os = "linux")]
+        {
+            let windows = compositor::list_windows(&self.session.ipc_socket).await?;
+            self.session.check(&self.principal)?;
+            Ok(windows)
+        }
+    }
+
+    /// Structured snapshot of the desktop window tree with `@eN` refs.
+    ///
+    /// Taking a new snapshot invalidates qualified `@<prev>:eN` refs from
+    /// earlier desktop snapshots (`Error::StaleRef`).
+    pub async fn desktop_snapshot(&self) -> Result<DesktopSnapshot> {
+        let windows = self.desktop_windows().await?;
+        let mut store = self
+            .session
+            .desktop_snap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        Ok(store.record(windows))
+    }
+
+    /// Focus a desktop window by numeric compositor id or `@eN` / `@<snap>:eN` ref.
+    pub async fn desktop_focus(&self, target: &str) -> Result<DesktopWindow> {
+        self.session.check(&self.principal)?;
+        let trimmed = target.trim();
+        let window_id = if trimmed.chars().all(|c| c.is_ascii_digit()) && !trimmed.is_empty() {
+            trimmed
+                .parse::<u64>()
+                .map_err(|e| Error::InvalidInput(format!("window id {trimmed:?}: {e}")))?
+        } else {
+            self.session
+                .desktop_snap
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .resolve(trimmed)?
+                .id
+        };
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = window_id;
+            Err(Error::Unsupported(
+                "desktop window focus requires Linux".into(),
+            ))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            compositor::focus_window(&self.session.ipc_socket, window_id).await?;
+            let windows = compositor::list_windows(&self.session.ipc_socket).await?;
+            self.session.check(&self.principal)?;
+            windows
+                .into_iter()
+                .find(|w| w.id == window_id)
+                .ok_or_else(|| Error::NotFound(format!("window {window_id}")))
+        }
+    }
+
+    /// Click the centre of a desktop snapshot ref (`@eN` or `@<snap>:eN`).
+    pub async fn desktop_click_ref(
+        &self,
+        target: &str,
+        button: Button,
+        modifiers: Option<&str>,
+    ) -> Result<()> {
+        self.session.check(&self.principal)?;
+        let window = self
+            .session
+            .desktop_snap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .resolve(target)?;
+        let (x, y) = window.rect.center();
+        let mut steps = Vec::new();
+        if let Some(m) = modifiers {
+            steps.push(Input::KeyDown(m.to_owned()));
+        }
+        steps.extend([
+            Input::Move { x, y },
+            Input::Button {
+                button,
+                pressed: true,
+            },
+            Input::Button {
+                button,
+                pressed: false,
+            },
+        ]);
+        if let Some(m) = modifiers {
+            steps.push(Input::KeyUp(m.to_owned()));
+        }
+        self.input(steps).await
     }
 }
 
