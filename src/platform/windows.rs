@@ -111,6 +111,7 @@ fn create_uia() -> Result<IUIAutomation, AdapterError> {
         .map_err(|e| map_hresult_err(e, "CoCreateInstance(CUIAutomation)"))
 }
 
+#[allow(non_upper_case_globals)]
 fn normalize_uia_role(control_type: UIA_CONTROLTYPE_ID) -> String {
     match control_type {
         UIA_WindowControlTypeId => "window".into(),
