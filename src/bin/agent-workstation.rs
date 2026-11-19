@@ -32,8 +32,8 @@ use agent_workstation::cli::{
     parse_desktop_click_target,
 };
 use agent_workstation::{
-    BrowserConfig, Button, Cookie, DesktopSession, Error, Holder, Input, Profile, Proxy, Secret,
-    SecretResolver, SessionConfig,
+    BrowserConfig, Button, Cookie, DesktopAction, DesktopSession, Error, Holder, Input, NodeRef,
+    Profile, Proxy, Secret, SecretResolver, SessionConfig, TreeOptions, native_adapter,
 };
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::rejection::PathRejection;
@@ -701,6 +701,7 @@ enum Op {
     },
     DesktopWindows,
     DesktopSnapshot,
+    DesktopCapabilities,
     DesktopFocus {
         target: String,
     },
@@ -708,6 +709,9 @@ enum Op {
         r#ref: String,
         button: Option<Button>,
         modifiers: Option<String>,
+    },
+    DesktopDoubleClickRef {
+        r#ref: String,
     },
     Key {
         chord: String,
@@ -836,6 +840,9 @@ async fn call(
         Op::DesktopSnapshot => {
             serde_json::to_value(s.desktop_snapshot().await?).map_err(|e| bad(e.to_string()))?
         }
+        Op::DesktopCapabilities => {
+            serde_json::to_value(native_adapter().capabilities()).map_err(|e| bad(e.to_string()))?
+        }
         Op::DesktopFocus { target } => json!({ "window": s.desktop_focus(&target).await? }),
         Op::DesktopClickRef {
             r#ref,
@@ -844,6 +851,12 @@ async fn call(
         } => {
             s.desktop_click_ref(&r#ref, button.unwrap_or(Button::Left), modifiers.as_deref())
                 .await?;
+            json!({ "ok": true })
+        }
+        Op::DesktopDoubleClickRef { r#ref } => {
+            s.desktop_click_ref(&r#ref, Button::Left, None).await?;
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            s.desktop_click_ref(&r#ref, Button::Left, None).await?;
             json!({ "ok": true })
         }
         Op::Key { chord } => json!({ "ok": s.key(&chord).await? }),
@@ -865,11 +878,9 @@ async fn call(
 }
 
 fn random_id() -> Result<String, ApiError> {
-    use std::io::Read;
     let mut b = [0u8; 12];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut b))
-        .map_err(|e| ApiError::from(Error::Io(e)))?;
+    getrandom::fill(&mut b)
+        .map_err(|e| ApiError::from(Error::Io(std::io::Error::other(e.to_string()))))?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
@@ -1103,7 +1114,15 @@ fn default_session_file() -> Result<PathBuf, String> {
             .join("agent-workstation")
             .join("session.json"));
     }
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir)
+            .join("agent-workstation")
+            .join("session.json"));
+    }
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .filter(|v| !v.is_empty())
+    {
         return Ok(PathBuf::from(home)
             .join(".cache")
             .join("agent-workstation")
@@ -1380,10 +1399,38 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
             let resp = client.call_op(&id, op).await?;
             write_png_output(path.as_deref(), &resp, as_json)?;
         }
-        Command::Desktop { action } => {
+        Command::Desktop { host: true, action } => {
+            run_host_desktop(action, as_json).await?;
+        }
+        Command::Desktop {
+            host: false,
+            action,
+        } => {
             let id = client.resolve_session().await?;
             match action {
-                DesktopCommand::Snapshot => {
+                DesktopCommand::Capabilities => {
+                    let resp = client
+                        .call_op(&id, json!({ "op": "desktop_capabilities" }))
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!(
+                            "platform={} backend={} tree={} actions={} keys={} pointer={} windows={}",
+                            resp["platform"].as_str().unwrap_or("?"),
+                            resp["backend"].as_str().unwrap_or("?"),
+                            resp["accessibility_tree"].as_bool().unwrap_or(false),
+                            resp["native_actions"].as_bool().unwrap_or(false),
+                            resp["keyboard_injection"].as_bool().unwrap_or(false),
+                            resp["pointer_injection"].as_bool().unwrap_or(false),
+                            resp["window_enumeration"].as_bool().unwrap_or(false),
+                        );
+                    }
+                }
+                DesktopCommand::Snapshot { .. } => {
                     let resp = client
                         .call_op(&id, json!({ "op": "desktop_snapshot" }))
                         .await?;
@@ -1435,6 +1482,28 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
                     } else {
                         println!("ok");
                     }
+                }
+                DesktopCommand::DoubleClick { target } => {
+                    let resp = client
+                        .call_op(
+                            &id,
+                            json!({ "op": "desktop_double_click_ref", "ref": target }),
+                        )
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!("ok");
+                    }
+                }
+                DesktopCommand::SetValue { .. } => {
+                    return Err(
+                        "desktop set-value requires --host (or use 'fill <ref> <value>' for browser fields)"
+                            .into(),
+                    );
                 }
                 DesktopCommand::Type { text } => {
                     let resp = client
@@ -1681,6 +1750,165 @@ async fn run_daemon(daemon_args: DaemonArgs, token: Option<String>) {
     }
 }
 
+async fn run_host_desktop(action: DesktopCommand, as_json: bool) -> Result<(), String> {
+    let adapter = native_adapter();
+    match action {
+        DesktopCommand::Capabilities => {
+            let caps = adapter.capabilities();
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&caps).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "platform={} backend={} tree={} actions={} keys={} pointer={} windows={}",
+                    caps.platform,
+                    caps.backend,
+                    caps.accessibility_tree,
+                    caps.native_actions,
+                    caps.keyboard_injection,
+                    caps.pointer_injection,
+                    caps.window_enumeration,
+                );
+            }
+        }
+        DesktopCommand::Snapshot {
+            max_depth,
+            max_nodes,
+            pid,
+        } => {
+            let defaults = TreeOptions::default();
+            let opts = TreeOptions {
+                max_depth: max_depth.unwrap_or(defaults.max_depth),
+                max_nodes: max_nodes.unwrap_or(defaults.max_nodes),
+                pid,
+            };
+            let tree = adapter
+                .snapshot(opts)
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "# host desktop snapshot {} ({}, {} nodes{})",
+                    tree.snapshot_id,
+                    tree.platform,
+                    tree.total_nodes,
+                    if tree.truncated { ", truncated" } else { "" }
+                );
+                if !tree.text.is_empty() {
+                    println!("{}", tree.text);
+                }
+            }
+        }
+        DesktopCommand::Windows => {
+            let windows = adapter
+                .list_windows()
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({ "windows": windows }))
+                        .map_err(|e| e.to_string())?
+                );
+            } else {
+                for w in windows {
+                    let focused = if w.focused { "*" } else { "-" };
+                    let app = w.app_id.as_deref().unwrap_or("-");
+                    println!(
+                        "{}\t{focused}\t{app}\t{},{} {}x{}\t{}",
+                        w.id, w.rect.x, w.rect.y, w.rect.width, w.rect.height, w.name
+                    );
+                }
+            }
+        }
+        DesktopCommand::Type { text } => {
+            adapter
+                .act(DesktopAction::TypeText { text })
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+            if as_json {
+                println!("{}", json!({ "ok": true }));
+            } else {
+                println!("ok");
+            }
+        }
+        DesktopCommand::Key { chord, .. } => {
+            adapter
+                .act(DesktopAction::PressKey { chord })
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+            if as_json {
+                println!("{}", json!({ "ok": true }));
+            } else {
+                println!("ok");
+            }
+        }
+        DesktopCommand::Scroll { dx, dy, .. } => {
+            adapter
+                .act(DesktopAction::Scroll {
+                    target: None,
+                    dx,
+                    dy,
+                })
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+            if as_json {
+                println!("{}", json!({ "ok": true }));
+            } else {
+                println!("ok");
+            }
+        }
+        DesktopCommand::Click { target, button, .. } => {
+            let node_ref = NodeRef::parse(&target).map_err(|e| format!("{}: {e}", e.code()))?;
+            adapter
+                .act(DesktopAction::Click {
+                    target: node_ref,
+                    button: button.map(Into::into),
+                })
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+        }
+        DesktopCommand::DoubleClick { target } => {
+            let node_ref = NodeRef::parse(&target).map_err(|e| format!("{}: {e}", e.code()))?;
+            adapter
+                .act(DesktopAction::DoubleClick { target: node_ref })
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+        }
+        DesktopCommand::Focus { target } => {
+            let node_ref = NodeRef::parse(&target).map_err(|e| format!("{}: {e}", e.code()))?;
+            adapter
+                .act(DesktopAction::Focus { target: node_ref })
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+        }
+        DesktopCommand::SetValue { target, value } => {
+            let node_ref = NodeRef::parse(&target).map_err(|e| format!("{}: {e}", e.code()))?;
+            adapter
+                .act(DesktopAction::SetValue {
+                    target: node_ref,
+                    value,
+                })
+                .await
+                .map_err(|e| format!("{}: {e}", e.code()))?;
+        }
+        DesktopCommand::Screenshot { .. } => {
+            return Err(
+                "host PlatformAdapter uses structured accessibility trees rather than screenshots; omit --host to capture the Wayland daemon display"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -1689,6 +1917,12 @@ async fn main() {
         Some(Command::Daemon(args)) => run_daemon(args, cli.client.token).await,
         Some(Command::Skills { topic, list }) => {
             print!("{}", agent_workstation::skills::render(topic, list));
+        }
+        Some(Command::Desktop { host: true, action }) => {
+            if let Err(e) = run_host_desktop(action, cli.client.json).await {
+                eprintln!("agent-workstation: {e}");
+                std::process::exit(1);
+            }
         }
         Some(other) => {
             if let Err(e) = run_client(cli.client, other).await {

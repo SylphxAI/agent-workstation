@@ -203,6 +203,11 @@ pub enum Command {
 
     /// Native desktop operations (windows, snapshot, pointer, keyboard, screenshots).
     Desktop {
+        /// Target the local host OS desktop directly via the compile-time `PlatformAdapter`
+        /// (AT-SPI2/Wayland on Linux, AXUIElement on macOS, UI Automation on Windows)
+        /// instead of the remote daemon session.
+        #[arg(long, default_value_t = false)]
+        host: bool,
         /// Desktop action to perform.
         #[command(subcommand)]
         action: DesktopCommand,
@@ -236,8 +241,21 @@ pub enum Command {
 /// Subcommands under `agent-workstation desktop`.
 #[derive(Subcommand, Debug)]
 pub enum DesktopCommand {
-    /// Capture a structured snapshot of mapped desktop windows with `@eN` refs.
-    Snapshot,
+    /// Inspect capabilities of the native desktop adapter.
+    Capabilities,
+
+    /// Capture a structured accessibility/window snapshot with `@eN` / `@<snap>:eN` refs.
+    Snapshot {
+        /// Maximum accessibility tree depth (host adapter mode).
+        #[arg(long)]
+        max_depth: Option<usize>,
+        /// Maximum accessibility tree nodes (host adapter mode).
+        #[arg(long)]
+        max_nodes: Option<usize>,
+        /// Optional target process id filter (host adapter mode).
+        #[arg(long)]
+        pid: Option<u32>,
+    },
 
     /// Click at desktop pixel coordinates (`<x> <y>`) or a desktop snapshot ref (`@e1`).
     Click {
@@ -253,6 +271,25 @@ pub enum DesktopCommand {
         /// Optional modifier chord held around the click (e.g. `ctrl+shift`).
         #[arg(long)]
         modifiers: Option<String>,
+    },
+
+    /// Double-click a desktop snapshot ref (`@e1` or `@<snap>:e1`).
+    #[command(name = "double-click")]
+    DoubleClick {
+        /// Desktop snapshot ref (`@e1` or `@<snap>:e1`).
+        #[arg(value_name = "REF")]
+        target: String,
+    },
+
+    /// Replace an accessible control's value directly by ref (`@e1` or `@<snap>:e1`).
+    #[command(name = "set-value")]
+    SetValue {
+        /// Desktop snapshot ref (`@e1` or `@<snap>:e1`).
+        #[arg(value_name = "REF")]
+        target: String,
+        /// Replacement text value.
+        #[arg(allow_hyphen_values = true)]
+        value: String,
     },
 
     /// Type Unicode text into the currently focused desktop window.
@@ -525,6 +562,7 @@ mod tests {
         match cli.command {
             Some(Command::Desktop {
                 action: DesktopCommand::Scroll { x, y, dx, dy },
+                ..
             }) => {
                 assert_eq!((x, y, dx, dy), (640.0, 400.0, -2, -5));
             }

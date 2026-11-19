@@ -33,6 +33,7 @@ mod error;
 pub mod fingerprint;
 pub mod gate;
 mod handoff;
+pub mod platform;
 pub mod profile;
 pub mod proxy;
 mod secret;
@@ -52,6 +53,10 @@ pub use error::{Error, Result};
 pub use fingerprint::{Fingerprint, FingerprintDefaults};
 pub use gate::{ControlGate, HandBack, Holder, Lease};
 pub use handoff::{FormState, Handoff, HandoffObservation, PageEvidence, SelectorState};
+pub use platform::{
+    AdapterError, DesktopAction, DesktopNode, DesktopTree, MockPlatformAdapter, NodeRef,
+    PlatformAdapter, PlatformCapabilities, TreeOptions, native_adapter,
+};
 pub use profile::Profile;
 pub use proxy::Proxy;
 pub use secret::{Secret, SecretResolver};

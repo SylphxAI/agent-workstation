@@ -113,14 +113,19 @@ pub fn render_topic(topic: SkillTopic) -> String {
         SkillTopic::Desktop => format!(
             "# agent-workstation desktop (v{VERSION})\n\n\
              ## Commands\n\
-             - Snapshot desktop windows with `@eN` / `@dN:eN` refs:\n\
+             - Inspect native host adapter capabilities (AT-SPI2/Wayland, macOS AX, Windows UIA):\n\
+               `agent-workstation desktop --host capabilities`\n\
+             - Snapshot desktop accessibility/window tree with `@eN` / `@<snap>:eN` refs:\n\
                `agent-workstation desktop snapshot`\n\
+               `agent-workstation desktop --host snapshot --max-depth 8 --max-nodes 200`\n\
              - List mapped windows or focus a window by id or ref:\n\
                `agent-workstation desktop windows`\n\
                `agent-workstation desktop focus @e1`\n\
-             - Click by pixel coordinates (`<x> <y>`) or desktop ref (`@eN`):\n\
+             - Click, double-click, or set accessible values directly:\n\
                `agent-workstation desktop click 640 400 --button left`\n\
                `agent-workstation desktop click @e1`\n\
+               `agent-workstation desktop double-click @e1`\n\
+               `agent-workstation desktop set-value @e2 \"updated\"`\n\
              - Send keyboard chords, Unicode text, wheel scroll, or capture the full display:\n\
                `agent-workstation desktop key ctrl+l`\n\
                `agent-workstation desktop key Return --hold-ms 200`\n\
@@ -128,9 +133,9 @@ pub fn render_topic(topic: SkillTopic) -> String {
                `agent-workstation desktop scroll 640 400 --dx 0 --dy -3`\n\
                `agent-workstation desktop screenshot ./desktop.png`\n\n\
              ## Rules\n\
-             - Desktop operations act on the same Wayland display as browser operations (browser chrome, file dialogs, cross-origin iframes).\n\
+             - Default `desktop` commands drive the active daemon session; pass `--host` to run directly against the local host OS `PlatformAdapter` without a daemon.\n\
              - Key chords acknowledge compositor delivery, not app focus change; re-check state with `desktop snapshot` or `snapshot` before typing.\n\
-             - Taking a new `desktop snapshot` invalidates qualified `@<prev>:eN` refs with `stale-ref`.\n"
+             - Taking a new snapshot invalidates qualified `@<prev>:eN` refs with `stale-ref`.\n"
         ),
         SkillTopic::Takeover => format!(
             "# agent-workstation takeover (v{VERSION})\n\n\
@@ -248,14 +253,23 @@ mod tests {
                     Some(Command::Skills { .. }) => {
                         seen_commands.insert("skills");
                     }
-                    Some(Command::Desktop { action }) => {
+                    Some(Command::Desktop { action, .. }) => {
                         seen_commands.insert("desktop");
                         match action {
-                            DesktopCommand::Snapshot => {
+                            DesktopCommand::Capabilities => {
+                                seen_commands.insert("desktop capabilities");
+                            }
+                            DesktopCommand::Snapshot { .. } => {
                                 seen_commands.insert("desktop snapshot");
                             }
                             DesktopCommand::Click { .. } => {
                                 seen_commands.insert("desktop click");
+                            }
+                            DesktopCommand::DoubleClick { .. } => {
+                                seen_commands.insert("desktop double-click");
+                            }
+                            DesktopCommand::SetValue { .. } => {
+                                seen_commands.insert("desktop set-value");
                             }
                             DesktopCommand::Type { .. } => {
                                 seen_commands.insert("desktop type");
@@ -309,8 +323,11 @@ mod tests {
             "eval",
             "screenshot",
             "desktop",
+            "desktop capabilities",
             "desktop snapshot",
             "desktop click",
+            "desktop double-click",
+            "desktop set-value",
             "desktop type",
             "desktop key",
             "desktop scroll",
