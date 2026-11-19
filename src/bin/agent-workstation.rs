@@ -1,42 +1,56 @@
-//! Standalone daemon: desktop sessions over a small JSON HTTP API.
+//! Standalone daemon and compact CLI for `agent-workstation`.
 //!
+//! Daemon mode (legacy top-level flags or `agent-workstation daemon ...`):
 //! ```text
 //! agent-workstation --listen 127.0.0.1:7600 --state-dir /var/lib/agent-workstation \
 //!     --browser /usr/bin/chromium [--seed-flag --fingerprint] [--browser-arg ARG]... \
 //!     [--secret-command CMD [ARG...] --]
 //! ```
 //!
-//! The bearer token comes from `AGENT_WORKSTATION_TOKEN` (required). With
-//! `--secret-command`, `fill_secret` runs `CMD ARG... <secret_ref>` and uses its
-//! standard output (one trailing newline trimmed) as the value.
-//!
-//! - `POST /sessions` `{"profile": "name", "profile_dir": "/path", "proxy": "http://…"?}` → `{"id", "takeover_url"}`
-//! - `POST /sessions/{id}/call` `{"principal": "agent-a", "op": "navigate", "url": "https://example.com"}`
-//!   → result JSON. The first principal to call holds the session until it
-//!   calls `{"op": "release"}`; another principal gets `409` with code
-//!   `leased`.
-//! - `DELETE /sessions/{id}`
+//! Compact CLI mode (drives a running daemon):
+//! ```text
+//! agent-workstation open https://example.com
+//! agent-workstation snapshot
+//! agent-workstation click @e1
+//! agent-workstation fill @e2 "hello"
+//! agent-workstation fill-secret @e3 vault/item/password --expect-origin https://example.com
+//! agent-workstation eval "document.title"
+//! agent-workstation screenshot ./page.png
+//! agent-workstation desktop snapshot
+//! agent-workstation takeover start
+//! agent-workstation close
+//! agent-workstation skills [core|desktop|takeover]
+//! ```
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use agent_workstation::cli::{
+    Cli, ClientArgs, Command, DaemonArgs, DesktopClickTarget, DesktopCommand, TakeoverCommand,
+    parse_desktop_click_target,
+};
 use agent_workstation::{
-    BrowserConfig, Button, Cookie, DesktopSession, Error, Input, Profile, Proxy, Secret,
+    BrowserConfig, Button, Cookie, DesktopSession, Error, Holder, Input, Profile, Proxy, Secret,
     SecretResolver, SessionConfig,
 };
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::rejection::PathRejection;
-use axum::extract::{Path, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path as AxumPath, Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use base64::Engine as _;
-use serde::Deserialize;
+use clap::Parser;
+use http_body_util::{BodyExt as _, Full};
+use hyper::body::Bytes as HyperBytes;
+use hyper_util::rt::TokioIo;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
 #[derive(Debug)]
@@ -47,37 +61,24 @@ struct Options {
     secret_command: Option<Vec<String>>,
 }
 
-fn parse_args() -> Result<Options, String> {
-    let mut args = std::env::args().skip(1);
-    let (mut listen, mut state, mut browser, mut seed, mut secret) = (None, None, None, None, None);
-    let mut browser_args = Vec::new();
-    while let Some(a) = args.next() {
-        let mut val = || args.next().ok_or(format!("{a} needs a value"));
-        match a.as_str() {
-            "--listen" => listen = Some(val()?.parse().map_err(|e| format!("--listen: {e}"))?),
-            "--state-dir" => state = Some(PathBuf::from(val()?)),
-            "--browser" => browser = Some(PathBuf::from(val()?)),
-            "--seed-flag" => seed = Some(val()?),
-            "--browser-arg" => browser_args.push(val()?),
-            "--secret-command" => {
-                let cmd: Vec<String> = args.by_ref().take_while(|x| x != "--").collect();
-                if cmd.is_empty() {
-                    return Err("--secret-command needs a command".into());
-                }
-                secret = Some(cmd);
-            }
-            other => return Err(format!("unknown argument {other}")),
-        }
+impl Options {
+    fn from_daemon_args(args: DaemonArgs) -> Result<Self, String> {
+        let browser = args
+            .browser
+            .ok_or_else(|| "--browser is required".to_owned())?;
+        let state_dir = args
+            .state_dir
+            .ok_or_else(|| "--state-dir is required".to_owned())?;
+        let mut cfg = BrowserConfig::new(browser);
+        cfg.seed_flag = args.seed_flag;
+        cfg.extra_args = args.browser_args;
+        Ok(Self {
+            listen: args.listen,
+            state_dir,
+            browser: cfg,
+            secret_command: args.secret_command,
+        })
     }
-    let mut cfg = BrowserConfig::new(browser.ok_or("--browser is required")?);
-    cfg.seed_flag = seed;
-    cfg.extra_args = browser_args;
-    Ok(Options {
-        listen: listen.unwrap_or_else(|| ([127, 0, 0, 1], 7600).into()),
-        state_dir: state.ok_or("--state-dir is required")?,
-        browser: cfg,
-        secret_command: secret,
-    })
 }
 
 #[derive(Debug)]
@@ -215,7 +216,7 @@ async fn authenticate(
 
 async fn supervise(
     State((app, needs_session)): State<(Shared, bool)>,
-    path: Result<Path<String>, PathRejection>,
+    path: Result<AxumPath<String>, PathRejection>,
     mut request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
@@ -363,7 +364,7 @@ async fn quiesce_all(State(app): State<Shared>, body: Body) -> Result<Json<Value
 
 async fn quiesce_session(
     State(app): State<Shared>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
     let started = Instant::now();
@@ -395,7 +396,7 @@ async fn resume_all(State(app): State<Shared>, body: Body) -> Result<Json<Value>
 
 async fn resume_session(
     State(app): State<Shared>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
     body: Body,
 ) -> Result<Json<Value>, ApiError> {
     let started = Instant::now();
@@ -500,18 +501,118 @@ async fn create(
     Ok(Json(json!({ "id": id, "takeover_url": url })))
 }
 
+fn parse_if_agent(uri: &Uri) -> Result<bool, ApiError> {
+    let Some(query) = uri.query() else {
+        return Ok(false);
+    };
+    let mut if_agent = false;
+    for (k, v) in url::form_urlencoded::parse(query.as_bytes()) {
+        if k == "if_agent" {
+            match v.as_ref() {
+                "true" | "1" => if_agent = true,
+                "false" | "0" => if_agent = false,
+                other => {
+                    return Err(bad(format!(
+                        "invalid if_agent query value {other:?}; expected true or false"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(if_agent)
+}
+
 async fn remove(
     State(app): State<Shared>,
     Extension(session): Extension<Arc<DesktopSession>>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
+    uri: Uri,
 ) -> Result<StatusCode, ApiError> {
-    session.close().await;
+    if parse_if_agent(&uri)? {
+        if !session.close_if_agent().await {
+            if let Holder::Human { since, .. } = session.gate().holder() {
+                return Err(ApiError::from(Error::HumanInControl { since }));
+            }
+            app.registry
+                .lock()
+                .expect("registry lock poisoned")
+                .sessions
+                .remove(&id);
+            return Err(ApiError::from(Error::Closed));
+        }
+    } else {
+        session.close().await;
+    }
     app.registry
         .lock()
         .expect("registry lock poisoned")
         .sessions
         .remove(&id);
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn takeover_status(
+    State(app): State<Shared>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = app
+        .registry
+        .lock()
+        .expect("registry lock poisoned")
+        .sessions
+        .get(&id)
+        .map(|entry| Arc::clone(&entry.session))
+        .ok_or_else(|| ApiError::from(Error::NotFound(id)))?;
+    let value = serde_json::to_value(session.takeover_status()).map_err(|e| bad(e.to_string()))?;
+    Ok(Json(value))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TakeoverStartRequest {
+    principal: Option<String>,
+}
+
+async fn takeover_start(
+    Extension(session): Extension<Arc<DesktopSession>>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let req: TakeoverStartRequest = optional_body(&body)?;
+    session.gate().take(req.principal);
+    let value = serde_json::to_value(session.takeover_status()).map_err(|e| bad(e.to_string()))?;
+    Ok(Json(value))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TakeoverEndRequest {
+    note: Option<String>,
+}
+
+async fn takeover_end(
+    Extension(session): Extension<Arc<DesktopSession>>,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let req: TakeoverEndRequest = optional_body(&body)?;
+    let note = req
+        .note
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty());
+    if note
+        .as_ref()
+        .is_some_and(|n| n.chars().count() > agent_workstation::takeover::MAX_NOTE_CHARS)
+    {
+        return Err(bad(format!(
+            "note exceeds {} characters",
+            agent_workstation::takeover::MAX_NOTE_CHARS
+        )));
+    }
+    let released = session.gate().release(note);
+    let status = session.takeover_status();
+    Ok(Json(json!({
+        "released": released,
+        "status": status,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -595,6 +696,16 @@ enum Op {
     ClickAt {
         x: f64,
         y: f64,
+        button: Option<Button>,
+        modifiers: Option<String>,
+    },
+    DesktopWindows,
+    DesktopSnapshot,
+    DesktopFocus {
+        target: String,
+    },
+    DesktopClickRef {
+        r#ref: String,
         button: Option<Button>,
         modifiers: Option<String>,
     },
@@ -721,6 +832,20 @@ async fn call(
             }
             json!({ "ok": s.input(steps).await? })
         }
+        Op::DesktopWindows => json!({ "windows": s.desktop_windows().await? }),
+        Op::DesktopSnapshot => {
+            serde_json::to_value(s.desktop_snapshot().await?).map_err(|e| bad(e.to_string()))?
+        }
+        Op::DesktopFocus { target } => json!({ "window": s.desktop_focus(&target).await? }),
+        Op::DesktopClickRef {
+            r#ref,
+            button,
+            modifiers,
+        } => {
+            s.desktop_click_ref(&r#ref, button.unwrap_or(Button::Left), modifiers.as_deref())
+                .await?;
+            json!({ "ok": true })
+        }
         Op::Key { chord } => json!({ "ok": s.key(&chord).await? }),
         Op::HoldKey { chord, ms } => {
             json!({ "ok": s.hold_key(&chord, std::time::Duration::from_millis(ms)).await? })
@@ -748,19 +873,739 @@ fn random_id() -> Result<String, ApiError> {
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 
-#[tokio::main]
-async fn main() {
-    let opts = match parse_args() {
+// ---- compact CLI client -----------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SavedSession {
+    endpoint: String,
+    session_id: String,
+}
+
+struct DaemonClient {
+    base_url: url::Url,
+    normalized_endpoint: String,
+    host_header: String,
+    connect_addr: String,
+    token: String,
+    principal: String,
+    session_override: Option<String>,
+    session_file: PathBuf,
+}
+
+impl DaemonClient {
+    fn from_args(args: &ClientArgs) -> Result<Self, String> {
+        let base_url = url::Url::parse(&args.endpoint)
+            .map_err(|e| format!("invalid --endpoint {:?}: {e}", args.endpoint))?;
+        if base_url.scheme() != "http" {
+            return Err(format!(
+                "unsupported endpoint scheme {:?}: daemon client expects http://",
+                base_url.scheme()
+            ));
+        }
+        let host = base_url
+            .host_str()
+            .ok_or_else(|| format!("--endpoint {:?} has no host", args.endpoint))?;
+        let port = base_url.port_or_known_default().unwrap_or(80);
+        let connect_addr = format!("{host}:{port}");
+        let host_header = match base_url.port() {
+            Some(p) => format!("{host}:{p}"),
+            None => host.to_owned(),
+        };
+        let normalized_endpoint = base_url.as_str().trim_end_matches('/').to_owned();
+        let token = args
+            .token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| {
+                "set AGENT_WORKSTATION_TOKEN or pass --token to authenticate with the daemon"
+                    .to_owned()
+            })?;
+        let session_file = match &args.session_file {
+            Some(p) => p.clone(),
+            None => default_session_file()?,
+        };
+        Ok(Self {
+            base_url,
+            normalized_endpoint,
+            host_header,
+            connect_addr,
+            token,
+            principal: args.principal.clone(),
+            session_override: args.session.clone(),
+            session_file,
+        })
+    }
+
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(StatusCode, Value), String> {
+        let base_path = self.base_url.path().trim_end_matches('/');
+        let full_path = format!("{base_path}{path}");
+        let stream = TcpStream::connect(&self.connect_addr)
+            .await
+            .map_err(|e| format!("cannot connect to daemon at {}: {e}", self.connect_addr))?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(|e| format!("HTTP handshake with {} failed: {e}", self.connect_addr))?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let payload = match body {
+            Some(v) => serde_json::to_vec(v).map_err(|e| format!("encode request JSON: {e}"))?,
+            None => Vec::new(),
+        };
+        let mut req_builder = hyper::Request::builder()
+            .method(method)
+            .uri(&full_path)
+            .header("host", &self.host_header)
+            .header("authorization", format!("Bearer {}", self.token))
+            .header("connection", "close");
+        if body.is_some() {
+            req_builder = req_builder.header("content-type", "application/json");
+        }
+        let req = req_builder
+            .body(Full::new(HyperBytes::from(payload)))
+            .map_err(|e| format!("build HTTP request: {e}"))?;
+
+        let resp = sender
+            .send_request(req)
+            .await
+            .map_err(|e| format!("request {method} {full_path} failed: {e}"))?;
+        let status = resp.status();
+        let bytes = resp
+            .into_body()
+            .collect()
+            .await
+            .map_err(|e| format!("read response body: {e}"))?
+            .to_bytes();
+        let value = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&bytes).into_owned()))
+        };
+        Ok((status, value))
+    }
+
+    async fn checked(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value, String> {
+        let (status, value) = self.request(method, path, body).await?;
+        if status.is_success() {
+            return Ok(value);
+        }
+        Err(format_daemon_error(status, &value))
+    }
+
+    async fn call_op(&self, session_id: &str, mut op: Value) -> Result<Value, String> {
+        let obj = op
+            .as_object_mut()
+            .ok_or_else(|| "internal error: op payload must be a JSON object".to_owned())?;
+        obj.insert("principal".into(), Value::String(self.principal.clone()));
+        self.checked("POST", &format!("/sessions/{session_id}/call"), Some(&op))
+            .await
+    }
+
+    fn read_saved_session(&self) -> Option<String> {
+        let text = std::fs::read_to_string(&self.session_file).ok()?;
+        let saved: SavedSession = serde_json::from_str(&text).ok()?;
+        (saved.endpoint == self.normalized_endpoint && !saved.session_id.is_empty())
+            .then_some(saved.session_id)
+    }
+
+    fn write_saved_session(&self, session_id: &str) -> Result<(), String> {
+        if let Some(parent) = self.session_file.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create session directory {}: {e}", parent.display()))?;
+        }
+        let saved = SavedSession {
+            endpoint: self.normalized_endpoint.clone(),
+            session_id: session_id.to_owned(),
+        };
+        let bytes = serde_json::to_vec_pretty(&saved).map_err(|e| e.to_string())?;
+        let tmp = self.session_file.with_extension("json.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        std::fs::rename(&tmp, &self.session_file)
+            .map_err(|e| format!("save session file {}: {e}", self.session_file.display()))
+    }
+
+    fn clear_saved_session_if(&self, session_id: &str) {
+        if self.read_saved_session().as_deref() == Some(session_id) {
+            let _ = std::fs::remove_file(&self.session_file);
+        }
+    }
+
+    async fn list_session_ids(&self) -> Result<Vec<String>, String> {
+        let v = self.checked("GET", "/sessions", None).await?;
+        let ids = v["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+            .collect();
+        Ok(ids)
+    }
+
+    async fn resolve_session(&self) -> Result<String, String> {
+        if let Some(id) = &self.session_override {
+            return Ok(id.clone());
+        }
+        if let Some(saved) = self.read_saved_session() {
+            return Ok(saved);
+        }
+        let ids = self.list_session_ids().await?;
+        match ids.as_slice() {
+            [] => Err(
+                "no active session; run 'agent-workstation open <url>' or pass --session <id>"
+                    .to_owned(),
+            ),
+            [only] => Ok(only.clone()),
+            many => Err(format!(
+                "multiple active sessions ({}); pass --session <id>",
+                many.join(", ")
+            )),
+        }
+    }
+}
+
+fn format_daemon_error(status: StatusCode, value: &Value) -> String {
+    if let Some(obj) = value.as_object() {
+        let code = obj.get("code").and_then(Value::as_str);
+        let msg = obj.get("message").and_then(Value::as_str);
+        match (code, msg) {
+            (Some(c), Some(m)) => return format!("{c}: {m} (HTTP {})", status.as_u16()),
+            (Some(c), None) => return format!("{c} (HTTP {})", status.as_u16()),
+            _ => {}
+        }
+    }
+    if let Some(s) = value.as_str() {
+        return format!("HTTP {}: {s}", status.as_u16());
+    }
+    format!("HTTP {}: {value}", status.as_u16())
+}
+
+fn default_session_file() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir)
+            .join("agent-workstation")
+            .join("session.json"));
+    }
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(home)
+            .join(".cache")
+            .join("agent-workstation")
+            .join("session.json"));
+    }
+    Err(
+        "cannot determine default session file; set XDG_RUNTIME_DIR, HOME, or --session-file"
+            .into(),
+    )
+}
+
+fn default_profile_dir(session_file: &Path, profile: &str) -> PathBuf {
+    session_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("profiles")
+        .join(profile)
+}
+
+fn write_png_output(path: Option<&Path>, resp: &Value, as_json: bool) -> Result<(), String> {
+    let Some(path) = path else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(resp).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    };
+    let encoded = resp["png_base64"]
+        .as_str()
+        .ok_or_else(|| "daemon screenshot response missing png_base64".to_owned())?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("decode screenshot PNG: {e}"))?;
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create screenshot directory {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, &bytes)
+        .map_err(|e| format!("write screenshot {}: {e}", path.display()))?;
+    let width = resp["width"].as_u64().unwrap_or(0);
+    let height = resp["height"].as_u64().unwrap_or(0);
+    let truncated = resp["truncated"].as_bool();
+    if as_json {
+        let mut meta = json!({
+            "path": path.display().to_string(),
+            "width": width,
+            "height": height,
+            "bytes": bytes.len(),
+        });
+        if let Some(t) = truncated {
+            meta["truncated"] = Value::Bool(t);
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&meta).map_err(|e| e.to_string())?
+        );
+    } else {
+        println!(
+            "saved {} ({width}x{height}, {} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    }
+    Ok(())
+}
+
+fn print_takeover_status(status: &Value, as_json: bool) -> Result<(), String> {
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(status).map_err(|e| e.to_string())?
+        );
+        return Ok(());
+    }
+    let holder = status["holder"].as_str().unwrap_or("unknown");
+    println!("holder={holder}");
+    if let Some(url) = status["takeover_url"].as_str().filter(|u| !u.is_empty()) {
+        println!("takeover_url={url}");
+    }
+    if let Some(running) = status["browser_running"].as_bool() {
+        println!("browser_running={running}");
+    }
+    if let Some(remaining) = status["idle_remaining_ms"].as_u64() {
+        println!("idle_remaining_ms={remaining}");
+    }
+    Ok(())
+}
+
+async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
+    let client = DaemonClient::from_args(&args)?;
+    let as_json = args.json;
+    match cmd {
+        Command::Open {
+            url,
+            profile,
+            profile_dir,
+            proxy,
+            new,
+        } => {
+            if new && client.session_override.is_some() {
+                return Err("cannot combine --new with --session".into());
+            }
+            let (session_id, created, takeover_url) = if new {
+                let dir = profile_dir
+                    .unwrap_or_else(|| default_profile_dir(&client.session_file, &profile));
+                let body = json!({
+                    "profile": profile,
+                    "profile_dir": dir,
+                    "proxy": proxy,
+                });
+                let resp = client.checked("POST", "/sessions", Some(&body)).await?;
+                let id = resp["id"]
+                    .as_str()
+                    .ok_or_else(|| "daemon create session response missing id".to_owned())?
+                    .to_owned();
+                let takeover = resp["takeover_url"].as_str().map(str::to_owned);
+                client.write_saved_session(&id)?;
+                (id, true, takeover)
+            } else if let Some(explicit) = &client.session_override {
+                (explicit.clone(), false, None)
+            } else {
+                let active = client.list_session_ids().await?;
+                let reusable = client
+                    .read_saved_session()
+                    .filter(|id| active.iter().any(|a| a == id))
+                    .or_else(|| (active.len() == 1).then(|| active[0].clone()));
+                if let Some(id) = reusable {
+                    client.write_saved_session(&id)?;
+                    (id, false, None)
+                } else {
+                    let dir = profile_dir
+                        .unwrap_or_else(|| default_profile_dir(&client.session_file, &profile));
+                    let body = json!({
+                        "profile": profile,
+                        "profile_dir": dir,
+                        "proxy": proxy,
+                    });
+                    let resp = client.checked("POST", "/sessions", Some(&body)).await?;
+                    let id = resp["id"]
+                        .as_str()
+                        .ok_or_else(|| "daemon create session response missing id".to_owned())?
+                        .to_owned();
+                    let takeover = resp["takeover_url"].as_str().map(str::to_owned);
+                    client.write_saved_session(&id)?;
+                    (id, true, takeover)
+                }
+            };
+            let nav = client
+                .call_op(&session_id, json!({ "op": "navigate", "url": url }))
+                .await?;
+            let final_url = nav["url"].as_str().unwrap_or(&url);
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "session": session_id,
+                        "created": created,
+                        "url": final_url,
+                        "takeover_url": takeover_url,
+                    }))
+                    .map_err(|e| e.to_string())?
+                );
+            } else {
+                if created {
+                    println!("session={session_id}");
+                    if let Some(tu) = takeover_url.filter(|u| !u.is_empty()) {
+                        println!("takeover_url={tu}");
+                    }
+                }
+                println!("{final_url}");
+            }
+        }
+        Command::Snapshot => {
+            let id = client.resolve_session().await?;
+            let resp = client.call_op(&id, json!({ "op": "snapshot" })).await?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                );
+            } else {
+                let snap_id = resp["id"].as_str().unwrap_or("?");
+                let url = resp["url"].as_str().unwrap_or("");
+                let refs = resp["refs"].as_u64().unwrap_or(0);
+                let text = resp["text"].as_str().unwrap_or("");
+                println!("# snapshot {snap_id} ({url}, {refs} refs)");
+                if !text.is_empty() {
+                    println!("{text}");
+                }
+            }
+        }
+        Command::Click { target } => {
+            let id = client.resolve_session().await?;
+            let resp = client
+                .call_op(&id, json!({ "op": "click", "ref": target }))
+                .await?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("ok");
+            }
+        }
+        Command::Fill { target, value } => {
+            let id = client.resolve_session().await?;
+            let resp = client
+                .call_op(&id, json!({ "op": "fill", "ref": target, "text": value }))
+                .await?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("ok");
+            }
+        }
+        Command::FillSecret {
+            target,
+            secret_handle,
+            expect_origin,
+        } => {
+            let id = client.resolve_session().await?;
+            let resp = client
+                .call_op(
+                    &id,
+                    json!({
+                        "op": "fill_secret",
+                        "ref": target,
+                        "secret_ref": secret_handle,
+                        "expect_origin": expect_origin,
+                    }),
+                )
+                .await?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("ok");
+            }
+        }
+        Command::Eval { js } => {
+            let id = client.resolve_session().await?;
+            let resp = client
+                .call_op(&id, json!({ "op": "eval", "expression": js }))
+                .await?;
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&resp["value"]).map_err(|e| e.to_string())?
+                );
+            }
+        }
+        Command::Screenshot {
+            path,
+            full_page,
+            desktop,
+        } => {
+            let id = client.resolve_session().await?;
+            let op = if desktop {
+                json!({ "op": "screenshot" })
+            } else {
+                json!({ "op": "page_screenshot", "full_page": full_page })
+            };
+            let resp = client.call_op(&id, op).await?;
+            write_png_output(path.as_deref(), &resp, as_json)?;
+        }
+        Command::Desktop { action } => {
+            let id = client.resolve_session().await?;
+            match action {
+                DesktopCommand::Snapshot => {
+                    let resp = client
+                        .call_op(&id, json!({ "op": "desktop_snapshot" }))
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        let snap_id = resp["id"].as_str().unwrap_or("?");
+                        let refs = resp["refs"].as_u64().unwrap_or(0);
+                        let text = resp["text"].as_str().unwrap_or("");
+                        println!("# desktop snapshot {snap_id} ({refs} refs)");
+                        if !text.is_empty() {
+                            println!("{text}");
+                        }
+                    }
+                }
+                DesktopCommand::Click {
+                    target,
+                    y,
+                    button,
+                    modifiers,
+                } => {
+                    let parsed =
+                        parse_desktop_click_target(&target, y).map_err(|e| e.to_string())?;
+                    let btn: Option<Button> = button.map(Into::into);
+                    let op = match parsed {
+                        DesktopClickTarget::Coords { x, y } => json!({
+                            "op": "click_at",
+                            "x": x,
+                            "y": y,
+                            "button": btn,
+                            "modifiers": modifiers,
+                        }),
+                        DesktopClickTarget::Ref(r) => json!({
+                            "op": "desktop_click_ref",
+                            "ref": r,
+                            "button": btn,
+                            "modifiers": modifiers,
+                        }),
+                    };
+                    let resp = client.call_op(&id, op).await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!("ok");
+                    }
+                }
+                DesktopCommand::Type { text } => {
+                    let resp = client
+                        .call_op(&id, json!({ "op": "type", "text": text }))
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!("ok");
+                    }
+                }
+                DesktopCommand::Key { chord, hold_ms } => {
+                    let op = match hold_ms.filter(|ms| *ms > 0) {
+                        Some(ms) => json!({ "op": "hold_key", "chord": chord, "ms": ms }),
+                        None => json!({ "op": "key", "chord": chord }),
+                    };
+                    let resp = client.call_op(&id, op).await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!("ok");
+                    }
+                }
+                DesktopCommand::Scroll { x, y, dx, dy } => {
+                    let resp = client
+                        .call_op(
+                            &id,
+                            json!({ "op": "scroll", "x": x, "y": y, "dx": dx, "dy": dy }),
+                        )
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!("ok");
+                    }
+                }
+                DesktopCommand::Windows => {
+                    let resp = client
+                        .call_op(&id, json!({ "op": "desktop_windows" }))
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else if let Some(windows) = resp["windows"].as_array() {
+                        for w in windows {
+                            let wid = w["id"].as_u64().unwrap_or(0);
+                            let focused = if w["focused"].as_bool().unwrap_or(false) {
+                                "*"
+                            } else {
+                                "-"
+                            };
+                            let app = w["app_id"].as_str().unwrap_or("-");
+                            let name = w["name"].as_str().unwrap_or("");
+                            let r = &w["rect"];
+                            println!(
+                                "{wid}\t{focused}\t{app}\t{},{} {}x{}\t{name}",
+                                r["x"].as_i64().unwrap_or(0),
+                                r["y"].as_i64().unwrap_or(0),
+                                r["width"].as_u64().unwrap_or(0),
+                                r["height"].as_u64().unwrap_or(0),
+                            );
+                        }
+                    }
+                }
+                DesktopCommand::Focus { target } => {
+                    let resp = client
+                        .call_op(&id, json!({ "op": "desktop_focus", "target": target }))
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        let wid = resp["window"]["id"].as_u64().unwrap_or(0);
+                        let name = resp["window"]["name"].as_str().unwrap_or("");
+                        println!("focused {wid} {name:?}");
+                    }
+                }
+                DesktopCommand::Screenshot { path } => {
+                    let resp = client.call_op(&id, json!({ "op": "screenshot" })).await?;
+                    write_png_output(path.as_deref(), &resp, as_json)?;
+                }
+            }
+        }
+        Command::Takeover { action } => {
+            let id = client.resolve_session().await?;
+            match action.unwrap_or(TakeoverCommand::Status) {
+                TakeoverCommand::Status => {
+                    let resp = client
+                        .checked("GET", &format!("/sessions/{id}/takeover"), None)
+                        .await?;
+                    print_takeover_status(&resp, as_json)?;
+                }
+                TakeoverCommand::Start { label } => {
+                    let body = json!({ "principal": label });
+                    let resp = client
+                        .checked(
+                            "POST",
+                            &format!("/sessions/{id}/takeover/start"),
+                            Some(&body),
+                        )
+                        .await?;
+                    print_takeover_status(&resp, as_json)?;
+                }
+                TakeoverCommand::End { note } => {
+                    let body = json!({ "note": note });
+                    let resp = client
+                        .checked("POST", &format!("/sessions/{id}/takeover/end"), Some(&body))
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        let released = resp["released"].as_bool().unwrap_or(false);
+                        let holder = resp["status"]["holder"].as_str().unwrap_or("unknown");
+                        println!("released={released} holder={holder}");
+                    }
+                }
+            }
+        }
+        Command::Close { force } => {
+            let id = client.resolve_session().await?;
+            let path = if force {
+                format!("/sessions/{id}")
+            } else {
+                format!("/sessions/{id}?if_agent=true")
+            };
+            client.checked("DELETE", &path, None).await?;
+            client.clear_saved_session_if(&id);
+            if as_json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "closed": true,
+                        "session": id,
+                        "force": force,
+                    }))
+                    .map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("closed {id}");
+            }
+        }
+        Command::Daemon(_) | Command::Skills { .. } => unreachable!(),
+    }
+    Ok(())
+}
+
+async fn run_daemon(daemon_args: DaemonArgs, token: Option<String>) {
+    let opts = match Options::from_daemon_args(daemon_args) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("agent-workstation: {e}");
             std::process::exit(2);
         }
     };
-    let Some(token) = std::env::var("AGENT_WORKSTATION_TOKEN")
-        .ok()
-        .filter(|t| t.len() >= 16)
-    else {
+    let Some(token) = token.filter(|t| t.len() >= 16) else {
         eprintln!("agent-workstation: set AGENT_WORKSTATION_TOKEN (16+ characters)");
         std::process::exit(2);
     };
@@ -785,6 +1630,21 @@ async fn main() {
         .route("/resume", post(resume_all))
         .route("/sessions/{id}/quiesce", post(quiesce_session))
         .route("/sessions/{id}/resume", post(resume_session))
+        .route("/sessions/{id}/takeover", get(takeover_status))
+        .route(
+            "/sessions/{id}/takeover/start",
+            post(takeover_start).route_layer(middleware::from_fn_with_state(
+                (Arc::clone(&app), true),
+                supervise,
+            )),
+        )
+        .route(
+            "/sessions/{id}/takeover/end",
+            post(takeover_end).route_layer(middleware::from_fn_with_state(
+                (Arc::clone(&app), true),
+                supervise,
+            )),
+        )
         .route(
             "/sessions/{id}",
             delete(remove).route_layer(middleware::from_fn_with_state(
@@ -818,6 +1678,24 @@ async fn main() {
     if let Err(e) = axum::serve(listener, router).await {
         eprintln!("agent-workstation: {e}");
         std::process::exit(1);
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    match cli.command {
+        None => run_daemon(cli.daemon, cli.client.token).await,
+        Some(Command::Daemon(args)) => run_daemon(args, cli.client.token).await,
+        Some(Command::Skills { topic, list }) => {
+            print!("{}", agent_workstation::skills::render(topic, list));
+        }
+        Some(other) => {
+            if let Err(e) = run_client(cli.client, other).await {
+                eprintln!("agent-workstation: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 }
 

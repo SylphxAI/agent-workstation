@@ -37,7 +37,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::{SinkExt, Stream, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
@@ -85,6 +85,68 @@ impl std::fmt::Debug for TakeoverConfig {
             .field("public_url", &self.public_url.as_ref().map(Url::as_str))
             .field("token", &self.token.as_ref().map(|_| "<redacted>"))
             .finish()
+    }
+}
+
+/// Current human-takeover status of a session.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TakeoverStatus {
+    /// Current control holder: `"agent"` or `"human"`.
+    pub holder: String,
+    /// Token-authenticated noVNC URL, when takeover is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover_url: Option<String>,
+    /// When the human took control, if `"human"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<DateTime<Utc>>,
+    /// Caller-supplied principal label for the human holder, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// Configured human idle expiry in milliseconds (`None` = explicit hand-back only).
+    pub idle_timeout_ms: Option<u64>,
+    /// Remaining human idle time in milliseconds while `"human"`.
+    pub idle_remaining_ms: Option<u64>,
+    /// Whether the session's browser process is currently running.
+    pub browser_running: bool,
+}
+
+impl TakeoverStatus {
+    /// Build status from a session's [`ControlGate`], optional noVNC URL, and browser liveness.
+    pub fn from_gate(
+        gate: &ControlGate,
+        takeover_url: Option<String>,
+        browser_running: bool,
+    ) -> Self {
+        let millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+        let timeout = gate.human_idle_timeout();
+        match gate.holder() {
+            Holder::Agent => Self {
+                holder: "agent".into(),
+                takeover_url,
+                since: None,
+                principal: None,
+                idle_timeout_ms: timeout.map(millis),
+                idle_remaining_ms: None,
+                browser_running,
+            },
+            Holder::Human {
+                since,
+                principal,
+                last_input,
+            } => {
+                let idle = (Utc::now() - last_input).to_std().unwrap_or_default();
+                let remaining = timeout.map(|t| millis(t.saturating_sub(idle)));
+                Self {
+                    holder: "human".into(),
+                    takeover_url,
+                    since: Some(since),
+                    principal,
+                    idle_timeout_ms: timeout.map(millis),
+                    idle_remaining_ms: remaining,
+                    browser_running,
+                }
+            }
+        }
     }
 }
 
@@ -149,6 +211,13 @@ impl Takeover {
     #[cfg(target_os = "linux")]
     pub(crate) fn browser_exited_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.shared.browser_exited.clone()
+    }
+
+    pub(crate) fn is_browser_running(&self) -> bool {
+        !self
+            .shared
+            .browser_exited
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Bind and serve the page and bridge for the VNC server at `vnc_socket`.

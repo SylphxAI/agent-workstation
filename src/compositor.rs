@@ -15,6 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
+use crate::desktop::{DesktopRect, DesktopWindow};
 use crate::error::{Error, Result};
 
 const START_TIMEOUT: Duration = Duration::from_secs(15);
@@ -118,6 +119,11 @@ impl Compositor {
         self.runtime_dir.join(&self.wayland_display)
     }
 
+    /// Compositor IPC socket path (`SWAYSOCK`).
+    pub fn ipc_socket(&self) -> &Path {
+        &self.ipc_socket
+    }
+
     /// Output size in pixels.
     pub fn size(&self) -> (u32, u32) {
         self.size
@@ -195,6 +201,117 @@ fn focused_process(node: &serde_json::Value, pid: u32) -> bool {
             .and_then(serde_json::Value::as_array)
             .is_some_and(|nodes| nodes.iter().any(|n| focused_process(n, pid)))
     })
+}
+
+/// Query all mapped windows from sway's IPC tree.
+pub(crate) async fn list_windows(socket: &Path) -> Result<Vec<DesktopWindow>> {
+    let mut stream = UnixStream::connect(socket).await?;
+    ipc_send(&mut stream, 4, b"").await?; // GET_TREE
+    let (tree, _) = ipc_reply(&mut stream, 4).await?;
+    let mut out = Vec::new();
+    collect_windows(&tree, &mut out);
+    Ok(out)
+}
+
+/// Focus a window container by its compositor id (`con_id`).
+pub(crate) async fn focus_window(socket: &Path, id: u64) -> Result<()> {
+    let mut stream = UnixStream::connect(socket).await?;
+    let cmd = format!("[con_id={id}] focus");
+    ipc_send(&mut stream, 0, cmd.as_bytes()).await?; // RUN_COMMAND
+    let (reply, _) = ipc_reply(&mut stream, 0).await?;
+    let results = reply
+        .as_array()
+        .ok_or_else(|| Error::Protocol("compositor focus reply must be a JSON array".into()))?;
+    let first = results
+        .first()
+        .ok_or_else(|| Error::NotFound(format!("window {id} not found")))?;
+    if first.get("success").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        let msg = first
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("focus command failed");
+        Err(Error::NotFound(format!("window {id}: {msg}")))
+    }
+}
+
+fn collect_windows(node: &serde_json::Value, out: &mut Vec<DesktopWindow>) {
+    let kind = node.get("type").and_then(serde_json::Value::as_str);
+    let children_empty = ["nodes", "floating_nodes"].iter().all(|key| {
+        node.get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty)
+    });
+    if matches!(kind, Some("con" | "floating_con"))
+        && children_empty
+        && let Some(id) = node.get("id").and_then(serde_json::Value::as_u64)
+    {
+        let pid = node
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|p| u32::try_from(p).ok());
+        let app_id = node
+            .get("app_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                node.get("window_properties")
+                    .and_then(|wp| wp.get("class"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            });
+        let name = node
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if pid.is_some() || app_id.is_some() || !name.is_empty() {
+            let rect = node
+                .get("rect")
+                .map_or_else(DesktopRect::default, |r| DesktopRect {
+                    x: r.get("x")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(0),
+                    y: r.get("y")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(0),
+                    width: r
+                        .get("width")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .unwrap_or(0),
+                    height: r
+                        .get("height")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|v| u32::try_from(v).ok())
+                        .unwrap_or(0),
+                });
+            let focused = node
+                .get("focused")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            out.push(DesktopWindow {
+                id,
+                name,
+                app_id,
+                pid,
+                focused,
+                rect,
+            });
+        }
+    }
+    for key in ["nodes", "floating_nodes"] {
+        if let Some(children) = node.get(key).and_then(serde_json::Value::as_array) {
+            for child in children {
+                collect_windows(child, out);
+            }
+        }
+    }
 }
 
 async fn ipc_send(stream: &mut UnixStream, kind: u32, payload: &[u8]) -> Result<()> {
@@ -422,5 +539,86 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(e.code(), "invalid-input");
+    }
+
+    #[tokio::test]
+    async fn list_and_focus_windows_round_trip_and_fail_closed() {
+        use serde_json::json;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ipc.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            // 1. list_windows
+            let (mut s1, _) = listener.accept().await.unwrap();
+            request(&mut s1, 4, b"").await;
+            let tree = json!({
+                "type": "root",
+                "nodes": [{
+                    "type": "output",
+                    "name": "HEADLESS-1",
+                    "nodes": [{
+                        "type": "workspace",
+                        "name": "1",
+                        "nodes": [{
+                            "type": "con",
+                            "id": 14,
+                            "name": "Example - Chromium",
+                            "app_id": "chromium",
+                            "pid": 1001,
+                            "focused": true,
+                            "rect": {"x": 0, "y": 0, "width": 1280, "height": 800},
+                            "nodes": [],
+                            "floating_nodes": []
+                        }],
+                        "floating_nodes": [{
+                            "type": "floating_con",
+                            "id": 15,
+                            "name": "Save File",
+                            "app_id": "xdg-desktop-portal",
+                            "pid": 1002,
+                            "focused": false,
+                            "rect": {"x": 200, "y": 150, "width": 600, "height": 400},
+                            "nodes": [],
+                            "floating_nodes": []
+                        }]
+                    }]
+                }]
+            });
+            ipc_send(&mut s1, 4, tree.to_string().as_bytes())
+                .await
+                .unwrap();
+
+            // 2. focus_window success
+            let (mut s2, _) = listener.accept().await.unwrap();
+            request(&mut s2, 0, b"[con_id=15] focus").await;
+            ipc_send(&mut s2, 0, br#"[{"success":true}]"#)
+                .await
+                .unwrap();
+
+            // 3. focus_window missing window fails closed
+            let (mut s3, _) = listener.accept().await.unwrap();
+            request(&mut s3, 0, b"[con_id=999] focus").await;
+            ipc_send(
+                &mut s3,
+                0,
+                br#"[{"success":false,"error":"No matching container"}]"#,
+            )
+            .await
+            .unwrap();
+        });
+
+        let windows = list_windows(&path).await.unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].id, 14);
+        assert_eq!(windows[0].app_id.as_deref(), Some("chromium"));
+        assert!(windows[0].focused);
+        assert_eq!(windows[1].id, 15);
+        assert_eq!(windows[1].name, "Save File");
+        assert!(!windows[1].focused);
+
+        focus_window(&path, 15).await.unwrap();
+        let err = focus_window(&path, 999).await.unwrap_err();
+        assert_eq!(err.code(), "not-found");
+        server.await.unwrap();
     }
 }
