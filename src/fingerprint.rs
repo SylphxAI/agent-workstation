@@ -258,6 +258,7 @@ impl Fingerprint {
                     e.into()
                 }
             })?;
+            #[cfg(unix)]
             std::fs::File::open(dir)?.sync_all()?;
             Ok(())
         })();

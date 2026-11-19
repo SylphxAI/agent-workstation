@@ -151,17 +151,16 @@ impl Browser {
             return Err(e.into());
         }
         let log = std::fs::File::create(log)?;
-        let mut child = config
-            .build_command(desktop_env, user_data_dir, fp, proxy_url)
-            .stdin(Stdio::null())
+        let mut cmd = config.build_command(desktop_env, user_data_dir, fp, proxy_url);
+        cmd.stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log)
-            .kill_on_drop(true)
-            .process_group(0)
-            .spawn()
-            .map_err(|e| {
-                Error::Process(format!("cannot start {}: {e}", config.binary.display()))
-            })?;
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        cmd.process_group(0);
+        let mut child = cmd.spawn().map_err(|e| {
+            Error::Process(format!("cannot start {}: {e}", config.binary.display()))
+        })?;
         let deadline = Instant::now() + LAUNCH_TIMEOUT;
         loop {
             if let Some(status) = child.try_wait()? {
@@ -1395,9 +1394,8 @@ fn frame_id(tree: &Value) -> Result<String> {
 
 /// A short random id that tells one browser's snapshots from another's.
 fn nonce() -> Result<String> {
-    use std::io::Read as _;
     let mut b = [0u8; 4];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    getrandom::fill(&mut b).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
     Ok(b.iter().map(|x| format!("{x:02x}")).collect())
 }
 

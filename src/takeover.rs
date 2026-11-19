@@ -21,14 +21,15 @@
 //! origin and scopes its cookie to that path.
 
 use std::convert::Infallible;
-use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+#[cfg(unix)]
+use axum::extract::ws::Message;
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
@@ -38,9 +39,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::Stream;
+#[cfg(unix)]
+use futures::{SinkExt, StreamExt};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixStream};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use url::Url;
@@ -51,6 +57,7 @@ use crate::gate::{ControlGate, Holder};
 /// Longest hand-back note accepted, in characters.
 pub const MAX_NOTE_CHARS: usize = 2000;
 /// Largest ClientCutText payload the bridge buffers.
+#[cfg(any(unix, test))]
 const MAX_CUT_TEXT: usize = 16 << 20;
 
 /// Where and how the takeover server listens.
@@ -347,7 +354,7 @@ async fn stopped(rx: &mut watch::Receiver<bool>) {
 
 fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    getrandom::fill(&mut bytes).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
     Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
 }
 
@@ -603,6 +610,7 @@ async fn ws(State(s): State<Arc<Shared>>, up: WebSocketUpgrade) -> Response {
         .on_upgrade(move |socket| bridge(socket, s))
 }
 
+#[cfg(unix)]
 async fn bridge(socket: WebSocket, s: Arc<Shared>) {
     let vnc = match UnixStream::connect(&s.vnc).await {
         Ok(v) => v,
@@ -650,8 +658,18 @@ async fn bridge(socket: WebSocket, s: Arc<Shared>) {
     let _ = ws_tx.send(Message::Close(None)).await;
 }
 
+#[cfg(not(unix))]
+async fn bridge(socket: WebSocket, s: Arc<Shared>) {
+    tracing::warn!(
+        vnc = %s.vnc.display(),
+        "takeover: Unix VNC socket bridge is unavailable on this platform"
+    );
+    drop(socket);
+}
+
 /// Parses the RFB client-to-server stream and drops input while the person
 /// may not drive the display.
+#[cfg(any(unix, test))]
 #[derive(Debug, Default)]
 struct RfbFilter {
     /// 0 ProtocolVersion, 1 security type, 2 ClientInit, 3 normal messages.
@@ -661,6 +679,7 @@ struct RfbFilter {
     pointer: Option<(u16, u16)>,
 }
 
+#[cfg(any(unix, test))]
 impl RfbFilter {
     /// Bytes to forward and how many input messages among them, or why the
     /// stream must close.
@@ -742,7 +761,9 @@ impl RfbFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use tokio::net::UnixListener;
+    #[cfg(unix)]
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     const HELLO: &[u8] = b"RFB 003.008\n\x01\x01";
@@ -807,6 +828,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     async fn http(addr: SocketAddr, request: &str) -> String {
         let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
         tcp.write_all(request.as_bytes()).await.unwrap();
@@ -901,6 +923,7 @@ mod tests {
         assert_eq!(gone.status(), StatusCode::GONE);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bridge_drops_input_until_a_person_takes_control() {
         let dir = tempfile::tempdir().unwrap();

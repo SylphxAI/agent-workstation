@@ -183,15 +183,25 @@ resume body reading has the same cap. A stalled control body returns
 budget leaves margin below 300 ms; it is not an end-to-end network, scheduler,
 filesystem, or VM snapshot latency guarantee.
 
-## Runtime requirements (Linux)
+## Runtime requirements & Native Host `PlatformAdapter`
 
-The crate compiles on macOS for callers that share configuration and types.
-Desktop execution is Linux-only: `DesktopSession::start` returns `Error::Unsupported`
-on other platforms before touching the profile or runtime directory. The
-compositor, VNC and Wayland backend modules are Linux-only; `Button`, `Frame` and
-`Input` remain available at the crate root.
+The crate compiles on Linux, macOS, and Windows:
 
-`sway`, `wayvnc` and a Chromium-family browser with Wayland support:
+- **Headless Wayland browser sessions (`DesktopSession`)**: Linux-only (`sway`,
+  `wayvnc`, and a Chromium-family browser). On macOS and Windows,
+  `DesktopSession::start` returns `Error::Unsupported` before touching the
+  profile or runtime directory.
+- **Native host desktop automation (`platform::PlatformAdapter`)**: Pure-Rust
+  compile-time accessibility tree and input adapters (`native_adapter()`, also
+  wired to `agent-workstation desktop --host ...`) returning structured
+  `DesktopTree` JSON with deterministic `@<snap>:eN` refs and `StaleRef`
+  invalidation:
+  - **Linux**: AT-SPI2 (D-Bus) + Wayland/`sway` compositor integration.
+  - **macOS**: Accessibility (`AXUIElement`) + CoreFoundation + CoreGraphics FFI.
+  - **Windows**: UI Automation (`IUIAutomation` COM) + Win32 input.
+
+For headless Linux sessions, install `sway`, `wayvnc`, and a Chromium-family
+browser with Wayland support:
 
 ```sh
 sudo apt-get install sway wayvnc chromium
