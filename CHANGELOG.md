@@ -56,6 +56,34 @@ was never published.
 - Snapshots list out-of-process frames as `Iframe` lines.
 - The daemon takes a `principal` on every call, gained the new ops, and
   passes browser flags with `--browser-arg`.
+- Browser launch wrappers and isolated environments on `BrowserConfig`
+  (`wrapper`, `clear_env`, `extra_env`).
+- Daemon supervision and bounded snapshot admission controls: `GET /healthz`,
+  `GET /sessions`, and global/per-session `POST /quiesce` and `POST /resume`
+  fences with bounded body/drain budgets (`1–250 ms`).
+- Cycle-fenced handoff observation and completion (`DesktopSession::handoff`,
+  `Handoff`, `HandoffObservation`, `PageEvidence`, `FormState`,
+  `SelectorState`) and `ControlGate::check_agent`.
+- Atomic agent-only session close (`DesktopSession::close_if_agent` and
+  `DELETE /sessions/{id}?if_agent=true`) that refuses to close while a person
+  holds control.
+- Configurable human takeover idle lifetime
+  (`SessionConfig::human_idle_timeout`, `ControlGate::with_human_idle_timeout`,
+  nullable `idle_timeout_ms`/`idle_remaining_ms`) and live browser-exit
+  surfacing without restarting automatically.
+- Touch-capable desktop takeover UI redesign (`assets/takeover/viewport.js`,
+  trackpad and direct-touch modes, dockable HUD, pinch/pan/scroll controls)
+  and holder-aware browser-exit guidance.
+- Compact CLI subcommands (`open`, `snapshot`, `click`, `fill`, `fill-secret`,
+  `eval`, `screenshot`, `desktop …`, `takeover …`, `close`), daemon desktop
+  window/snapshot operations (`DesktopWindow`, `DesktopSnapshot`,
+  `DesktopRect`, `DesktopWindowRef`), and offline version-synced
+  `agent-workstation skills` output.
+- Compile-time pure-Rust `PlatformAdapter` trait (`native_adapter()`,
+  `DesktopTree`, `DesktopNode`, `NodeRef`, `DesktopAction`,
+  `PlatformCapabilities`, `MockPlatformAdapter`) for native host desktop
+  automation on Linux (AT-SPI2/Wayland), macOS (`AXUIElement`/CoreGraphics),
+  and Windows (`IUIAutomation`/Win32), wired to `agent-workstation desktop --host`.
 
 ### Fixed
 
