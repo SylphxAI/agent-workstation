@@ -41,10 +41,18 @@ over the whole desktop.
 - **Takeover**: wayvnc behind a token-protected WebSocket and a noVNC page.
   While a person holds control every agent call returns
   `Error::HumanInControl`; the agent resumes when they hand back (or after
-  five idle minutes). The page runs on its own listener, can be mounted in
-  the caller's HTTP server (`takeover_router`), and its public URL can change
+  the idle timeout expires). The page runs on its own listener, can be mounted
+  in the caller's HTTP server (`takeover_router`), and its public URL can change
   while the session runs (`set_takeover_public_url`), so a stable public
   entry or a tunnel started later serves it.
+  - Human idle expiry is configurable through
+    `SessionConfig::human_idle_timeout` (default
+    `Some(Duration::from_secs(300))`). Set `None` to require an explicit
+    hand-back, or use a longer duration; takeover state reports nullable
+    `idle_timeout_ms`/`idle_remaining_ms` for indefinite control.
+  - If the browser exits, the takeover page reports it without releasing
+    control or restarting automatically, showing holder-specific guidance to
+    resume with the existing profile.
 - **No spoofing scripts.** A profile's `fingerprint.json` seed is applied at
   launch only (desktop size, languages, timezone, and an optional seed flag
   for browser builds that take one).
@@ -237,10 +245,3 @@ publication as separate deliberate operations.
 ## License
 
 MIT. The takeover page bundles noVNC (MPL-2.0); see `assets/takeover/novnc/`.
-
-Human idle expiry is configurable through `SessionConfig::human_idle_timeout`
-(default `Some(Duration::from_secs(300))`). Set `None` to require an explicit
-hand-back, or use a longer duration. Takeover state reports nullable
-`idle_timeout_ms`/`idle_remaining_ms` for indefinite control. If the browser
-exits, the takeover page reports it without releasing control or restarting
-into a new page; use Hand back to request recovery with the existing profile.
