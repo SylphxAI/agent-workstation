@@ -907,3 +907,103 @@ async fn browser_exit_guidance_follows_the_holder_without_restarting() {
     }
     viewer_process.kill().await.unwrap();
 }
+
+#[tokio::test]
+async fn detaching_viewer_preserves_live_browser_and_revokes_old_credentials() {
+    if !headful() {
+        return;
+    }
+    use futures::StreamExt;
+    use tower::ServiceExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("run");
+    let profile = dir.path().join("profile");
+    let session = DesktopSession::start(config(&profile, &runtime))
+        .await
+        .unwrap();
+    let agent = session.lease("fixture").unwrap();
+    let url = serve().await;
+    agent.navigate(&url).await.unwrap();
+    let before = agent.tabs().await.unwrap();
+    agent
+        .eval("window.testState = 'solved-42'; document.title = 'Changed'")
+        .await
+        .unwrap();
+
+    session.start_takeover(Default::default()).await.unwrap();
+    let old = session.takeover_url().unwrap();
+    let old_addr = session.takeover_addr().unwrap();
+    let old_router = session.takeover_router().unwrap();
+    let rfb = format!("ws://{old_addr}/ws?{}", old.query().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(rfb).await.unwrap();
+    assert!(
+        ws.next()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_data()
+            .starts_with(b"RFB ")
+    );
+    session.gate().take(None);
+    assert!(matches!(
+        agent.eval("window.testState").await,
+        Err(Error::HumanInControl { .. })
+    ));
+
+    assert!(session.detach_takeover(Some("done".into())).await);
+    assert!(!session.detach_takeover(None).await);
+    assert!(session.takeover_status().browser_running);
+    assert!(session.takeover_url().is_none());
+    assert!(!runtime.join("vnc.sock").exists());
+    assert!(tokio::net::TcpStream::connect(old_addr).await.is_err());
+    let terminal = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .unwrap();
+    assert!(!matches!(terminal, Some(Ok(msg)) if !msg.is_close()));
+    assert_eq!(
+        agent
+            .eval("[window.testState, document.title]")
+            .await
+            .unwrap(),
+        json!(["solved-42", "Changed"])
+    );
+
+    session.start_takeover(Default::default()).await.unwrap();
+    let new = session.takeover_url().unwrap();
+    assert_ne!(old.query(), new.query());
+    let old_take = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/take?{}", old.query().unwrap()))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    };
+    assert_eq!(old_router.oneshot(old_take()).await.unwrap().status(), 410);
+    assert_eq!(
+        session
+            .takeover_router()
+            .unwrap()
+            .oneshot(old_take())
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let after = agent.tabs().await.unwrap();
+    assert_eq!(
+        (&after[0].id, &after[0].url),
+        (&before[0].id, &before[0].url)
+    );
+    assert_eq!(agent.eval("window.testState").await.unwrap(), "solved-42");
+    let new_addr = session.takeover_addr().unwrap();
+    session.close().await;
+    assert!(!session.takeover_status().browser_running);
+    assert!(session.takeover_url().is_none());
+    assert!(!runtime.join("vnc.sock").exists());
+    assert!(tokio::net::TcpStream::connect(new_addr).await.is_err());
+    assert!(matches!(
+        session.start_takeover(Default::default()).await,
+        Err(Error::Closed)
+    ));
+}

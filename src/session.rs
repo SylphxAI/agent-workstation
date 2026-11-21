@@ -70,12 +70,26 @@ impl SessionConfig {
 /// The session's helper processes, owned until [`DesktopSession::close`].
 #[derive(Debug, Default)]
 struct Processes {
-    #[cfg(target_os = "linux")]
-    vnc: Option<Vnc>,
     browser: Option<Browser>,
     #[cfg(target_os = "linux")]
     compositor: Option<Compositor>,
     proxy: Option<ProxyEndpoint>,
+}
+
+/// A viewer generation, independent of the browser and its display.
+#[derive(Debug)]
+struct Viewer {
+    page: Takeover,
+    #[cfg(target_os = "linux")]
+    vnc: Vnc,
+}
+
+impl Viewer {
+    async fn shutdown(self) {
+        #[cfg(target_os = "linux")]
+        self.vnc.shutdown().await;
+        self.page.shutdown().await;
+    }
 }
 
 /// One headless Wayland desktop with one headful browser.
@@ -91,7 +105,12 @@ pub struct DesktopSession {
     gate: Arc<ControlGate>,
     fingerprint: Fingerprint,
     web: Mutex<Web>,
-    takeover: Option<Takeover>,
+    viewer: std::sync::Mutex<Option<Viewer>>,
+    viewer_lifecycle: Mutex<()>,
+    #[cfg(target_os = "linux")]
+    vnc_binary: PathBuf,
+    #[cfg(target_os = "linux")]
+    browser_exited: Arc<std::sync::atomic::AtomicBool>,
     processes: Arc<std::sync::Mutex<Processes>>,
     desktop_snap: std::sync::Mutex<DesktopSnapshotStore>,
     #[cfg(target_os = "linux")]
@@ -184,41 +203,14 @@ impl DesktopSession {
                 return Err(e);
             }
         };
-        let mut processes = Processes {
-            vnc: None,
+        let processes = Arc::new(std::sync::Mutex::new(Processes {
             browser: Some(browser),
             compositor: Some(compositor),
             proxy,
-        };
-        let takeover = match config.takeover {
-            None => None,
-            Some(tc) => {
-                let started = async {
-                    let vnc = Vnc::start(&config.vnc, &env, &config.runtime_dir).await?;
-                    match Takeover::start(tc, vnc.socket().to_path_buf(), gate.clone()).await {
-                        Ok(t) => Ok((vnc, t)),
-                        Err(e) => {
-                            vnc.shutdown().await;
-                            Err(e)
-                        }
-                    }
-                }
-                .await;
-                match started {
-                    Ok((vnc, t)) => {
-                        processes.vnc = Some(vnc);
-                        Some(t)
-                    }
-                    Err(e) => {
-                        stop_processes(processes).await;
-                        return Err(e);
-                    }
-                }
-            }
-        };
-        let processes = Arc::new(std::sync::Mutex::new(processes));
-        if let Some(t) = &takeover {
-            let exited = t.browser_exited_flag();
+        }));
+        let browser_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let exited = browser_exited.clone();
             let processes = Arc::downgrade(&processes);
             tokio::spawn(async move {
                 loop {
@@ -227,28 +219,35 @@ impl DesktopSession {
                         break;
                     };
                     let mut processes = processes.lock().unwrap_or_else(|p| p.into_inner());
-                    let Some(browser) = &mut processes.browser else {
-                        break;
-                    };
-                    if !browser.is_running() {
+                    if !processes.browser.as_mut().is_some_and(Browser::is_running) {
                         exited.store(true, std::sync::atomic::Ordering::Release);
                         break;
                     }
                 }
             });
         }
-        Ok(Self {
+        let session = Self {
             gate,
             fingerprint,
             web: Mutex::new(web),
-            takeover,
+            viewer: std::sync::Mutex::default(),
+            viewer_lifecycle: Mutex::new(()),
+            vnc_binary: config.vnc,
+            browser_exited,
             processes,
             desktop_snap: std::sync::Mutex::new(DesktopSnapshotStore::default()),
             socket,
             ipc_socket,
             input,
             size,
-        })
+        };
+        if let Some(tc) = config.takeover
+            && let Err(err) = session.start_takeover(tc).await
+        {
+            session.close().await;
+            return Err(err);
+        }
+        Ok(session)
     }
 
     /// Desktop sessions require Linux. No files or processes are created.
@@ -301,23 +300,93 @@ impl DesktopSession {
         self.gate.lease()
     }
 
-    /// Takeover page URL (with its token), when takeover is enabled.
+    fn viewer(&self) -> std::sync::MutexGuard<'_, Option<Viewer>> {
+        self.viewer.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Attach a viewer to this live desktop, without touching the browser or
+    /// compositor. If already attached, retain the existing viewer and its
+    /// configuration. After detaching, the default config issues a fresh token.
+    #[cfg(target_os = "linux")]
+    pub async fn start_takeover(&self, config: TakeoverConfig) -> Result<()> {
+        let _lifecycle = self.viewer_lifecycle.lock().await;
+        if self.is_closed() {
+            return Err(Error::Closed);
+        }
+        if self.viewer().is_some() {
+            return Ok(());
+        }
+        let (env, runtime_dir) = {
+            let mut processes = self.processes.lock().unwrap_or_else(|p| p.into_inner());
+            if !processes.browser.as_mut().is_some_and(Browser::is_running) {
+                return Err(Error::Closed);
+            }
+            let c = processes.compositor.as_ref().ok_or(Error::Closed)?;
+            (c.client_env(), c.runtime_dir().to_path_buf())
+        };
+        let vnc = Vnc::start(&self.vnc_binary, &env, &runtime_dir).await?;
+        let page = Takeover::start_with_liveness(
+            config,
+            vnc.socket().to_path_buf(),
+            self.gate.clone(),
+            self.browser_exited.clone(),
+        )
+        .await;
+        match page {
+            Ok(page) => {
+                *self.viewer() = Some(Viewer { page, vnc });
+                Ok(())
+            }
+            Err(err) => {
+                vnc.shutdown().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Attaching a Wayland viewer requires Linux.
+    #[cfg(not(target_os = "linux"))]
+    pub async fn start_takeover(&self, _config: TakeoverConfig) -> Result<()> {
+        Err(Error::Unsupported("desktop sessions require Linux".into()))
+    }
+
+    /// Revoke the viewer, close its streams and stop VNC. Return control to the
+    /// agent without stopping the browser, its CDP connection, or the display.
+    /// Returns whether a viewer was detached or human control was reclaimed.
+    pub async fn detach_takeover(&self, note: Option<String>) -> bool {
+        let _lifecycle = self.viewer_lifecycle.lock().await;
+        let viewer = self.take_viewer();
+        let released = self.gate.release(note);
+        if let Some(viewer) = viewer {
+            viewer.shutdown().await;
+            true
+        } else {
+            released
+        }
+    }
+
+    fn take_viewer(&self) -> Option<Viewer> {
+        let mut slot = self.viewer();
+        if let Some(viewer) = slot.as_ref() {
+            viewer.page.stop();
+        }
+        slot.take()
+    }
+
+    /// Takeover page URL (with its token), when a viewer is attached.
     pub fn takeover_url(&self) -> Option<url::Url> {
-        self.takeover.as_ref().map(Takeover::url)
+        self.viewer().as_ref().map(|v| v.page.url())
     }
 
     /// Current takeover status including holder, noVNC URL, idle expiry and browser liveness.
     pub fn takeover_status(&self) -> TakeoverStatus {
-        let browser_running = match &self.takeover {
-            Some(t) => t.is_browser_running(),
-            None => self
-                .processes
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .browser
-                .as_mut()
-                .is_some_and(Browser::is_running),
-        };
+        let browser_running = self
+            .processes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .browser
+            .as_mut()
+            .is_some_and(Browser::is_running);
         TakeoverStatus::from_gate(
             &self.gate,
             self.takeover_url().map(|u| u.to_string()),
@@ -325,24 +394,24 @@ impl DesktopSession {
         )
     }
 
-    /// Change where people reach the takeover page; see
-    /// [`Takeover::set_public_url`].
+    /// Change where people reach the takeover page; see [`Takeover::set_public_url`].
     pub fn set_takeover_public_url(&self, url: url::Url) -> Result<()> {
-        self.takeover
+        self.viewer()
             .as_ref()
             .ok_or_else(|| Error::Unsupported("this session has no takeover page".into()))?
+            .page
             .set_public_url(url)
     }
 
     /// The takeover page as a router to mount in the caller's own HTTP
     /// server; see [`Takeover::router`].
     pub fn takeover_router(&self) -> Option<axum::Router> {
-        self.takeover.as_ref().map(Takeover::router)
+        self.viewer().as_ref().map(|v| v.page.router())
     }
 
     /// The takeover page's own listener, when it has one.
     pub fn takeover_addr(&self) -> Option<std::net::SocketAddr> {
-        self.takeover.as_ref().and_then(Takeover::local_addr)
+        self.viewer().as_ref().and_then(|v| v.page.local_addr())
     }
 
     /// The profile's fingerprint.
@@ -390,8 +459,9 @@ impl DesktopSession {
 
     async fn finish_close(&self) {
         let _in_flight = self.web.lock().await;
-        if let Some(t) = &self.takeover {
-            t.stop();
+        let _lifecycle = self.viewer_lifecycle.lock().await;
+        if let Some(viewer) = self.take_viewer() {
+            viewer.shutdown().await;
         }
         let processes =
             std::mem::take(&mut *self.processes.lock().unwrap_or_else(|p| p.into_inner()));
@@ -407,10 +477,6 @@ impl DesktopSession {
 }
 
 async fn stop_processes(mut p: Processes) {
-    #[cfg(target_os = "linux")]
-    if let Some(v) = p.vnc.take() {
-        v.shutdown().await;
-    }
     if let Some(b) = p.browser.take() {
         b.shutdown().await;
     }

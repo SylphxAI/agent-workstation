@@ -206,32 +206,35 @@ struct Shared {
     vnc: PathBuf,
     gate: Arc<ControlGate>,
     stop: watch::Receiver<bool>,
+    // Serialize revocation with control changes from already admitted requests.
+    control: std::sync::Mutex<()>,
 }
 
 impl Shared {
+    fn is_stopped(&self) -> bool {
+        *self.stop.borrow() || self.stop.has_changed().is_err()
+    }
+
     fn public(&self) -> std::sync::RwLockReadGuard<'_, Public> {
         self.public.read().unwrap_or_else(|p| p.into_inner())
     }
 }
 
 impl Takeover {
-    #[cfg(target_os = "linux")]
-    pub(crate) fn browser_exited_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        self.shared.browser_exited.clone()
-    }
-
-    pub(crate) fn is_browser_running(&self) -> bool {
-        !self
-            .shared
-            .browser_exited
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
     /// Bind and serve the page and bridge for the VNC server at `vnc_socket`.
     pub async fn start(
         config: TakeoverConfig,
         vnc_socket: PathBuf,
         gate: Arc<ControlGate>,
+    ) -> Result<Takeover> {
+        Self::start_with_liveness(config, vnc_socket, gate, Arc::default()).await
+    }
+
+    pub(crate) async fn start_with_liveness(
+        config: TakeoverConfig,
+        vnc_socket: PathBuf,
+        gate: Arc<ControlGate>,
+        browser_exited: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Takeover> {
         let token = match config.token {
             Some(t) if t.is_empty() => {
@@ -260,10 +263,11 @@ impl Takeover {
             token,
             cookie: format!("awt{}", &random_token()?[..8]),
             public: std::sync::RwLock::new(Public::new(base)?),
-            browser_exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            browser_exited,
             vnc: vnc_socket,
             gate,
             stop: stop_rx.clone(),
+            control: std::sync::Mutex::new(()),
         });
         let app = Router::new()
             .route("/", get(page))
@@ -335,6 +339,11 @@ impl Takeover {
     /// router answers `410 Gone` from then on. The own listener's task ends
     /// on its own.
     pub fn stop(&self) {
+        let _control = self
+            .shared
+            .control
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let _ = self.stop.send(true);
     }
 
@@ -401,7 +410,7 @@ fn reject(status: StatusCode, msg: &str) -> Response {
 }
 
 async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Response {
-    if *s.stop.borrow() {
+    if s.is_stopped() {
         return StatusCode::GONE.into_response();
     }
     let tokens = presented(req.headers(), req.uri(), &s.cookie);
@@ -429,7 +438,12 @@ async fn guard(State(s): State<Arc<Shared>>, req: Request, next: Next) -> Respon
             return reject(StatusCode::FORBIDDEN, "cross-origin request");
         }
     }
-    let mut res = next.run(req).await;
+    let mut stop = s.stop.clone();
+    let mut res = tokio::select! {
+        biased;
+        _ = stopped(&mut stop) => return StatusCode::GONE.into_response(),
+        res = next.run(req) => res,
+    };
     let h = res.headers_mut();
     for (k, v) in [
         ("cache-control", "no-store"),
@@ -547,9 +561,13 @@ async fn state(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
     Json(snapshot(&s).0)
 }
 
-async fn take(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
+async fn take(State(s): State<Arc<Shared>>) -> Response {
+    let _control = s.control.lock().unwrap_or_else(|p| p.into_inner());
+    if s.is_stopped() {
+        return StatusCode::GONE.into_response();
+    }
     s.gate.take(None);
-    Json(snapshot(&s).0)
+    Json(snapshot(&s).0).into_response()
 }
 
 async fn release(State(s): State<Arc<Shared>>, body: Bytes) -> Response {
@@ -577,6 +595,10 @@ async fn release(State(s): State<Arc<Shared>>, body: Bytes) -> Response {
             format!("note exceeds {MAX_NOTE_CHARS} characters"),
         )
             .into_response();
+    }
+    let _control = s.control.lock().unwrap_or_else(|p| p.into_inner());
+    if s.is_stopped() {
+        return StatusCode::GONE.into_response();
     }
     s.gate.release(note);
     Json(snapshot(&s).0).into_response()
@@ -612,18 +634,26 @@ async fn ws(State(s): State<Arc<Shared>>, up: WebSocketUpgrade) -> Response {
 
 #[cfg(unix)]
 async fn bridge(socket: WebSocket, s: Arc<Shared>) {
+    let mut stop = s.stop.clone();
+    tokio::select! {
+        biased;
+        _ = stopped(&mut stop) => {},
+        _ = bridge_until_disconnected(socket, &s) => {},
+    }
+}
+
+#[cfg(unix)]
+async fn bridge_until_disconnected(socket: WebSocket, s: &Shared) {
     let vnc = match UnixStream::connect(&s.vnc).await {
         Ok(v) => v,
         Err(e) => return tracing::warn!(error = %e, "takeover: VNC socket unreachable"),
     };
     let (mut vnc_rx, mut vnc_tx) = vnc.into_split();
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let (mut stop, mut filter, mut buf) =
-        (s.stop.clone(), RfbFilter::default(), vec![0u8; 64 << 10]);
+    let (mut filter, mut buf) = (RfbFilter::default(), vec![0u8; 64 << 10]);
     let may_input = || s.gate.human_may_input();
     loop {
         tokio::select! {
-            _ = stopped(&mut stop) => break,
             n = vnc_rx.read(&mut buf) => match n {
                 Ok(n) if n > 0 => {
                     if ws_tx.send(Message::Binary(Bytes::copy_from_slice(&buf[..n]))).await.is_err() {
