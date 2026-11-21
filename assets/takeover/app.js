@@ -28,7 +28,11 @@ const viewport = createViewport({
 function connect() {
   const url = new URL('ws', location.href);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  const connection = new RFB($('frame'), url.href, { wsProtocols: ['binary'] });
+  // The viewport, not the non-interactive framebuffer canvas, owns the
+  // pointer. Cursor rectangles update its native CSS cursor, never a sprite.
+  const connection = new RFB($('frame'), url.href, {
+    wsProtocols: ['binary'], cursorTarget: $('screen'),
+  });
   rfb = connection;
   connection.viewOnly = holder !== 'human';
   let canvas;
@@ -73,6 +77,7 @@ function render() {
   $('copy').disabled = !remoteClip;
   if (!canInput()) { setKeys(false); $('ime').blur(); clearSticky(); }
   if (rfb) rfb.viewOnly = !human;
+  $('screen').dataset.viewOnly = String(!canInput());
   viewport.paintCursor();
   tickIdle();
 }

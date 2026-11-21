@@ -9,7 +9,7 @@ repository = "https://github.com/SylphxAI/agent-workstation"
 readme = "README.md"
 keywords = ["agent", "browser", "wayland", "automation", "vnc"]
 categories = ["web-programming", "api-bindings", "development-tools::testing"]
-include = ["/src/**", "/assets/**", "/tests/**", "/LICENSE", "/README.md", "/CHANGELOG.md"]
+include = ["/build.rs", "/src/**", "/assets/**", "/tests/**", "/LICENSE", "/README.md", "/CHANGELOG.md"]
 
 [workspace]
 # `bench/` is an independent tree; it may depend on this crate by path.
@@ -34,6 +34,9 @@ tracing = "0.1"
 url = "2"
 png = "0.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "ws"] }
+
+[build-dependencies]
+cc = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rustix = { version = "1", features = ["event", "fs", "pipe"] }
