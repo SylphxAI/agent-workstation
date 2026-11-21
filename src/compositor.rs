@@ -7,6 +7,7 @@
 //! tiles to fill it without borders, so its native chrome is the top of the
 //! desktop.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -59,11 +60,14 @@ impl Compositor {
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("XDG_RUNTIME_DIR", runtime_dir)
             .env("SWAYSOCK", &ipc_socket)
+            .env("LD_PRELOAD", "/proc/self/fd/0")
             .env("WLR_BACKENDS", "headless")
             .env("WLR_RENDERER", "pixman")
             .env("WLR_LIBINPUT_NO_DEVICES", "1")
             .envs(std::env::var_os("LD_LIBRARY_PATH").map(|v| ("LD_LIBRARY_PATH", v)))
-            .stdin(Stdio::null())
+            // This headless child reads no stdin. Pass the sealed library here
+            // to give the loader a private descriptor without a writable path.
+            .stdin(Stdio::from(headless_cursor()?))
             .stdout(log.try_clone()?)
             .stderr(log)
             .kill_on_drop(true)
@@ -356,6 +360,30 @@ async fn ipc_reply(stream: &mut UnixStream, expected: u32) -> Result<(serde_json
             return Err(Error::Protocol("unexpected compositor IPC reply".into()));
         }
     }
+}
+
+// Scope the compatibility layer to this headless compositor. The anonymous
+// file cannot be replaced via a runtime path, and is never loaded by clients.
+fn headless_cursor() -> Result<std::fs::File> {
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+
+    let mut file = std::fs::File::from(
+        memfd_create(
+            "headless-cursor",
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+        )
+        .map_err(std::io::Error::from)?,
+    );
+    file.write_all(include_bytes!(concat!(
+        env!("OUT_DIR"),
+        "/headless_cursor.so"
+    )))?;
+    fcntl_add_seals(
+        &file,
+        SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
+    )
+    .map_err(std::io::Error::from)?;
+    Ok(file)
 }
 
 fn config_text(width: u32, height: u32) -> String {

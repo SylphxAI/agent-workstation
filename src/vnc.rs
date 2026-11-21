@@ -30,9 +30,10 @@ impl Vnc {
             return Err(e.into());
         }
         let log = std::fs::File::create(runtime_dir.join("vnc.log"))?;
+        // Capture without the pointer overlay. Servers with separate cursor
+        // capture can still send the shape as an RFB Cursor rectangle.
         let mut child = Command::new(binary)
             .arg("--unix-socket")
-            .arg("--render-cursor")
             .arg(&socket)
             .envs(desktop_env.iter().cloned())
             .stdin(Stdio::null())

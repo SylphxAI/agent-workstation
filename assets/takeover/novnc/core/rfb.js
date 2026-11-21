@@ -232,7 +232,8 @@ export default class RFB extends EventTargetMixin {
         this._screen.appendChild(this._canvas);
 
         // Cursor
-        this._cursor = new Cursor();
+        this._cursorTarget = options.cursorTarget || this._canvas;
+        this._cursor = new Cursor({ nativeOnly: !!options.cursorTarget });
 
         // XXX: TightVNC 2.8.11 sends no cursor at all until Windows changes
         // it. Result: no cursor at all until a window border or an edit field
@@ -574,7 +575,7 @@ export default class RFB extends EventTargetMixin {
 
         this._gestures.attach(this._canvas);
 
-        this._cursor.attach(this._canvas);
+        this._cursor.attach(this._cursorTarget);
         this._refreshCursor();
 
         // Monitor size changes of the screen element

@@ -6,15 +6,15 @@
 
 import { supportsCursorURIs, isTouchDevice } from './browser.js';
 
-const useFallback = !supportsCursorURIs || isTouchDevice;
-
 export default class Cursor {
-    constructor() {
+    constructor({ nativeOnly = false } = {}) {
         this._target = null;
+        this._nativeOnly = nativeOnly;
+        this._useFallback = !nativeOnly && (!supportsCursorURIs || isTouchDevice);
 
         this._canvas = document.createElement('canvas');
 
-        if (useFallback) {
+        if (this._useFallback) {
             this._canvas.style.position = 'fixed';
             this._canvas.style.zIndex = '65535';
             this._canvas.style.pointerEvents = 'none';
@@ -44,7 +44,7 @@ export default class Cursor {
 
         this._target = target;
 
-        if (useFallback) {
+        if (this._useFallback) {
             document.body.appendChild(this._canvas);
 
             const options = { capture: true, passive: true };
@@ -62,7 +62,7 @@ export default class Cursor {
             return;
         }
 
-        if (useFallback) {
+        if (this._useFallback) {
             const options = { capture: true, passive: true };
             this._target.removeEventListener('mouseover', this._eventHandlers.mouseover, options);
             this._target.removeEventListener('mouseleave', this._eventHandlers.mouseleave, options);
@@ -74,11 +74,12 @@ export default class Cursor {
             }
         }
 
+        if (this._nativeOnly) this._target.style.removeProperty('cursor');
         this._target = null;
     }
 
     change(rgba, hotx, hoty, w, h) {
-        if ((w === 0) || (h === 0)) {
+        if ((w === 0) || (h === 0) || (this._nativeOnly && !supportsCursorURIs)) {
             this.clear();
             return;
         }
@@ -97,7 +98,7 @@ export default class Cursor {
         ctx.clearRect(0, 0, w, h);
         ctx.putImageData(img, 0, 0);
 
-        if (useFallback) {
+        if (this._useFallback) {
             this._updatePosition();
         } else {
             let url = this._canvas.toDataURL();
@@ -106,7 +107,7 @@ export default class Cursor {
     }
 
     clear() {
-        this._target.style.cursor = 'none';
+        this._target.style.cursor = this._nativeOnly ? 'default' : 'none';
         this._canvas.width = 0;
         this._canvas.height = 0;
         this._position.x = this._position.x + this._hotSpot.x;
@@ -118,7 +119,7 @@ export default class Cursor {
     // Mouse events might be emulated, this allows
     // moving the cursor in such cases
     move(clientX, clientY) {
-        if (!useFallback) {
+        if (!this._useFallback) {
             return;
         }
         // clientX/clientY are relative the _visual viewport_,

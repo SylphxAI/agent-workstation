@@ -40,7 +40,9 @@ button.on { color: var(--accent); border-color: var(--accent); }
 button.primary { color: #10261d; background: var(--accent); }
 button.primary:not(:disabled):hover { background: #c4f9df; }
 #screen { position: absolute; inset: 0; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
-#screen[data-trackpad="true"] { cursor: none; }
+/* Override the active cursor shape when observing or using the local trackpad. */
+#screen[data-view-only="true"] { cursor: default !important; }
+#screen[data-trackpad="true"] { cursor: none !important; }
 #frame { pointer-events: none; position: absolute; top: 0; left: 0; transform-origin: top left; }
 #frame > div { overflow: hidden !important; background: transparent !important; }
 #cursor { pointer-events: none; position: absolute; top: 0; left: 0; width: 23px; height: 27px; }
