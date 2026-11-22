@@ -316,13 +316,17 @@ impl DesktopSession {
         if self.viewer().is_some() {
             return Ok(());
         }
-        let (env, runtime_dir) = {
+        let (env, runtime_dir, socket) = {
             let mut processes = self.processes.lock().unwrap_or_else(|p| p.into_inner());
             if !processes.browser.as_mut().is_some_and(Browser::is_running) {
                 return Err(Error::Closed);
             }
             let c = processes.compositor.as_ref().ok_or(Error::Closed)?;
-            (c.client_env(), c.runtime_dir().to_path_buf())
+            (
+                c.client_env(),
+                c.runtime_dir().to_path_buf(),
+                c.socket_path(),
+            )
         };
         let vnc = Vnc::start(&self.vnc_binary, &env, &runtime_dir).await?;
         let page = Takeover::start_with_liveness(
@@ -330,6 +334,7 @@ impl DesktopSession {
             vnc.socket().to_path_buf(),
             self.gate.clone(),
             self.browser_exited.clone(),
+            Some(socket),
         )
         .await;
         match page {

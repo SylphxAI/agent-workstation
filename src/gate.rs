@@ -223,6 +223,34 @@ impl ControlGate {
         self.expire_idle(&mut s, Utc::now());
         !s.closed && matches!(*self.holder.borrow(), Holder::Human { .. })
     }
+    /// Run a short commit while the same human control cycle is still active.
+    /// Never keep this lock across a round trip or data transfer.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_human_control<T>(
+        &self,
+        expected: DateTime<Utc>,
+        input: bool,
+        commit: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut s = self.state.lock().expect("state lock");
+        self.expire_idle(&mut s, Utc::now());
+        if s.closed
+            || !matches!(*self.holder.borrow(), Holder::Human { since, .. } if since == expected)
+        {
+            return Err(Error::Refused("takeover control changed".into()));
+        }
+        let result = commit()?;
+        if input {
+            self.holder.send_if_modified(|h| {
+                if let Holder::Human { last_input, .. } = h {
+                    *last_input = Utc::now();
+                }
+                false
+            });
+        }
+        Ok(result)
+    }
+
     /// A person takes control. Repeated takes extend the same active cycle.
     pub fn take(&self, principal: Option<String>) -> Holder {
         let mut s = self.state.lock().expect("state lock");

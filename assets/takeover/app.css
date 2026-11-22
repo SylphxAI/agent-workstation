@@ -107,3 +107,5 @@ dialog::backdrop { background: #080f13b3; }
 dialog textarea { display: block; width: 100%; margin: 10px 0 0; padding: 8px; background: var(--desk); border: 1px solid var(--border); border-radius: 8px; resize: vertical; font-size: 16px; }
 dialog menu { display: flex; justify-content: flex-end; gap: 6px; margin: 12px 0 0; padding: 0; }
 body { top: var(--view-top, 0px); bottom: auto; height: var(--view-height, 100dvh); }
+
+#announcements #copy-retry { pointer-events: auto; }

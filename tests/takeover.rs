@@ -478,3 +478,284 @@ async fn verify_viewer(dir: &Path, url: &url::Url, page: &mut Cdp) {
     browser.shutdown().await;
     compositor.shutdown().await;
 }
+
+async fn focus_desktop(viewer: &mut Cdp) {
+    // noVNC replaces its canvas on reconnect (including around a page reload).
+    // Locate and focus the attached canvas in the same browser turn.
+    wait_for(viewer, "(() => { const canvas = document.querySelector('#frame canvas'); if (!canvas || !document.hasFocus()) return false; canvas.focus(); return document.activeElement === canvas; })()").await;
+}
+
+/// Drive the viewer with Chromium's trusted keyboard events, not a synthetic
+/// DOM paste event or the clipboard endpoint directly.
+async fn viewer_chord(cdp: &mut Cdp, key: char, modifiers: u8) {
+    let upper = key.to_ascii_uppercase();
+    let (modifier, vk) = match modifiers {
+        2 => ("Control", 17),
+        4 => ("Meta", 91),
+        _ => panic!("unexpected CDP modifier"),
+    };
+    let letter = key.to_string();
+    let code = format!("Key{upper}");
+    let mod_code = format!("{modifier}Left");
+    for (kind, key, code, vk, mods) in [
+        ("rawKeyDown", modifier, mod_code.as_str(), vk, modifiers),
+        ("rawKeyDown", &letter, &code, upper as u32, modifiers),
+        ("keyUp", &letter, &code, upper as u32, modifiers),
+        ("keyUp", modifier, &mod_code, vk, 0),
+    ] {
+        cdp.call(
+            "Input.dispatchKeyEvent",
+            json!({"type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk, "modifiers": mods}),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn takeover_shortcuts_sync_the_wayland_clipboard() {
+    use agent_workstation::{DesktopSession, Profile, SessionConfig};
+    if std::env::var("AGENT_WORKSTATION_HEADFUL").as_deref() != Ok("1") {
+        eprintln!("skipped: set AGENT_WORKSTATION_HEADFUL=1");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("remote-profile");
+    let mut config = BrowserConfig::new(
+        std::env::var("AGENT_WORKSTATION_BROWSER").unwrap_or_else(|_| "/usr/bin/chromium".into()),
+    );
+    if let Ok(extra) = std::env::var("AGENT_WORKSTATION_BROWSER_ARGS") {
+        config.extra_args = extra.split_whitespace().map(String::from).collect();
+    }
+    let mut config = SessionConfig::new(
+        Profile::new("clipboard-fixture", &profile),
+        config,
+        dir.path().join("remote"),
+    );
+    config.fingerprint_defaults.screen_width = 1280;
+    config.fingerprint_defaults.screen_height = 800;
+    let desktop = DesktopSession::start(config).await.unwrap();
+    let port = std::fs::read_to_string(profile.join("user-data/DevToolsActivePort")).unwrap();
+    let mut lines = port.lines();
+    let mut remote = Cdp::connect(&format!(
+        "ws://127.0.0.1:{}{}",
+        lines.next().unwrap(),
+        lines.next().unwrap()
+    ))
+    .await
+    .unwrap();
+    let pages = remote.pages().await.unwrap();
+    remote
+        .attach(pages[0]["targetId"].as_str().unwrap())
+        .await
+        .unwrap();
+    remote.call("Page.navigate", json!({"url": "data:text/html,<textarea id=box autofocus></textarea><script>window.pastes=[];window.chords=[];addEventListener('paste',e=>pastes.push(e.clipboardData.getData('text/plain')));addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey)chords.push([e.key,e.ctrlKey,e.metaKey])});</script>"})).await.unwrap();
+    wait_for(
+        &mut remote,
+        "document.activeElement?.id === 'box' && Array.isArray(window.pastes)",
+    )
+    .await;
+    evaluate(
+        &mut remote,
+        "box.value='stale selection'; box.select(); document.execCommand('copy'); box.value='';",
+    )
+    .await;
+
+    let viewer_dir = dir.path().join("viewer");
+    let compositor = Compositor::start(Path::new("sway"), &viewer_dir, 1280, 800)
+        .await
+        .unwrap();
+    let (browser, mut viewer) = launch_browser(&compositor, &viewer_dir, &[]).await;
+    let url = desktop.takeover_url().unwrap();
+    viewer
+        .call(
+            "Browser.grantPermissions",
+            json!({
+                "origin": url.origin().ascii_serialization(),
+                "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"],
+            }),
+        )
+        .await
+        .unwrap();
+    viewer
+        .call("Page.navigate", json!({"url":url.as_str()}))
+        .await
+        .unwrap();
+    viewer
+        .call(
+            "Emulation.setFocusEmulationEnabled",
+            json!({"enabled":true}),
+        )
+        .await
+        .unwrap();
+    wait_for(&mut viewer, "document.querySelector('#signal')?.dataset.state === 'view' && !!document.querySelector('#frame canvas') && document.hasFocus()").await;
+    focus_desktop(&mut viewer).await;
+    let unicode = "粵語 密碼 🔐\n验证码 012345";
+    let text = json!(unicode);
+    evaluate(
+        &mut viewer,
+        &format!("navigator.clipboard.writeText({text})"),
+    )
+    .await;
+    viewer_chord(&mut viewer, 'v', 2).await;
+    assert_eq!(evaluate(&mut remote, "box.value").await, "");
+    evaluate(&mut viewer, "document.querySelector('#take').click()").await;
+    wait_for(
+        &mut viewer,
+        "document.querySelector('#signal')?.dataset.state === 'control'",
+    )
+    .await;
+    focus_desktop(&mut viewer).await;
+    viewer_chord(&mut viewer, 'v', 2).await;
+    wait_for(
+        &mut remote,
+        &format!("box.value === {text} && JSON.stringify(pastes) === JSON.stringify([{text}])"),
+    )
+    .await;
+
+    viewer_chord(&mut viewer, 'a', 2).await;
+    wait_for(
+        &mut remote,
+        &format!("box.selectionStart === 0 && box.selectionEnd === {text}.length"),
+    )
+    .await;
+    evaluate(
+        &mut viewer,
+        "navigator.clipboard.writeText('viewer sentinel')",
+    )
+    .await;
+    viewer_chord(&mut viewer, 'c', 2).await;
+    wait_for(
+        &mut viewer,
+        &format!("navigator.clipboard.readText().then(s=>s==={text})"),
+    )
+    .await;
+    evaluate(
+        &mut viewer,
+        "navigator.clipboard.writeText('viewer sentinel')",
+    )
+    .await;
+    viewer_chord(&mut viewer, 'x', 2).await;
+    wait_for(&mut remote, "box.value === ''").await;
+    wait_for(
+        &mut viewer,
+        &format!("navigator.clipboard.readText().then(s=>s==={text})"),
+    )
+    .await;
+
+    // A copy with no shortcut at all must sync, as with a remote context menu.
+    let menu_text = json!("選單複製 🐈");
+    evaluate(
+        &mut remote,
+        &format!("box.value={menu_text}; box.select(); document.execCommand('copy')"),
+    )
+    .await;
+    wait_for(
+        &mut viewer,
+        &format!("navigator.clipboard.readText().then(s=>s==={menu_text})"),
+    )
+    .await;
+
+    // Run the real page’s macOS branch in this Linux viewer, then send trusted
+    // Meta chords. The host's native Cmd+V default is covered by the mapping
+    // test, not emulated here; the native paste path above uses Linux Ctrl+V.
+    viewer.call("Page.enable", json!({})).await.unwrap();
+    viewer.call("Emulation.setUserAgentOverride", json!({
+        "userAgent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "platform": "MacIntel",
+    })).await.unwrap();
+    viewer.call("Page.reload", json!({})).await.unwrap();
+    wait_for(&mut viewer, "document.querySelector('#signal')?.dataset.state === 'control' && document.hasFocus() && !!document.querySelector('#frame canvas') && navigator.platform === 'MacIntel'").await;
+    focus_desktop(&mut viewer).await;
+    evaluate(
+        &mut viewer,
+        "navigator.clipboard.writeText('viewer sentinel')",
+    )
+    .await;
+    evaluate(&mut remote, "box.setSelectionRange(0,0); chords.length=0;").await;
+    viewer_chord(&mut viewer, 'a', 4).await;
+    wait_for(&mut remote, "box.selectionEnd === box.value.length").await;
+    viewer_chord(&mut viewer, 'c', 4).await;
+    wait_for(
+        &mut viewer,
+        &format!("navigator.clipboard.readText().then(s=>s==={menu_text})"),
+    )
+    .await;
+    viewer_chord(&mut viewer, 'x', 4).await;
+    wait_for(&mut remote, "box.value === ''").await;
+    viewer_chord(&mut viewer, 'z', 4).await;
+    wait_for(&mut remote, &format!("box.value === {menu_text}")).await;
+    assert_eq!(
+        evaluate(
+            &mut remote,
+            "chords.filter(([key]) => ['a','c','x','z'].includes(key))"
+        )
+        .await,
+        json!([
+            ["a", true, false],
+            ["c", true, false],
+            ["x", true, false],
+            ["z", true, false]
+        ])
+    );
+
+    // Browser rejection offers a clickable retry with the current remote value.
+    evaluate(&mut viewer, "window.writeText = navigator.clipboard.writeText.bind(navigator.clipboard); navigator.clipboard.writeText = () => Promise.reject(new Error('blocked'));").await;
+    evaluate(
+        &mut remote,
+        &format!("box.value={text}; box.select(); document.execCommand('copy')"),
+    )
+    .await;
+    wait_for(&mut viewer, "!document.querySelector('#copy-retry').hidden").await;
+    let retry = evaluate(
+        &mut viewer,
+        "document.querySelector('#copy-retry').getBoundingClientRect().toJSON()",
+    )
+    .await;
+    evaluate(
+        &mut viewer,
+        "navigator.clipboard.writeText = window.writeText",
+    )
+    .await;
+    let x = retry["left"].as_f64().unwrap() + retry["width"].as_f64().unwrap() / 2.0;
+    let y = retry["top"].as_f64().unwrap() + retry["height"].as_f64().unwrap() / 2.0;
+    viewer_mouse(&mut viewer, "mousePressed", x, y, 1).await;
+    viewer_mouse(&mut viewer, "mouseReleased", x, y, 0).await;
+    wait_for(
+        &mut viewer,
+        &format!("navigator.clipboard.readText().then(s=>s==={text})"),
+    )
+    .await;
+
+    evaluate(&mut viewer, "document.querySelector('#handback').click()").await;
+    wait_for(&mut viewer, "document.querySelector('#note-dlg').open").await;
+    viewer_chord(&mut viewer, 'v', 2).await;
+    assert_eq!(evaluate(&mut remote, "pastes.length").await, 1);
+    evaluate(
+        &mut viewer,
+        "document.querySelector('#note-dlg').close('ok')",
+    )
+    .await;
+    wait_for(
+        &mut viewer,
+        "document.querySelector('#signal')?.dataset.state === 'view'",
+    )
+    .await;
+    evaluate(
+        &mut remote,
+        &format!("box.value={menu_text}; box.select(); document.execCommand('copy')"),
+    )
+    .await;
+    focus_desktop(&mut viewer).await;
+    viewer_chord(&mut viewer, 'v', 2).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(evaluate(&mut remote, "pastes.length").await, 1);
+    assert_eq!(
+        evaluate(&mut viewer, "navigator.clipboard.readText()").await,
+        unicode
+    );
+
+    browser.shutdown().await;
+    compositor.shutdown().await;
+    desktop.close().await;
+}

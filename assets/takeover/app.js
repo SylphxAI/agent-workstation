@@ -1,4 +1,5 @@
 // Takeover page: the desktop over noVNC, gated by who holds control.
+import { desktopShortcut } from './input.js';
 import { createViewport } from './viewport.js';
 import RFB from './novnc/core/rfb.js';
 import KeyTable from './novnc/core/input/keysym.js';
@@ -10,9 +11,14 @@ history.replaceState(null, '', location.pathname);
 
 const WARN_MS = 30_000;
 let browserRunning = true;
-let rfb = null, connected = false, holder = 'agent', deadline = 0, remoteClip = '', sendClip = false;
-let feedbackTimer;
-const canInput = () => connected && holder === 'human';
+const mac = /mac/i.test(navigator.userAgentData?.platform || navigator.platform);
+const modalOpen = () => !!document.querySelector('dialog[open]');
+let rfb = null, connected = false, holder = 'agent', since = null, deadline = 0;
+let waylandClipboard = false, remoteClip = '', clipSource = null, generation = 0;
+let feedbackTimer, pendingCopy, clipDialog, releasing = false;
+let pasteQueue = Promise.resolve();
+const canInput = () => connected && holder === 'human' && !releasing && !modalOpen();
+const canSync = () => canInput() && !document.hidden && document.hasFocus();
 const sticky = new Set();
 
 const viewport = createViewport({
@@ -53,11 +59,12 @@ function connect() {
     connected = false;
     viewport.cancel();
     rfb = null;
-    remoteClip = '';
     render();
     setTimeout(connect, 2000);
   });
-  connection.addEventListener('clipboard', e => { remoteClip = e.detail.text; render(); });
+  connection.addEventListener('clipboard', e => {
+    if (rfb === connection && !waylandClipboard && canSync()) receiveClipboard(e.detail.text);
+  });
 }
 
 function render() {
@@ -74,27 +81,41 @@ function render() {
   $('take').disabled = !browserRunning;
   $('handback').hidden = !human;
   document.querySelectorAll('.needs-control, #keys button').forEach(b => { b.disabled = !canInput(); });
-  $('copy').disabled = !remoteClip;
+  syncClipboard();
+  updateCopy();
   if (!canInput()) { setKeys(false); $('ime').blur(); clearSticky(); }
-  if (rfb) rfb.viewOnly = !human;
+  if (rfb && rfb.viewOnly === canInput()) rfb.viewOnly = !canInput();
   $('screen').dataset.viewOnly = String(!canInput());
   viewport.paintCursor();
   tickIdle();
 }
 
 function apply(state) {
-  if (holder === 'human' && state.holder !== 'human') viewport.cancel();
+  const next = state.since ?? null;
+  if (next !== since && holder === 'human') viewport.cancel();
+  if (next !== since) {
+    resetClipboard();
+    // A stale local dialog must not be able to commit in a new cycle.
+    for (const id of ['clip-dlg', 'note-dlg']) if ($(id).open) $(id).close('cancel');
+    $('clip').value = '';
+  }
+  since = next;
   holder = state.holder;
+  waylandClipboard = state.wayland_clipboard === true;
   browserRunning = state.browser_running !== false;
   deadline = holder === 'human' && state.idle_remaining_ms != null ? Date.now() + state.idle_remaining_ms : 0;
   render();
 }
 
-function feedback(message) {
+function feedback(message, offerCopy = false) {
   clearTimeout(feedbackTimer);
   $('feedback').textContent = message;
   $('feedback').hidden = false;
-  feedbackTimer = setTimeout(() => { $('feedback').hidden = true; }, 4600);
+  $('copy-retry').hidden = !offerCopy || !canSync() || !remoteClip;
+  feedbackTimer = setTimeout(() => {
+    $('feedback').hidden = true;
+    $('copy-retry').hidden = true;
+  }, offerCopy ? 12000 : 4600);
 }
 
 function tickIdle() {
@@ -162,20 +183,17 @@ const INPUT_KEYS = { deleteContentBackward: 'XK_BackSpace', deleteContentForward
 function flushIme() { if (ime.value) typeText(ime.value); ime.value = ''; }
 ime.addEventListener('keydown', e => {
   if (e.isComposing || e.keyCode === 229) return;
+  if (!canInput() || handleShortcut(e, true)) return;
   const mods = [e.ctrlKey && KeyTable.XK_Control_L, e.altKey && KeyTable.XK_Alt_L, e.metaKey && KeyTable.XK_Super_L].filter(Boolean);
   if (e.shiftKey && e.key.length !== 1) mods.push(KeyTable.XK_Shift_L);
   if (NAMED[e.key]) { e.preventDefault(); tap(KeyTable[NAMED[e.key]], mods); }
   else if (mods.length && e.key.length === 1 && !(e.key.toLowerCase() === 'v' && (e.ctrlKey || e.metaKey))) { e.preventDefault(); tap(keysyms.lookup(e.key.codePointAt(0)), mods); }
 });
 ime.addEventListener('beforeinput', e => {
-  if (!e.isComposing && INPUT_KEYS[e.inputType]) { e.preventDefault(); tap(KeyTable[INPUT_KEYS[e.inputType]]); }
+  if (canInput() && !e.isComposing && INPUT_KEYS[e.inputType]) { e.preventDefault(); tap(KeyTable[INPUT_KEYS[e.inputType]]); }
 });
 ime.addEventListener('input', e => { if (!e.isComposing) flushIme(); });
 ime.addEventListener('compositionend', flushIme);
-ime.addEventListener('paste', e => {
-  const text = e.clipboardData?.getData('text/plain');
-  if (text) { e.preventDefault(); pasteText(text); }
-});
 for (const event of ['focus', 'blur']) ime.addEventListener(event, () => {
   const active = document.activeElement === ime;
   $('kbd').setAttribute('aria-pressed', String(active));
@@ -187,44 +205,189 @@ $('kbd').onclick = () => {
   else ime.focus({ preventScroll: true }); // must run inside the iOS tap activation
 };
 
-// Clipboard: local text becomes the remote clipboard, then Ctrl+V pastes it.
+// Capture keyboard chords before noVNC consumes target-phase events. Leave
+// native paste's default action alone: it supplies text even where readText
+// is unavailable. A genuine Ctrl+V on a Mac has no native paste default.
+function handleShortcut(e, soft = false) {
+  const action = desktopShortcut(e, mac);
+  if (!action) return false;
+  if (action.copy && !e.repeat) primeCopy();
+  if (!action.key && !action.paste && !action.suppress && !e.repeat) return false;
+  if (!action.paste || action.read || e.repeat) e.preventDefault();
+  e.stopPropagation();
+  if (action.paste && action.read && !e.repeat) readLocalClipboard();
+  if (action.key && (!action.copy || !e.repeat)) {
+    const keysym = KeyTable[NAMED[action.key]] ?? keysyms.lookup(action.key.codePointAt(0));
+    const mods = action.ctrl ? [KeyTable.XK_Control_L] : [];
+    if (soft && e.shiftKey) mods.push(KeyTable.XK_Shift_L);
+    tap(keysym, mods);
+  }
+  return true;
+}
+const isCanvas = target => target === $('frame').querySelector('canvas');
+$('frame').addEventListener('keydown', e => {
+  if (canInput() && isCanvas(e.target)) handleShortcut(e);
+}, true);
+for (const target of [$('frame'), ime]) target.addEventListener('paste', e => {
+  if (!canInput() || (e.target !== ime && !isCanvas(e.target))) return;
+  e.preventDefault();
+  e.stopPropagation();
+  pasteText(e.clipboardData?.getData('text/plain'));
+}, true);
+
+// Scope pending clipboard work to this connected, focused control cycle.
+const clipURL = () => `clipboard?since=${encodeURIComponent(since)}`;
+function updateCopy() {
+  $('copy').disabled = !canSync() || !remoteClip;
+  if (!remoteClip || !canSync()) $('copy-retry').hidden = true;
+}
+function resetClipboard() {
+  generation++;
+  clipSource?.close();
+  clipSource = null;
+  pendingCopy?.finish(null);
+  remoteClip = '';
+  pasteQueue = Promise.resolve();
+  updateCopy();
+}
+function syncClipboard() {
+  if (!canSync()) {
+    resetClipboard();
+    return;
+  }
+  if (!waylandClipboard || clipSource || !since) return;
+  const source = new EventSource(clipURL());
+  clipSource = source;
+  const changed = (e, baseline) => {
+    if (clipSource !== source || !canSync()) return;
+    const text = JSON.parse(e.data);
+    if (baseline || !text) {
+      remoteClip = text ?? '';
+      updateCopy();
+    } else receiveClipboard(text);
+  };
+  source.addEventListener('baseline', e => changed(e, true));
+  source.addEventListener('clipboard', e => changed(e, false));
+}
+window.addEventListener('focus', () => { syncClipboard(); updateCopy(); });
+window.addEventListener('blur', resetClipboard);
+document.addEventListener('visibilitychange', () => { syncClipboard(); updateCopy(); });
+
 function pasteText(text) {
-  if (!canInput() || !text) return;
-  rfb.clipboardPasteFrom(text);
-  tap(KeyTable.XK_v, [KeyTable.XK_Control_L]);
+  if (!canSync() || !text) return;
+  if (!waylandClipboard) {
+    // Standalone raw-RFB viewers have no Wayland socket. Keep their original
+    // VNC clipboard behavior; sessions never use this lossy legacy transport.
+    rfb.clipboardPasteFrom(text);
+    tap(KeyTable.XK_v, [KeyTable.XK_Control_L]);
+    return;
+  }
+  const scope = generation, url = clipURL();
+  pasteQueue = pasteQueue.then(async () => {
+    if (!canSync() || generation !== scope) return;
+    const res = await fetch(url, { method: 'POST', body: text });
+    if (!res.ok) throw new Error('Paste was not acknowledged.');
+  }).catch(() => {
+    if (canSync() && generation === scope) feedback('Could not paste into the desktop. Try again.');
+  });
+}
+function showDialog(id) {
+  viewport.cancel();
+  $(id).returnValue = '';
+  $(id).showModal();
+  render();
 }
 function openClip(label, text, send) {
-  sendClip = send;
   $('clip-label').textContent = label;
   $('clip').value = text;
   $('clip-send').hidden = !send;
-  $('clip-dlg').returnValue = '';
-  $('clip-dlg').showModal();
+  clipDialog = { send, connection: rfb, since };
+  showDialog('clip-dlg');
   $('clip').select();
 }
 $('clip-dlg').addEventListener('close', () => {
-  if (sendClip && $('clip-dlg').returnValue === 'ok') pasteText($('clip').value);
+  const dialog = clipDialog, text = $('clip').value;
+  clipDialog = null;
+  $('clip').value = '';
+  render();
+  if (dialog?.send && dialog.connection === rfb && dialog.since === since && $('clip-dlg').returnValue === 'ok') {
+    pasteText(text);
+  }
 });
-$('paste').onclick = async () => {
+async function readLocalClipboard() {
+  if (!canSync()) return;
+  const scope = generation;
   let text = '';
   try { text = await navigator.clipboard.readText(); } catch { /* permission or insecure context */ }
-  if (!canInput()) return;
+  if (!canSync() || generation !== scope) return;
   if (text) pasteText(text);
   else openClip('Paste the text to send to the desktop:', '', true);
-};
-$('copy').onclick = async () => {
-  try { await navigator.clipboard.writeText(remoteClip); feedback('Copied the desktop clipboard.'); }
-  catch { openClip('Desktop clipboard (select and copy):', remoteClip, false); }
-};
+}
+$('paste').onclick = readLocalClipboard;
+
+// WebKit requires starting the write inside the gesture. Supply the Blob
+// only when the remote selection actually changes; reject on cancellation.
+function primeCopy() {
+  if (!canSync() || !window.ClipboardItem || !navigator.clipboard?.write ||
+      !/AppleWebKit/.test(navigator.userAgent) || /Chrome|Chromium|Firefox/.test(navigator.userAgent)) return;
+  pendingCopy?.finish(null);
+  const item = Promise.withResolvers ? Promise.withResolvers() : deferred();
+  const finish = text => {
+    clearTimeout(timer);
+    pendingCopy = null;
+    if (text) item.resolve(new Blob([text], { type: 'text/plain' }));
+    else item.reject(new Error('No remote copy'));
+  };
+  const timer = setTimeout(() => finish(null), 2000);
+  // A synchronously rejected ClipboardItem must not block the remote shortcut.
+  item.promise.catch(() => {});
+  try {
+    const write = navigator.clipboard.write([new ClipboardItem({ 'text/plain': item.promise })]);
+    pendingCopy = { finish, write };
+    write.catch(() => {});
+  } catch { finish(null); }
+}
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+}
+async function receiveClipboard(text) {
+  remoteClip = text;
+  updateCopy();
+  if (!text || !canSync()) return;
+  const scope = generation, copy = pendingCopy;
+  copy?.finish(text);
+  try {
+    if (copy) await copy.write;
+    else await navigator.clipboard.writeText(text);
+    if (canSync() && generation === scope && remoteClip === text) feedback('Copied the desktop clipboard.');
+  } catch {
+    if (canSync() && generation === scope && remoteClip === text) feedback('Your browser blocked clipboard sync.', true);
+  }
+}
+async function copyLocal() {
+  if (!canSync() || !remoteClip) return;
+  const scope = generation, text = remoteClip;
+  try {
+    await navigator.clipboard.writeText(text);
+    if (canSync() && scope === generation && remoteClip === text) feedback('Copied the desktop clipboard.');
+  } catch {
+    if (canSync() && scope === generation && remoteClip === text) openClip('Desktop clipboard (select and copy):', text, false);
+  }
+}
+$('copy').onclick = $('copy-retry').onclick = copyLocal;
 
 // Control.
 $('take').onclick = () => post('take').then(() => { if (!viewport.coarse) rfb?.focus(); }).catch(e => feedback(e.message));
-$('handback').onclick = () => { $('note').value = ''; $('note-dlg').returnValue = ''; $('note-dlg').showModal(); };
-$('note-dlg').addEventListener('close', () => {
-  if ($('note-dlg').returnValue !== 'ok') return;
-  clearSticky();
-  viewport.cancel();
-  post('release', { note: $('note').value.trim() || null }).catch(e => feedback(e.message));
+$('handback').onclick = () => { $('note').value = ''; showDialog('note-dlg'); };
+$('note-dlg').addEventListener('close', async () => {
+  if ($('note-dlg').returnValue !== 'ok') { render(); return; }
+  releasing = true;
+  render();
+  try { await post('release', { note: $('note').value.trim() || null }); }
+  catch (e) { feedback(e.message); }
+  finally { releasing = false; render(); }
 });
 
 function modeLabel() {
