@@ -21,6 +21,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncReadExt, Interest};
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool};
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum, delegate_noop};
@@ -80,6 +81,7 @@ struct State {
     outcome: Option<bool>,
     /// The clipboard selection offered to this client.
     selection: Option<ZwlrDataControlOfferV1>,
+    selection_changed: bool,
     /// Text this client serves as the clipboard owner.
     owned: Option<String>,
     /// The owned selection was replaced.
@@ -95,8 +97,10 @@ const TEXT_MIMES: [&str; 5] = [
     "TEXT",
 ];
 /// Largest clipboard text read.
-const MAX_CLIPBOARD: usize = 16 << 20;
-/// How long a clipboard owner may take to start sending.
+pub(crate) const MAX_CLIPBOARD: usize = 16 << 20;
+// Identifies a selection set by Takeover so it is not echoed to the viewer.
+const TAKEOVER_PASTE_MIME: &str = "application/x-takeover-paste";
+/// How long a clipboard owner may take to send.
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -155,6 +159,7 @@ impl Dispatch<ZwlrDataControlDeviceV1, ()> for State {
         use zwlr_data_control_device_v1::Event as E;
         match ev {
             E::Selection { id } => {
+                s.selection_changed = true;
                 if let Some(old) = std::mem::replace(&mut s.selection, id) {
                     old.destroy();
                 }
@@ -198,8 +203,10 @@ impl Dispatch<ZwlrDataControlSourceV1, ()> for State {
     ) {
         use zwlr_data_control_source_v1::Event as E;
         match ev {
-            E::Send { fd, .. } => {
-                if let Some(text) = &s.owned {
+            E::Send { fd, mime_type } => {
+                if TEXT_MIMES.contains(&mime_type.as_str())
+                    && let Some(text) = &s.owned
+                {
                     // A reader that closes early only ends its own paste.
                     let _ =
                         std::io::Write::write_all(&mut std::fs::File::from(fd), text.as_bytes());
@@ -388,6 +395,28 @@ pub fn clipboard_text(socket: &Path) -> Result<Option<String>> {
 /// selection; a thread then serves pastes until another client replaces it
 /// or the compositor exits.
 pub fn set_clipboard_text(socket: &Path, text: String) -> Result<()> {
+    set_selection(socket, text, false, |commit| commit())
+}
+
+/// Install the takeover clipboard and send Ctrl+V in that order on one
+/// Wayland connection. The caller authorizes the actual effect, not the
+/// potentially blocking connection setup or acknowledgement.
+pub(crate) fn paste_clipboard(
+    socket: &Path,
+    text: String,
+    authorize: impl FnOnce(&mut CommitSelection<'_>) -> Result<()>,
+) -> Result<()> {
+    set_selection(socket, text, true, authorize)
+}
+
+type CommitSelection<'a> = dyn FnMut() -> Result<()> + 'a;
+
+fn set_selection(
+    socket: &Path,
+    text: String,
+    paste: bool,
+    authorize: impl FnOnce(&mut CommitSelection<'_>) -> Result<()>,
+) -> Result<()> {
     if text.len() > MAX_CLIPBOARD {
         return Err(Error::InvalidInput(format!(
             "clipboard text exceeds {} MiB",
@@ -403,9 +432,36 @@ pub fn set_clipboard_text(socket: &Path, text: String) -> Result<()> {
     for mime in TEXT_MIMES {
         source.offer(mime.to_string());
     }
+    const KEY_V: u32 = 47;
+    let keyboard = if paste {
+        source.offer(TAKEOVER_PASTE_MIME.into());
+        let manager: ZwpVirtualKeyboardManagerV1 = c.bind(1..=1)?;
+        let keyboard = manager.create_virtual_keyboard(&seat, &qh, ());
+        upload_keymap(&keyboard, &[(KEY_V, "v".into())])?;
+        Some(keyboard)
+    } else {
+        None
+    };
     c.state.owned = Some(text);
-    device.set_selection(Some(&source));
+    // Flush all preparation before the gated effect. No roundtrip or paste
+    // data transfer can hold the control lock.
     c.roundtrip()?;
+    authorize(&mut || {
+        device.set_selection(Some(&source));
+        if let Some(keyboard) = &keyboard {
+            keyboard.modifiers(1 << 2, 0, 0, 0); // XKB Control
+            keyboard.key(0, KEY_V, 1);
+            keyboard.key(0, KEY_V, 0);
+            keyboard.modifiers(0, 0, 0, 0);
+        }
+        c.conn
+            .flush()
+            .map_err(|e| Error::Protocol(format!("wayland: {e}")))
+    })?;
+    c.roundtrip()?;
+    if let Some(keyboard) = keyboard {
+        keyboard.destroy();
+    }
     std::thread::Builder::new()
         .name("desktop-clipboard".into())
         .spawn(move || {
@@ -419,6 +475,96 @@ pub fn set_clipboard_text(socket: &Path, text: String) -> Result<()> {
         })
         .map_err(|e| Error::Process(format!("clipboard owner: {e}")))?;
     Ok(())
+}
+
+/// One subscription to selection changes, with no polling or retained text.
+/// Drop this when the corresponding viewer stops accepting clipboard updates.
+pub(crate) struct ClipboardChanges {
+    readiness: tokio::net::UnixStream,
+    conn: Connection,
+    queue: EventQueue<State>,
+    state: State,
+    _device: ZwlrDataControlDeviceV1,
+}
+
+impl ClipboardChanges {
+    pub(crate) async fn open(socket: std::path::PathBuf) -> Result<Self> {
+        let (c, device) = tokio::task::spawn_blocking(move || {
+            let c = Client::connect(&socket)?;
+            let seat: wl_seat::WlSeat = c.bind(1..=7)?;
+            let manager: ZwlrDataControlManagerV1 = c.bind(1..=2)?;
+            let device = manager.get_data_device(&seat, &c.queue.handle(), ());
+            c.conn
+                .flush()
+                .map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
+            Ok::<_, Error>((c, device))
+        })
+        .await
+        .map_err(|e| Error::Process(format!("clipboard observer: {e}")))??;
+        // Own a duplicate for readiness; Wayland still owns and reads its socket.
+        let readiness = UnixStream::from(c.conn.as_fd().try_clone_to_owned()?);
+        readiness.set_nonblocking(true)?;
+        Ok(Self {
+            readiness: tokio::net::UnixStream::from_std(readiness)?,
+            conn: c.conn,
+            queue: c.queue,
+            state: c.state,
+            _device: device,
+        })
+    }
+
+    /// Wait for a selection, ignoring those from local takeover paste.
+    pub(crate) async fn next(&mut self) -> Result<Option<String>> {
+        loop {
+            self.queue
+                .dispatch_pending(&mut self.state)
+                .map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
+            if std::mem::take(&mut self.state.selection_changed) {
+                break;
+            }
+            self.readiness.readable().await?;
+            let Some(read) = self.queue.prepare_read() else {
+                continue;
+            };
+            match self
+                .readiness
+                .try_io(Interest::READABLE, || match read.read() {
+                    Err(wayland_client::backend::WaylandError::Io(e)) => Err(e),
+                    Err(e) => Err(std::io::Error::other(e)),
+                    Ok(n) => Ok(n),
+                }) {
+                Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => return Err(e.into()),
+                _ => {}
+            }
+        }
+        let Some(offer) = self.state.selection.as_ref() else {
+            return Ok(None);
+        };
+        let mime = offer
+            .data::<std::sync::Mutex<Vec<String>>>()
+            .and_then(|m| m.lock().ok())
+            .filter(|m| !m.iter().any(|o| o == TAKEOVER_PASTE_MIME))
+            .and_then(|m| {
+                TEXT_MIMES
+                    .into_iter()
+                    .find(|mime| m.iter().any(|o| o == mime))
+            });
+        let Some(mime) = mime else { return Ok(None) };
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)
+            .map_err(|e| Error::Io(e.into()))?;
+        offer.receive(mime.into(), write.as_fd());
+        drop(write);
+        self.conn
+            .flush()
+            .map_err(|e| Error::Protocol(format!("wayland: {e}")))?;
+        let mut read =
+            tokio::net::unix::pipe::Receiver::from_owned_fd(read)?.take((MAX_CLIPBOARD + 1) as u64);
+        let mut out = Vec::new();
+        match tokio::time::timeout(CLIPBOARD_TIMEOUT, read.read_to_end(&mut out)).await {
+            Ok(Ok(_)) if out.len() <= MAX_CLIPBOARD => Ok(String::from_utf8(out).ok()),
+            _ => Ok(None),
+        }
+    }
 }
 
 fn to_rgba(

@@ -50,6 +50,16 @@ over the whole desktop.
     `Some(Duration::from_secs(300))`). Set `None` to require an explicit
     hand-back, or use a longer duration; takeover state reports nullable
     `idle_timeout_ms`/`idle_remaining_ms` for indefinite control.
+  - Click the desktop to use keyboard shortcuts. On macOS, common `Cmd`
+    shortcuts map to Linux `Ctrl` shortcuts, `Cmd+←/→` moves to the start/end
+    of the line, and `Option+←/→` moves by word. Windows and Linux keep `Ctrl`.
+    Some shortcuts may be reserved by the host browser or operating system.
+  - While you control a Wayland session, paste UTF-8 text directly into the
+    desktop. Copying or cutting in the desktop also updates your local clipboard
+    when the page has focus and the browser allows it. If blocked, use the retry
+    button or **Tools → Copy/Paste**. Automatic browser clipboard access may
+    require HTTPS (or localhost) and browser permission. Clipboard sync is off
+    in view-only mode.
   - If the browser exits, the takeover page reports it without releasing
     control or restarting automatically, showing holder-specific guidance to
     resume with the existing profile.

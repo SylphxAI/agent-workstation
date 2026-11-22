@@ -45,6 +45,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Release preflight tests
         run: python3 -m unittest discover -s .github/tests -v
+      - name: Takeover JavaScript
+        run: |
+          node --input-type=module --check < assets/takeover/app.js
+          node --test tests/takeover-input.mjs
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy

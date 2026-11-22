@@ -11,7 +11,9 @@
 //!
 //! Endpoints (relative to the page URL): `ws` (binary RFB), `state` (JSON),
 //! `events` (server-sent `state` events), `take` and `release` (POST,
-//! `{"note": "..."}` of at most [`MAX_NOTE_CHARS`] characters).
+//! `{"note": "..."}` of at most [`MAX_NOTE_CHARS`] characters). A Wayland-backed
+//! session also serves `clipboard?since=<control start>` (UTF-8 paste via POST,
+//! selection changes via SSE), restricted to the current human control cycle.
 //!
 //! The page can be served two ways, together or alone: on its own listener
 //! ([`TakeoverConfig::bind`]), and mounted in the caller's HTTP server under
@@ -27,6 +29,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
+#[cfg(target_os = "linux")]
+use axum::extract::DefaultBodyLimit;
 #[cfg(unix)]
 use axum::extract::ws::Message;
 use axum::extract::ws::{WebSocket, WebSocketUpgrade};
@@ -39,6 +43,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use chrono::{DateTime, Utc};
+#[cfg(target_os = "linux")]
+use futures::FutureExt;
 use futures::Stream;
 #[cfg(unix)]
 use futures::{SinkExt, StreamExt};
@@ -204,6 +210,8 @@ struct Shared {
     public: std::sync::RwLock<Public>,
     browser_exited: Arc<std::sync::atomic::AtomicBool>,
     vnc: PathBuf,
+    #[cfg(target_os = "linux")]
+    wayland: Option<PathBuf>,
     gate: Arc<ControlGate>,
     stop: watch::Receiver<bool>,
     // Serialize revocation with control changes from already admitted requests.
@@ -227,7 +235,7 @@ impl Takeover {
         vnc_socket: PathBuf,
         gate: Arc<ControlGate>,
     ) -> Result<Takeover> {
-        Self::start_with_liveness(config, vnc_socket, gate, Arc::default()).await
+        Self::start_with_liveness(config, vnc_socket, gate, Arc::default(), None).await
     }
 
     pub(crate) async fn start_with_liveness(
@@ -235,6 +243,7 @@ impl Takeover {
         vnc_socket: PathBuf,
         gate: Arc<ControlGate>,
         browser_exited: Arc<std::sync::atomic::AtomicBool>,
+        #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] wayland: Option<PathBuf>,
     ) -> Result<Takeover> {
         let token = match config.token {
             Some(t) if t.is_empty() => {
@@ -265,6 +274,8 @@ impl Takeover {
             public: std::sync::RwLock::new(Public::new(base)?),
             browser_exited,
             vnc: vnc_socket,
+            #[cfg(target_os = "linux")]
+            wayland,
             gate,
             stop: stop_rx.clone(),
             control: std::sync::Mutex::new(()),
@@ -276,7 +287,15 @@ impl Takeover {
             .route("/events", get(events))
             .route("/take", post(take))
             .route("/release", post(release))
-            .route("/{*path}", get(asset))
+            .route("/{*path}", get(asset));
+        #[cfg(target_os = "linux")]
+        let app = app.route(
+            "/clipboard",
+            get(clipboard_events)
+                .post(paste)
+                .layer(DefaultBodyLimit::max(crate::wayland::MAX_CLIPBOARD)),
+        );
+        let app = app
             .layer(middleware::from_fn_with_state(shared.clone(), guard))
             .with_state(shared.clone());
         let task = listener.map(|listener| {
@@ -466,7 +485,7 @@ macro_rules! assets {
 }
 
 static ASSETS: &[(&str, &[u8])] = assets! {
-    "index.html", "app.js", "app.css", "viewport.js", "novnc/LICENSE.txt", "novnc/docs/LICENSE.MPL-2.0",
+    "index.html", "app.js", "app.css", "input.js", "viewport.js", "novnc/LICENSE.txt", "novnc/docs/LICENSE.MPL-2.0",
     "novnc/core/base64.js", "novnc/core/crypto/aes.js", "novnc/core/crypto/bigint.js",
     "novnc/core/crypto/crypto.js", "novnc/core/crypto/des.js", "novnc/core/crypto/dh.js",
     "novnc/core/crypto/md5.js", "novnc/core/crypto/rsa.js", "novnc/core/decoders/copyrect.js",
@@ -554,6 +573,10 @@ fn snapshot(shared: &Shared) -> (serde_json::Value, String) {
         }
     };
     json["browser_running"] = running.into();
+    #[cfg(target_os = "linux")]
+    if shared.wayland.is_some() {
+        json["wayland_clipboard"] = true.into();
+    }
     (json, format!("{key} browser={running}"))
 }
 
@@ -625,6 +648,119 @@ async fn events(
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[cfg(target_os = "linux")]
+fn clipboard_cycle(s: &Shared, uri: &Uri) -> std::result::Result<DateTime<Utc>, StatusCode> {
+    let since = uri
+        .query()
+        .and_then(|q| {
+            url::form_urlencoded::parse(q.as_bytes()).find_map(|(key, value)| {
+                if key == "since" {
+                    value.parse().ok()
+                } else {
+                    None
+                }
+            })
+        })
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    s.gate
+        .with_human_control(since, false, || Ok(()))
+        .map_err(|_| StatusCode::CONFLICT)?;
+    Ok(since)
+}
+
+#[cfg(target_os = "linux")]
+async fn paste(State(s): State<Arc<Shared>>, uri: Uri, body: Bytes) -> StatusCode {
+    let Some(socket) = s.wayland.clone() else {
+        return StatusCode::NOT_FOUND;
+    };
+    let since = match clipboard_cycle(&s, &uri) {
+        Ok(since) => since,
+        Err(status) => return status,
+    };
+    let Ok(text) = std::str::from_utf8(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if text.is_empty() {
+        return StatusCode::NO_CONTENT;
+    }
+    let text = text.to_owned();
+    match tokio::task::spawn_blocking(move || {
+        crate::wayland::paste_clipboard(&socket, text, |commit| {
+            let _control = s.control.lock().unwrap_or_else(|p| p.into_inner());
+            if s.is_stopped() {
+                return Err(Error::Closed);
+            }
+            s.gate.with_human_control(since, true, commit)
+        })
+    })
+    .await
+    {
+        Ok(Ok(())) => StatusCode::NO_CONTENT,
+        Ok(Err(Error::Refused(_))) => StatusCode::CONFLICT,
+        Ok(Err(Error::Closed)) => StatusCode::GONE,
+        _ => StatusCode::BAD_GATEWAY,
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn clipboard_events(State(s): State<Arc<Shared>>, uri: Uri) -> Response {
+    let Some(socket) = s.wayland.clone() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let since = match clipboard_cycle(&s, &uri) {
+        Ok(since) => since,
+        Err(status) => return status.into_response(),
+    };
+    let mut stop = s.stop.clone();
+    let mut holder = s.gate.subscribe();
+    let revoked = async move {
+        let handback = async move {
+            let _ = holder
+                .wait_for(
+                    |h| !matches!(h, Holder::Human { since: current, .. } if *current == since),
+                )
+                .await;
+        };
+        tokio::select! { _ = stopped(&mut stop) => {}, _ = handback => {} }
+    }
+    .shared();
+    let changes = tokio::select! {
+        biased;
+        _ = revoked.clone() => return StatusCode::CONFLICT.into_response(),
+        r = crate::wayland::ClipboardChanges::open(socket) => match r {
+            Ok(changes) => changes,
+            Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+        },
+    };
+    let stream = futures::stream::unfold(
+        (changes, revoked, s, true),
+        move |(mut changes, revoked, s, baseline)| async move {
+            let text = tokio::select! {
+                biased;
+                _ = revoked.clone() => return None,
+                result = changes.next() => result.ok()?,
+            };
+            let data = serde_json::to_string(&text).expect("serializable clipboard text");
+            let event = Event::default()
+                .event(if baseline { "baseline" } else { "clipboard" })
+                .data(data);
+            {
+                let _control = s.control.lock().unwrap_or_else(|p| p.into_inner());
+                if s.is_stopped() {
+                    return None;
+                }
+                s.gate.with_human_control(since, false, || Ok(())).ok()?;
+            }
+            Some((Ok::<_, Infallible>(event), (changes, revoked, s, false)))
+        },
+    );
+    (
+        [("x-accel-buffering", "no")],
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    )
+        .into_response()
 }
 
 async fn ws(State(s): State<Arc<Shared>>, up: WebSocketUpgrade) -> Response {
@@ -874,6 +1010,86 @@ mod tests {
         assert_eq!(f.pointer, None, "dropped input moves nothing");
         f.feed(&POINTER, &|| true).unwrap();
         assert_eq!(f.pointer, Some((10, 20)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn clipboard_requires_auth_origin_and_current_human_cycle() {
+        use tower::ServiceExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ControlGate::new();
+        let t = Takeover::start_with_liveness(
+            TakeoverConfig {
+                bind: None,
+                public_url: Some(Url::parse("https://desk.example/").unwrap()),
+                token: Some("test-token".into()),
+            },
+            dir.path().join("vnc.sock"),
+            gate.clone(),
+            Arc::default(),
+            Some(dir.path().join("nonexistent-wayland.sock")),
+        )
+        .await
+        .unwrap();
+        let take = || {
+            let Holder::Human { since, .. } = gate.take(None) else {
+                panic!("not human")
+            };
+            url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("since", &since.to_rfc3339())
+                .finish()
+        };
+        let call = |method, cycle: &str, origin, token: &str, body: &'static [u8]| {
+            let req = Request::builder()
+                .method(method)
+                .uri(format!("/clipboard?{cycle}"))
+                .header("origin", origin)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::from(body))
+                .unwrap();
+            t.router().oneshot(req)
+        };
+        let cycle = take();
+        let req = |method, cycle: &str, body| {
+            call(method, cycle, "https://desk.example", "test-token", body)
+        };
+        assert_eq!(
+            call("POST", &cycle, "https://desk.example", "wrong", b"text")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            call("GET", &cycle, "https://other.example", "test-token", b"")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            req("POST", &cycle, b"\xff").await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        gate.release(None);
+        assert_eq!(
+            req("POST", &cycle, b"text").await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        let current = take();
+        assert_ne!(cycle, current);
+        assert_eq!(
+            req("GET", &cycle, b"").await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            req("POST", &cycle, b"text").await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            req("POST", &current, b"").await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
     }
 
     #[tokio::test]
