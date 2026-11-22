@@ -57,9 +57,17 @@ over the whole desktop.
   - While you control a Wayland session, paste UTF-8 text directly into the
     desktop. Copying or cutting in the desktop also updates your local clipboard
     when the page has focus and the browser allows it. If blocked, use the retry
-    button or **Tools → Copy/Paste**. Automatic browser clipboard access may
+    button or open **Clipboard** for **Copy from desktop** and **Paste to desktop**. Automatic browser clipboard access may
     require HTTPS (or localhost) and browser permission. Clipboard sync is off
     in view-only mode.
+  - On a phone, use **Trackpad** to aim with one finger or switch to **Direct
+    Touch** to click where you tap. Hold for right-click, pinch to zoom, or
+    slide two fingers to scroll. Turn on **Pan** in View controls to move the
+    camera instead. The **Keyboard** and **Keys** buttons stay reachable
+    above the on-screen keyboard; selected modifiers apply to the next key.
+  - The status strip shows who holds control and the HTTP round-trip time to
+    the desktop gateway (not video latency). **Reconnect** replaces the viewer
+    connection without restarting the desktop or changing who has control.
   - If the browser exits, the takeover page reports it without releasing
     control or restarting automatically, showing holder-specific guidance to
     resume with the existing profile.

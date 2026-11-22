@@ -6,10 +6,10 @@ const middle = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 
 export function createViewport({ screen, frame, cursor, send, focus, enabled, changed }) {
   const coarse = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
-  let trackpad = coarse, touchCursor = coarse;
+  let trackpad = coarse, touchCursor = coarse, pan = false;
   let width = 0, height = 0, viewW = 0, viewH = 0;
   let scale = 1, left = 0, top = 0, preset = null;
-  let pos = { x: 0, y: 0 }, mask = 0, mouseId = null;
+  let pos = { x: 0, y: 0 }, mask = 0, mouseId = null, positioned = false;
   let finger = null, pinch = null, multi = false, lastTap = null, holdTimer = 0;
   let wheelX = 0, wheelY = 0, wheelPosition = null;
 
@@ -52,26 +52,25 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
   }
 
   function layout() {
-    const vv = window.visualViewport;
-    document.body.style.setProperty('--view-height', (vv?.height ?? window.innerHeight) + 'px');
-    document.body.style.setProperty('--view-top', (vv?.offsetTop ?? 0) + 'px');
     const nextW = screen.clientWidth, nextH = screen.clientHeight;
     if (!nextW || !nextH || (viewW === nextW && viewH === nextH)) return;
     const anchor = toDesktop({ x: viewW / 2, y: viewH / 2 });
     viewW = nextW;
     viewH = nextH;
     if (!width) return;
-    if (preset) center(preset);
-    else {
-      scale = clamp(scale, fitScale(), 4);
-      left = viewW / 2 - anchor.x * scale;
-      top = viewH / 2 - anchor.y * scale;
-      paint();
+    if (preset === 'fit') { center('fit'); return; }
+    scale = preset === 'focus' ? Math.max(1, fitScale()) : clamp(scale, fitScale(), 4);
+    left = viewW / 2 - anchor.x * scale;
+    top = viewH / 2 - anchor.y * scale;
+    // Keep the last remote input point clear of the new keyboard/dock edge.
+    if (coarse && positioned) {
+      const margin = Math.min(32, viewW / 4, viewH / 4);
+      left += clamp(left + pos.x * scale, margin, viewW - margin) - (left + pos.x * scale);
+      top += clamp(top + pos.y * scale, margin, viewH - margin) - (top + pos.y * scale);
     }
+    paint();
   }
-  window.addEventListener('resize', layout);
-  window.visualViewport?.addEventListener('resize', layout);
-  window.visualViewport?.addEventListener('scroll', layout);
+  new ResizeObserver(layout).observe(screen);
   layout();
 
   function framebuffer(w, h) {
@@ -96,10 +95,21 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
   function point(p = pos, buttons = mask) {
     if (!width || !enabled()) return;
     pos = { x: clamp(p.x, 0, width - 1), y: clamp(p.y, 0, height - 1) };
+    positioned = true;
     send(pos.x, pos.y, buttons);
     paintCursor();
   }
-  function click(button) { point(pos, mask | button); point(); }
+  function click(button, touch = false) {
+    point(pos, mask | button);
+    point();
+    if (!touch) return;
+    const ripple = document.createElement('span');
+    ripple.className = button === 4 ? 'tap-ripple right' : 'tap-ripple';
+    ripple.style.left = clamp(left + pos.x * scale, 5, viewW - 5) + 'px';
+    ripple.style.top = clamp(top + pos.y * scale, 5, viewH - 5) + 'px';
+    screen.append(ripple);
+    setTimeout(() => ripple.remove(), 280);
+  }
   function scroll(direction) {
     const anchor = !touchCursor && wheelPosition ? wheelPosition : !(trackpad && touchCursor) ? toDesktop({ x: viewW / 2, y: viewH / 2 }) : pos;
     point(anchor, mask | direction);
@@ -128,7 +138,11 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
     if (mask) { mask = 0; point(); }
     const [a, b] = points;
     if (!b) { pinch = null; return; }
-    pinch = { ids: [a.id, b.id], span: Math.max(1, dist(a, b)), scale, anchor: toDesktop(middle(a, b)) };
+    const mid = middle(a, b);
+    pinch = { ids: [a.id, b.id], span: Math.max(1, dist(a, b)), scale,
+      start: mid, anchor: toDesktop(mid), wheel: mid, kind: null };
+    // Scroll the item under the trackpad pointer, or under the initial touch midpoint.
+    pinch.scrollAt = trackpad ? { ...pos } : pinch.anchor;
   }
 
   screen.addEventListener('touchstart', e => {
@@ -143,13 +157,16 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
     const second = trackpad && lastTap && at - lastTap.at < 325 && dist(lastTap, p) < 34;
     lastTap = null;
     finger = { start: p, last: p, at, moved: false, held: false, second, dragging: false };
-    if (trackpad) {
-      holdTimer = setTimeout(() => {
-        if (!finger || finger.moved || !enabled()) return;
-        if (finger.second) { finger.dragging = true; mask = 1; point(); }
-        else { finger.held = true; click(4); }
-      }, second ? 220 : 510);
-    }
+    if (!trackpad && !inFrame(p)) { finger = null; return; }
+    holdTimer = setTimeout(() => {
+      if (!finger || finger.moved || !enabled()) return;
+      if (finger.second) { finger.dragging = true; mask = 1; point(); }
+      else {
+        finger.held = true;
+        if (!trackpad) point(toDesktop(p));
+        click(4, true);
+      }
+    }, second ? 220 : 510);
   }, { passive: false });
 
   screen.addEventListener('touchmove', e => {
@@ -160,11 +177,30 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
       const pair = pinch?.ids.map(id => points.find(p => p.id === id));
       if (!pair?.every(Boolean)) { startPinch(points); return; }
       const [a, b] = pair, mid = middle(a, b);
-      scale = clamp(pinch.scale * dist(a, b) / pinch.span, fitScale(), 4);
-      left = mid.x - pinch.anchor.x * scale;
-      top = mid.y - pinch.anchor.y * scale;
-      preset = null;
-      paint();
+      const span = dist(a, b);
+      if (!pinch.kind) {
+        const translation = dist(mid, pinch.start), spread = Math.abs(span - pinch.span);
+        if (spread >= 10 && spread >= translation * .65) pinch.kind = 'camera';
+        else if (translation >= 13) pinch.kind = pan || !enabled() ? 'camera' : 'scroll';
+        else return;
+      }
+      if (pinch.kind === 'camera') {
+        scale = clamp(pinch.scale * span / pinch.span, fitScale(), 4);
+        left = mid.x - pinch.anchor.x * scale;
+        top = mid.y - pinch.anchor.y * scale;
+        preset = null;
+        paint();
+      } else {
+        const dx = mid.x - pinch.wheel.x, dy = mid.y - pinch.wheel.y;
+        // Finger motion follows page motion; RFB wheel direction is opposite.
+        const horizontal = Math.abs(dx) > Math.abs(dy), delta = horizontal ? dx : dy;
+        const count = Math.min(6, Math.floor(Math.abs(delta) / 18));
+        if (count) {
+          const direction = horizontal ? (delta > 0 ? 32 : 64) : (delta > 0 ? 8 : 16);
+          for (let i = 0; i < count; i++) { point(pinch.scrollAt, mask | direction); point(); }
+          pinch.wheel = mid;
+        }
+      }
     } else if (!multi && finger && enabled() && points[0]?.id === finger.start.id) {
       const p = points[0], at = performance.now();
       if (!finger.moved && dist(p, finger.start) < 5) return;
@@ -195,8 +231,8 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
     if (finger.dragging) { mask = 0; point(); }
     else if (!finger.moved && !finger.held && enabled()) {
       const p = local(end);
-      if (trackpad) { click(1); lastTap = { ...p, at: performance.now() }; }
-      else if (inFrame(p)) { point(toDesktop(p)); click(1); }
+      if (trackpad) { click(1, true); lastTap = { ...p, at: performance.now() }; }
+      else if (inFrame(p)) { point(toDesktop(p)); click(1, true); }
     }
     finger = null;
   }, { passive: false });
@@ -254,6 +290,7 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
 
   return { framebuffer, center, cancel, scroll, coarse, paintCursor,
     get trackpad() { return trackpad; },
+    togglePan() { cancel(); pan = !pan; return pan; },
     toggleMode() { cancel(); trackpad = !trackpad; touchCursor = trackpad; paintCursor(); },
     toggleFit() { cancel(); center(Math.abs(scale - fitScale()) < 1e-4 ? 'focus' : 'fit'); },
   };
