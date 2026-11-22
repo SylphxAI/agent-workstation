@@ -479,6 +479,12 @@ async fn verify_viewer(dir: &Path, url: &url::Url, page: &mut Cdp) {
     compositor.shutdown().await;
 }
 
+async fn focus_desktop(viewer: &mut Cdp) {
+    // noVNC replaces its canvas on reconnect (including around a page reload).
+    // Locate and focus the attached canvas in the same browser turn.
+    wait_for(viewer, "(() => { const canvas = document.querySelector('#frame canvas'); if (!canvas || !document.hasFocus()) return false; canvas.focus(); return document.activeElement === canvas; })()").await;
+}
+
 /// Drive the viewer with Chromium's trusted keyboard events, not a synthetic
 /// DOM paste event or the clipboard endpoint directly.
 async fn viewer_chord(cdp: &mut Cdp, key: char, modifiers: u8) {
@@ -583,11 +589,7 @@ async fn takeover_shortcuts_sync_the_wayland_clipboard() {
         .await
         .unwrap();
     wait_for(&mut viewer, "document.querySelector('#signal')?.dataset.state === 'view' && !!document.querySelector('#frame canvas') && document.hasFocus()").await;
-    evaluate(
-        &mut viewer,
-        "window.focusDesktop=()=>document.querySelector('#frame canvas').focus(); focusDesktop();",
-    )
-    .await;
+    focus_desktop(&mut viewer).await;
     let unicode = "粵語 密碼 🔐\n验证码 012345";
     let text = json!(unicode);
     evaluate(
@@ -603,7 +605,7 @@ async fn takeover_shortcuts_sync_the_wayland_clipboard() {
         "document.querySelector('#signal')?.dataset.state === 'control'",
     )
     .await;
-    evaluate(&mut viewer, "focusDesktop()").await;
+    focus_desktop(&mut viewer).await;
     viewer_chord(&mut viewer, 'v', 2).await;
     wait_for(
         &mut remote,
@@ -664,11 +666,7 @@ async fn takeover_shortcuts_sync_the_wayland_clipboard() {
     })).await.unwrap();
     viewer.call("Page.reload", json!({})).await.unwrap();
     wait_for(&mut viewer, "document.querySelector('#signal')?.dataset.state === 'control' && document.hasFocus() && !!document.querySelector('#frame canvas') && navigator.platform === 'MacIntel'").await;
-    evaluate(
-        &mut viewer,
-        "window.focusDesktop=()=>document.querySelector('#frame canvas').focus(); focusDesktop();",
-    )
-    .await;
+    focus_desktop(&mut viewer).await;
     evaluate(
         &mut viewer,
         "navigator.clipboard.writeText('viewer sentinel')",
@@ -748,7 +746,7 @@ async fn takeover_shortcuts_sync_the_wayland_clipboard() {
         &format!("box.value={menu_text}; box.select(); document.execCommand('copy')"),
     )
     .await;
-    evaluate(&mut viewer, "focusDesktop()").await;
+    focus_desktop(&mut viewer).await;
     viewer_chord(&mut viewer, 'v', 2).await;
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(evaluate(&mut remote, "pastes.length").await, 1);
