@@ -10,10 +10,13 @@ const $ = id => document.getElementById(id);
 history.replaceState(null, '', location.pathname);
 
 const WARN_MS = 30_000;
+const CONNECT_MS = 8_000;
 let browserRunning = true;
 const mac = /mac/i.test(navigator.userAgentData?.platform || navigator.platform);
 const modalOpen = () => !!document.querySelector('dialog[open]');
 let rfb = null, connected = false, holder = 'agent', since = null, deadline = 0;
+let retryTimer, failures = 0, reconnecting = false;
+let link = 'Connecting…', latencyProbe = null;
 let waylandClipboard = false, remoteClip = '', clipSource = null, generation = 0;
 let feedbackTimer, pendingCopy, clipDialog, releasing = false;
 let pasteQueue = Promise.resolve();
@@ -31,41 +34,118 @@ const viewport = createViewport({
   },
 });
 
+function showLink() {
+  const label = !browserRunning ? 'Browser stopped' : connected
+    ? (holder === 'human' ? 'Live · In control' : 'Live · View only') : link;
+  if ($('connection-label').textContent !== label) $('connection-label').textContent = label;
+  $('signal').dataset.state = !browserRunning || !connected ? 'waiting' : holder === 'human' ? 'control' : 'view';
+  $('reconnect').disabled = reconnecting;
+}
+
+// Measure the authenticated gateway round trip, not framebuffer/video latency.
+async function measureLatency() {
+  if (!connected || document.hidden || latencyProbe) return;
+  const start = performance.now(), probe = new AbortController();
+  latencyProbe = probe;
+  const timeout = setTimeout(() => probe.abort(), 4000);
+  try {
+    const res = await fetch('state', { method: 'HEAD', cache: 'no-store', signal: probe.signal });
+    if (!res.ok) throw new Error('Gateway unavailable');
+    if (latencyProbe === probe) $('latency').textContent = Math.round(performance.now() - start) + ' ms';
+  } catch {
+    if (latencyProbe === probe) $('latency').textContent = 'RTT unavailable';
+  } finally {
+    clearTimeout(timeout);
+    if (latencyProbe === probe) latencyProbe = null;
+  }
+}
+
+function scheduleRetry(reason) {
+  const delay = Math.min(2 ** ++failures, 16);
+  link = reason + ' · Retry in ' + delay + 's';
+  retryTimer = setTimeout(connect, delay * 1000);
+  render();
+}
+
 function connect() {
+  clearTimeout(retryTimer);
+  if (rfb) return;
+  link = failures ? 'Reconnecting…' : 'Connecting…';
+  showLink();
   const url = new URL('ws', location.href);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  // The viewport, not the non-interactive framebuffer canvas, owns the
-  // pointer. Cursor rectangles update its native CSS cursor, never a sprite.
-  const connection = new RFB($('frame'), url.href, {
-    wsProtocols: ['binary'], cursorTarget: $('screen'),
-  });
+  // The viewport owns pointer input; noVNC updates its native CSS cursor.
+  let connection;
+  try {
+    connection = new RFB($('frame'), url.href, { wsProtocols: ['binary'], cursorTarget: $('screen') });
+  } catch {
+    scheduleRetry('Could not connect');
+    return;
+  }
   rfb = connection;
-  connection.viewOnly = holder !== 'human';
-  let canvas;
-  // ResizeObserver measures untransformed CSS size. With noVNC scaling and
-  // clipping disabled that size is exactly the native framebuffer size.
+  connection.viewOnly = !canInput();
+  let canvas, timedOut = false;
+  const handshake = setTimeout(() => {
+    if (reconnecting) return;
+    timedOut = true;
+    link = 'Connection timed out';
+    showLink();
+    connection.disconnect();
+  }, CONNECT_MS);
   const observer = new ResizeObserver(() => {
     if (connected && rfb === connection) viewport.framebuffer(canvas.width, canvas.height);
   });
   connection.addEventListener('connect', () => {
+    clearTimeout(handshake);
     canvas = $('frame').querySelector('canvas');
     observer.observe(canvas);
+    failures = 0;
     connected = true;
     viewport.framebuffer(canvas.width, canvas.height);
     render();
+    measureLatency();
   });
   connection.addEventListener('disconnect', () => {
+    clearTimeout(handshake);
     observer.disconnect();
+    if (rfb !== connection) return;
     connected = false;
-    viewport.cancel();
     rfb = null;
-    render();
-    setTimeout(connect, 2000);
+    viewport.cancel();
+    latencyProbe?.abort();
+    latencyProbe = null;
+    $('latency').textContent = '—';
+    if ($('clip-dlg').open) $('clip-dlg').close('cancel');
+    if (reconnecting) {
+      reconnecting = false;
+      connect();
+      render();
+    } else {
+      scheduleRetry(timedOut ? 'Timed out' : 'Disconnected');
+    }
   });
   connection.addEventListener('clipboard', e => {
     if (rfb === connection && !waylandClipboard && canSync()) receiveClipboard(e.detail.text);
   });
 }
+
+$('reconnect').onclick = () => {
+  clearTimeout(retryTimer);
+  failures = 0;
+  if (!rfb) { connect(); return; }
+  // Only replace this WebSocket. Custody and the remote desktop are unchanged.
+  viewport.cancel();
+  reconnecting = true;
+  connected = false;
+  $('latency').textContent = '—';
+  latencyProbe?.abort();
+  latencyProbe = null;
+  link = 'Reconnecting…';
+  render();
+  rfb.disconnect();
+};
+setInterval(measureLatency, 8000);
+document.addEventListener('visibilitychange', measureLatency);
 
 function render() {
   const human = holder === 'human';
@@ -75,15 +155,19 @@ function render() {
   const status = !browserRunning ? 'The browser has stopped.' : !connected ? 'Desktop disconnected, reconnecting…'
     : human ? 'You are in control. The agent is paused.' : 'The agent is in control (view only).';
   if ($('status').textContent !== status) $('status').textContent = status;
-  $('signal').dataset.state = !browserRunning || !connected ? 'waiting' : human ? 'control' : 'view';
-  $('tools-btn').title = status;
+  showLink();
   $('take').hidden = human;
-  $('take').disabled = !browserRunning;
+  $('take').disabled = !browserRunning || !connected;
   $('handback').hidden = !human;
   document.querySelectorAll('.needs-control, #keys button').forEach(b => { b.disabled = !canInput(); });
   syncClipboard();
   updateCopy();
-  if (!canInput()) { setKeys(false); $('ime').blur(); clearSticky(); }
+  for (const id of ['kbd', 'keys-btn', 'clip-btn']) $(id).hidden = !human;
+  if (!canInput()) {
+    if (activeTray !== 'tools') setTray(null);
+    $('ime').blur();
+    clearSticky();
+  }
   if (rfb && rfb.viewOnly === canInput()) rfb.viewOnly = !canInput();
   $('screen').dataset.viewOnly = String(!canInput());
   viewport.paintCursor();
@@ -159,7 +243,7 @@ function typeText(text) {
 }
 $('keys').addEventListener('click', e => {
   const b = e.target.closest('button');
-  if (!b) return;
+  if (!b || !canInput()) return;
   if (b.dataset.key) tap(KeyTable[b.dataset.key]);
   const mod = KeyTable[b.dataset.mod];
   if (mod) {
@@ -168,11 +252,17 @@ $('keys').addEventListener('click', e => {
     b.setAttribute('aria-pressed', String(sticky.has(mod)));
   }
 });
-function setKeys(open) {
-  $('keys').hidden = !open;
-  $('keys-btn').setAttribute('aria-expanded', String(open));
+const trays = new Map([['tools', 'tools-btn'], ['keys', 'keys-btn'], ['clipboard', 'clip-btn']]);
+let activeTray = null;
+function setTray(next) {
+  activeTray = next;
+  for (const [id, button] of trays) {
+    $(id).hidden = id !== next;
+    $(button).setAttribute('aria-expanded', String(id === next));
+  }
+  $('tools-btn').setAttribute('aria-label', next === 'tools' ? 'Hide view controls' : 'Show view controls');
 }
-$('keys-btn').onclick = () => setKeys($('keys').hidden);
+for (const [id, button] of trays) $(button).onclick = () => setTray(activeTray === id ? null : id);
 
 // Soft keyboard: a hidden textarea collects typed and IME-composed text.
 const ime = $('ime');
@@ -198,8 +288,13 @@ for (const event of ['focus', 'blur']) ime.addEventListener(event, () => {
   const active = document.activeElement === ime;
   $('kbd').setAttribute('aria-pressed', String(active));
   $('kbd').classList.toggle('on', active);
+  syncViewport();
 });
-$('kbd').addEventListener('pointerdown', e => e.preventDefault());
+// Keys and toolbar taps must not steal focus from the soft keyboard.
+$('hud').addEventListener('pointerdown', e => {
+  const button = e.target.closest('button');
+  if (button && (button === $('kbd') || document.activeElement === ime)) e.preventDefault();
+});
 $('kbd').onclick = () => {
   if (document.activeElement === ime) ime.blur();
   else ime.focus({ preventScroll: true }); // must run inside the iOS tap activation
@@ -240,6 +335,7 @@ const clipURL = () => `clipboard?since=${encodeURIComponent(since)}`;
 function updateCopy() {
   $('copy').disabled = !canSync() || !remoteClip;
   if (!remoteClip || !canSync()) $('copy-retry').hidden = true;
+  $('clip-state').textContent = remoteClip ? 'Desktop text ready' : 'Desktop clipboard empty';
 }
 function resetClipboard() {
   generation++;
@@ -394,21 +490,41 @@ function modeLabel() {
   $('mode-label').textContent = viewport.trackpad ? 'Trackpad' : 'Direct Touch';
   $('mode').setAttribute('aria-pressed', String(!viewport.trackpad));
   $('gesture-hint').textContent = viewport.trackpad
-    ? 'Slide one finger to aim, tap to click, or hold for right-click. Pinch or pan with two fingers.'
-    : 'Tap to click where you touch. Pinch or pan with two fingers.';
+    ? 'Slide to aim. Tap or double-tap to click; hold for right-click.'
+    : 'Tap or double-tap where you want to click; hold for right-click.';
+  $('gesture-hint').textContent += ' Pinch to zoom. Two fingers scroll; toggle Pan to move the view.';
 }
 $('mode').onclick = () => { viewport.toggleMode(); modeLabel(); };
 $('fit').onclick = () => viewport.toggleFit();
+$('pan').onclick = () => {
+  const on = viewport.togglePan();
+  $('pan').textContent = on ? 'Pan: on' : 'Pan: off';
+  $('pan').setAttribute('aria-pressed', String(on));
+};
 $('scroll-up').onclick = () => viewport.scroll(8);
 $('scroll-down').onclick = () => viewport.scroll(16);
 
-function setTools(open) {
-  $('tools').hidden = !open;
-  $('tools-btn').setAttribute('aria-expanded', String(open));
-  $('tools-btn').setAttribute('aria-label', open ? 'Hide controls' : 'Show controls');
-}
-$('tools-btn').onclick = () => setTools($('tools').hidden);
 const dock = $('dock'), hud = $('hud');
+const visual = window.visualViewport;
+function syncViewport() {
+  const { style } = document.body;
+  const width = visual?.width ?? window.innerWidth, height = visual?.height ?? window.innerHeight;
+  style.setProperty('--view-width', width + 'px');
+  style.setProperty('--view-height', height + 'px');
+  style.setProperty('--view-left', (visual?.offsetLeft ?? 0) + 'px');
+  style.setProperty('--view-top', (visual?.offsetTop ?? 0) + 'px');
+  const typing = viewport.coarse && (document.activeElement === ime ||
+    (visual?.scale === 1 && document.documentElement.clientHeight - height > 100));
+  hud.dataset.edge = typing ? 'bottom' : hud.dataset.dock;
+}
+window.addEventListener('resize', syncViewport);
+visual?.addEventListener('resize', syncViewport);
+visual?.addEventListener('scroll', syncViewport);
+new ResizeObserver(() => {
+  document.body.style.setProperty('--hud-height', hud.offsetHeight + 'px');
+}).observe(hud);
+syncViewport();
+
 let docking = null, dragged = false;
 dock.addEventListener('pointerdown', e => {
   if (e.button !== 0 || docking) return;
@@ -419,11 +535,12 @@ dock.addEventListener('pointerdown', e => {
 dock.addEventListener('pointermove', e => {
   if (docking?.id !== e.pointerId) return;
   if (!dragged && Math.hypot(e.clientX - docking.x, e.clientY - docking.y) < 12) return;
-  const rect = $('screen').getBoundingClientRect();
+  const rect = document.body.getBoundingClientRect();
   const x = (e.clientX - rect.left) / rect.width;
   dragged = true;
   hud.dataset.dock = e.clientY - rect.top < rect.height / 2 ? 'top' : 'bottom';
   hud.dataset.align = x < .32 ? 'start' : x > .68 ? 'end' : 'center';
+  syncViewport();
 });
 // Prevent a recognized dock drag from becoming a native touch scroll/fling.
 dock.addEventListener('touchmove', e => { if (dragged) e.preventDefault(); }, { passive: false });
@@ -433,6 +550,7 @@ for (const event of ['pointerup', 'pointercancel', 'lostpointercapture']) {
 dock.onclick = e => {
   if (!dragged || !e.detail) hud.dataset.dock = hud.dataset.dock === 'bottom' ? 'top' : 'bottom';
   dragged = false;
+  syncViewport();
 };
 
 modeLabel();

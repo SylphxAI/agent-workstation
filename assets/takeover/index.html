@@ -2,9 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>Desktop takeover</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="app.css">
 <script type="module" src="app.js"></script>
 </head>
@@ -18,47 +19,64 @@
 <aside id="hud" data-dock="bottom" data-align="center" aria-label="Takeover controls">
   <header id="bar">
     <button id="dock" aria-label="Move toolbar" title="Drag to dock, or click to switch edges"><span class="grip" aria-hidden="true"></span></button>
-    <button id="tools-btn" aria-label="Show controls" aria-expanded="false" aria-controls="tools" title="Controls">
-      <span id="signal" aria-hidden="true"></span>
-      <svg aria-hidden="true" viewBox="0 0 20 20" width="17" height="17"><path d="m5 12 5-5 5 5"/></svg>
+    <button id="tools-btn" aria-label="Show view controls" aria-expanded="false" aria-controls="tools" title="View controls">
+      <svg aria-hidden="true" viewBox="0 0 20 20" width="18" height="18"><path d="M3 6h14M3 14h14M7 3v6m6 2v6"/></svg>
+    </button>
+    <button id="kbd" class="needs-control" aria-label="Keyboard" aria-pressed="false" title="Keyboard" hidden>
+      <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><rect x="2" y="5" width="16" height="10" rx="2"/><path d="M5 8h.1m3 0h.1m3 0h.1m3 0h.1M5 11h.1M8 12h6"/></svg>
+    </button>
+    <button id="keys-btn" class="needs-control" aria-controls="keys" aria-expanded="false" title="Modifier keys" hidden>Keys</button>
+    <button id="clip-btn" class="needs-control" aria-label="Clipboard" aria-controls="clipboard" aria-expanded="false" title="Clipboard" hidden>
+      <svg aria-hidden="true" viewBox="0 0 20 20" width="19" height="19"><path d="M7 4H4v14h12V4h-3M7 2h6v5H7zM7 11h6m-6 3h4"/></svg>
     </button>
     <button id="take" class="primary" hidden>Take control</button>
     <button id="handback" class="primary" hidden>Hand back</button>
   </header>
-  <section id="tools" hidden>
-    <div class="session-line">
-      <span class="eyebrow">REMOTE DESKTOP</span>
-      <output id="zoom" aria-label="View scale">—</output>
+  <nav id="keys" class="tray" aria-label="Modifier and navigation keys" hidden>
+    <button data-key="XK_Escape">Esc</button>
+    <button data-key="XK_Tab">Tab</button>
+    <button data-mod="XK_Control_L" aria-pressed="false">Ctrl</button>
+    <button data-mod="XK_Alt_L" aria-pressed="false">Alt</button>
+    <button data-mod="XK_Super_L" aria-pressed="false">Cmd</button>
+    <button data-mod="XK_Shift_L" aria-pressed="false">Shift</button>
+    <button data-key="XK_Left" aria-label="Left">←</button>
+    <button data-key="XK_Up" aria-label="Up">↑</button>
+    <button data-key="XK_Down" aria-label="Down">↓</button>
+    <button data-key="XK_Right" aria-label="Right">→</button>
+    <button data-key="XK_Home">Home</button>
+    <button data-key="XK_End">End</button>
+    <button data-key="XK_BackSpace" aria-label="Backspace">⌫</button>
+    <button data-key="XK_Return" aria-label="Enter">⏎</button>
+  </nav>
+  <section id="clipboard" class="tray" aria-label="Clipboard" hidden>
+    <div class="section-line"><span>Clipboard</span><span id="clip-state">Desktop clipboard empty</span></div>
+    <div class="row pair">
+      <button id="paste" class="needs-control" aria-label="Paste into desktop">Paste to desktop</button>
+      <button id="copy" disabled aria-label="Copy from desktop">Copy from desktop</button>
     </div>
-    <div class="view row" role="group" aria-label="View controls">
+  </section>
+  <section id="tools" class="tray" aria-label="View controls" hidden>
+    <div class="section-line"><span>View controls</span><output id="zoom" aria-label="View scale">—</output></div>
+    <div class="row pair">
       <button id="mode" aria-label="Direct Touch mode" aria-pressed="false"><span id="mode-label">Trackpad</span><span class="swap" aria-hidden="true">⇄</span></button>
       <button id="fit">Fit</button>
     </div>
     <p id="gesture-hint"></p>
-    <div class="row actions" role="group" aria-label="Desktop input">
-      <button id="kbd" class="needs-control" aria-pressed="false">Keyboard</button>
-      <button id="keys-btn" class="needs-control" aria-controls="keys" aria-expanded="false">Keys</button>
-      <button id="paste" class="needs-control">Paste</button>
-      <button id="copy" disabled>Copy</button>
+    <div class="row view-actions" role="group" aria-label="Scroll and pan">
+      <button id="pan" aria-pressed="false">Pan: off</button>
       <button id="scroll-up" class="needs-control" aria-label="Scroll up">Scroll ↑</button>
       <button id="scroll-down" class="needs-control" aria-label="Scroll down">Scroll ↓</button>
     </div>
-<nav id="keys" aria-label="Special keys" hidden>
-  <button data-key="XK_Escape">Esc</button>
-  <button data-key="XK_Tab">Tab</button>
-  <button data-mod="XK_Control_L">Ctrl</button>
-  <button data-mod="XK_Alt_L">Alt</button>
-  <button data-mod="XK_Shift_L">Shift</button>
-  <button data-key="XK_Left" aria-label="Left">←</button>
-  <button data-key="XK_Up" aria-label="Up">↑</button>
-  <button data-key="XK_Down" aria-label="Down">↓</button>
-  <button data-key="XK_Right" aria-label="Right">→</button>
-  <button data-key="XK_Home">Home</button>
-  <button data-key="XK_End">End</button>
-  <button data-key="XK_BackSpace" aria-label="Backspace">⌫</button>
-  <button data-key="XK_Return" aria-label="Enter">⏎</button>
-</nav>
   </section>
+  <div id="connection">
+    <span id="signal" aria-hidden="true"></span>
+    <span id="connection-label" role="status">Connecting…</span>
+    <output id="latency" aria-label="Gateway round-trip time" title="HTTP round-trip time to the desktop gateway, not video latency" aria-live="off">—</output>
+    <button id="reconnect" aria-label="Reconnect" title="Reconnect the viewer without restarting the desktop">
+      <svg aria-hidden="true" viewBox="0 0 20 20" width="17" height="17"><path d="M16 8a6 6 0 1 0 0 4m0-4V3m0 5h-5"/></svg>
+      <span>Reconnect</span>
+    </button>
+  </div>
 </aside>
 <p id="status" role="status" class="sr-only">Connecting…</p>
 <div id="announcements">
