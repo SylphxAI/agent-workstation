@@ -86,7 +86,7 @@ test('active SSE edges show and dismiss, but duplicate or geometry-only updates 
   assert.deepEqual(trace, [['focus', 'url'], ['blur'], ['focus', 'decimal'], ['blur']]);
 });
 
-test('manual pin survives misses and SSE blur until a hit; suppress survives SSE focus until a hit', () => {
+test('manual pin survives misses and SSE blur; suppress survives SSE focus until a hit', () => {
   const { keyboard, trace } = keyboardFixture();
   keyboard.update(input(true));
   keyboard.toggle(); // suppress
@@ -103,8 +103,10 @@ test('manual pin survives misses and SSE blur until a hit; suppress survives SSE
   keyboard.update(input());
   keyboard.tap(miss);
   assert.deepEqual(trace, [['focus', 'text']]);
-  keyboard.tap(hit); // clears pin without replacing the focused textarea
+  keyboard.tap(hit); // does not silently unpin a manual open
   keyboard.tap(miss);
+  assert.deepEqual(trace, [['focus', 'text']]);
+  keyboard.toggle();
   assert.deepEqual(trace, [['focus', 'text'], ['blur']]);
 });
 

@@ -60,7 +60,7 @@ export function createSoftKeyboard({ coarse, canInput, asyncFocus, focused, focu
     tap({ x, y }) {
       if (!coarse() || !canInput()) return;
       if (input?.rects.some(([rx, ry, w, h]) => x >= rx && x - rx < w && y >= ry && y - ry < h)) {
-        override = null;
+        if (override === 'suppress') override = null;
         show(); // synchronous with the trusted touchend
       } else if (override !== 'pin') hide();
     },

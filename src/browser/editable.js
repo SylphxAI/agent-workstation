@@ -31,7 +31,14 @@
         if (type || e.localName === 'textarea') {
             if ((type && !nativeInputs.includes(type)) || e.readOnly || e.matches(':disabled')) return null;
         } else if (!e.hasAttribute('contenteditable') || !e.isContentEditable) {
-            return null;
+            // ARIA widgets may handle printable keys directly. Exclude
+            // select-only comboboxes and widgets without a focusable editor.
+            const role = e.getAttribute('role')?.trim().split(/\s+/, 1)[0];
+            if (!['textbox', 'searchbox', 'combobox'].includes(role) ||
+                e.localName === 'button' || e.localName === 'select' ||
+                !e.hasAttribute('tabindex') || e.getAttribute('aria-readonly') === 'true' ||
+                e.closest('[aria-disabled="true"]')) return null;
+            return role === 'searchbox' ? 'search' : 'text';
         }
         const mode = e.inputMode;
         if (mode === 'none') return null;

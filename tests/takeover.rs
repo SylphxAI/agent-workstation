@@ -759,3 +759,136 @@ async fn takeover_shortcuts_sync_the_wayland_clipboard() {
     compositor.shutdown().await;
     desktop.close().await;
 }
+
+#[tokio::test]
+async fn takeover_focuses_the_ime_on_trusted_touch_before_typing_remotely() {
+    use agent_workstation::{DesktopSession, Profile, SessionConfig};
+    use base64::Engine as _;
+    if std::env::var("AGENT_WORKSTATION_HEADFUL").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = BrowserConfig::new(
+        std::env::var("AGENT_WORKSTATION_BROWSER").unwrap_or_else(|_| "/usr/bin/chromium".into()),
+    );
+    if let Ok(extra) = std::env::var("AGENT_WORKSTATION_BROWSER_ARGS") {
+        config.extra_args = extra.split_whitespace().map(String::from).collect();
+    }
+    config.extra_args.push("--kiosk".into());
+    let mut config = SessionConfig::new(
+        Profile::new("touch-fixture", dir.path().join("profile")),
+        config,
+        dir.path().join("remote"),
+    );
+    config.fingerprint_defaults.screen_width = 800;
+    config.fingerprint_defaults.screen_height = 600;
+    config.takeover = Some(TakeoverConfig::default());
+    let remote = DesktopSession::start(config).await.unwrap();
+    let agent = remote.lease("operator").unwrap();
+    let page = "<!doctype html><style>input,button{position:absolute;box-sizing:border-box}input{left:350px;top:275px;width:100px;height:50px}button{left:340px;top:180px;width:120px;height:40px}</style><input id=field><button id=plain>Done</button>";
+    agent
+        .navigate(&format!(
+            "data:text/html;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(page)
+        ))
+        .await
+        .unwrap();
+
+    let dir = dir.path().join("viewer");
+    let compositor = Compositor::start(Path::new("sway"), &dir, 1280, 800)
+        .await
+        .unwrap();
+    let (browser, mut viewer) = launch_browser(&compositor, &dir, &[]).await;
+    viewer
+        .call(
+            "Emulation.setDeviceMetricsOverride",
+            json!({"width":390,"height":700,"deviceScaleFactor":1,"mobile":true}),
+        )
+        .await
+        .unwrap();
+    viewer
+        .call(
+            "Emulation.setTouchEmulationEnabled",
+            json!({"enabled":true,"maxTouchPoints":5}),
+        )
+        .await
+        .unwrap();
+    let url = remote.takeover_url().unwrap();
+    viewer
+        .call("Page.navigate", json!({"url":url.as_str()}))
+        .await
+        .unwrap();
+    wait_for(&mut viewer, "document.querySelector('#signal')?.dataset.state === 'view' && matchMedia('(pointer: coarse)').matches").await;
+    evaluate(&mut viewer, r#"(() => {
+        window.taps = [];
+        window.imeEdges = [];
+        const ime = document.querySelector('#ime');
+        for (const event of ['focus', 'blur']) ime.addEventListener(event, () => imeEdges.push(event));
+        addEventListener('touchend', e => taps.push([e.isTrusted, e.defaultPrevented, document.activeElement === ime]));
+        const source = new EventSource('events');
+        source.addEventListener('input', e => window.context = JSON.parse(e.data));
+        document.querySelector('#take').click();
+    })()"#).await;
+    wait_for(&mut viewer, "window.context?.rects.some(r => r[0] === 350 && r[1] === 275) && document.querySelector('#signal').dataset.state === 'control' && document.querySelector('#frame canvas').width === 800").await;
+
+    touch_tap(&mut viewer, 195.0, 350.0).await; // Trackpad starts at desktop centre.
+    assert_eq!(
+        evaluate(&mut viewer, "taps.at(-1)").await,
+        json!([true, true, true])
+    );
+    viewer
+        .call("Input.insertText", json!({"text":"x"}))
+        .await
+        .unwrap();
+    wait_for(&mut viewer, "window.context?.active === true").await;
+    evaluate(&mut viewer, "document.querySelector('#mode').click()").await;
+    for (remote_y, focus) in [(200, false), (300, true), (200, false)] {
+        let screen = evaluate(&mut viewer, &format!("(() => {{ const r = document.querySelector('#frame canvas').getBoundingClientRect(); return [r.left + r.width / 2, r.top + r.height * {remote_y} / 600]; }})()")).await;
+        touch_tap(
+            &mut viewer,
+            screen[0].as_f64().unwrap(),
+            screen[1].as_f64().unwrap(),
+        )
+        .await;
+        assert_eq!(
+            evaluate(&mut viewer, "taps.at(-1)").await,
+            json!([true, true, focus])
+        );
+        if !focus {
+            wait_for(&mut viewer, "window.context?.active === false").await;
+        }
+    }
+    assert_eq!(
+        evaluate(&mut viewer, "imeEdges").await,
+        json!(["focus", "blur", "focus", "blur"])
+    );
+    assert!(remote.gate().release(None));
+    assert_eq!(
+        agent
+            .eval("document.querySelector('#field').value")
+            .await
+            .unwrap(),
+        "x"
+    );
+    drop(viewer);
+    browser.shutdown().await;
+    compositor.shutdown().await;
+    remote.close().await;
+}
+
+async fn touch_tap(viewer: &mut Cdp, x: f64, y: f64) {
+    viewer
+        .call(
+            "Input.dispatchTouchEvent",
+            json!({"type":"touchStart","touchPoints":[{"x":x,"y":y}]}),
+        )
+        .await
+        .unwrap();
+    viewer
+        .call(
+            "Input.dispatchTouchEvent",
+            json!({"type":"touchEnd","touchPoints":[]}),
+        )
+        .await
+        .unwrap();
+}

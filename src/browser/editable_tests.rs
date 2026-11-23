@@ -93,6 +93,8 @@ async fn headful_editable_context_matches_painted_desktop_and_trusted_focus() {
 <iframe style="position:absolute;left:400px;top:80px;width:200px;height:100px;border:4px solid #444" srcdoc="<body style='margin:0'><input type=url style='position:absolute;left:35px;top:25px;width:50px;height:20px;padding:0;border:0;background:#02fa76'></body>"></iframe>
 <div id=shadow style="position:absolute;left:350px;top:30px"></div>
 <div contenteditable style="position:absolute;left:550px;top:30px;width:80px;height:20px">Edit me</div>
+<div role="searchbox" tabindex="0" style="position:absolute;left:650px;top:30px;width:80px;height:20px">Search</div>
+<button role="combobox" style="position:absolute;left:650px;top:90px">Select</button>
 <script>
     const root = document.querySelector('#shadow').attachShadow({mode:'open'});
     root.innerHTML = '<input inputmode=decimal style="display:block;width:60px;height:24px;padding:0;border:0;background:#02fa76">';
@@ -102,7 +104,7 @@ async fn headful_editable_context_matches_painted_desktop_and_trusted_focus() {
 </script>"#,
     );
     agent.navigate(&main).await.unwrap();
-    let ctx = expect_context(&endpoint, window, |c| c.rects.len() == 5).await;
+    let ctx = expect_context(&endpoint, window, |c| c.rects.len() == 6).await;
     let top = ctx.rects[0][1] - 32;
     assert!(top > 0, "expected real Chromium toolbar above the page");
     assert_eq!(
@@ -112,7 +114,8 @@ async fn headful_editable_context_matches_painted_desktop_and_trusted_focus() {
             [220, top + 42, 40, 10],
             [350, top + 30, 60, 24],
             [439, top + 109, 50, 20],
-            [550, top + 30, 80, 20]
+            [550, top + 30, 80, 20],
+            [650, top + 30, 80, 20]
         ]
     );
 
@@ -139,6 +142,7 @@ async fn headful_editable_context_matches_painted_desktop_and_trusted_focus() {
         (360, top + 42, InputPurpose::Decimal),
         (450, top + 119, InputPurpose::Url),
         (560, top + 40, InputPurpose::Text),
+        (660, top + 40, InputPurpose::Search),
     ] {
         agent
             .click_at(f64::from(x), f64::from(y), Button::Left)
@@ -147,7 +151,7 @@ async fn headful_editable_context_matches_painted_desktop_and_trusted_focus() {
         let _ = expect_context(&endpoint, window, |c| c.active && c.purpose == purpose).await;
     }
     agent.key("ctrl+l").await.unwrap();
-    let _ = expect_context(&endpoint, window, |c| !c.active && c.rects.len() == 5).await;
+    let _ = expect_context(&endpoint, window, |c| !c.active && c.rects.len() == 6).await;
 
     // The observer follows a real tab switch without activating the agent's
     // old tab or disturbing the browser's native focus ownership.
@@ -169,7 +173,7 @@ async fn headful_editable_context_matches_painted_desktop_and_trusted_focus() {
     .await;
     assert_eq!(agent.current_url().await.unwrap(), second);
     agent.close_tab(&second_id).await.unwrap();
-    let _ = expect_context(&endpoint, window, |c| c.rects.len() == 5).await;
+    let _ = expect_context(&endpoint, window, |c| c.rects.len() == 6).await;
     assert!(editable_context(&endpoint, [0, 0, 40, 50]).await.is_none());
     desktop.close().await;
 }
