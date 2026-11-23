@@ -783,23 +783,32 @@ async fn browser_exit_guidance_follows_the_holder_without_restarting() {
         .spawn()
         .unwrap();
     let port_file = viewer.path().join("DevToolsActivePort");
-    tokio::time::timeout(Duration::from_secs(15), async {
-        while !port_file.exists() {
-            assert!(viewer_process.try_wait().unwrap().is_none());
+    // Chromium can create the file before writing either line. Wait for a
+    // complete endpoint and a successful DevTools handshake, not existence.
+    let mut web = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if let Some(status) = viewer_process
+                .try_wait()
+                .expect("read viewer process status")
+            {
+                panic!("viewer exited before DevTools was ready: {status}");
+            }
+            if let Ok(content) = std::fs::read_to_string(&port_file) {
+                let mut lines = content.lines();
+                if let (Some(port), Some(path)) = (lines.next(), lines.next())
+                    && let Ok(port) = port.parse::<u16>()
+                    && port != 0
+                    && path.starts_with("/devtools/browser/")
+                    && let Ok(web) = Web::connect(&format!("ws://127.0.0.1:{port}{path}")).await
+                {
+                    break web;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
-    let port = std::fs::read_to_string(port_file).unwrap();
-    let mut lines = port.lines();
-    let mut web = Web::connect(&format!(
-        "ws://127.0.0.1:{}{}",
-        lines.next().unwrap(),
-        lines.next().unwrap()
-    ))
-    .await
-    .unwrap();
+    .expect("viewer DevTools endpoint not ready");
 
     for human_first in [false, true] {
         let (profile, rt) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
