@@ -625,6 +625,7 @@ async fn compact_cli_exercises_all_subcommands_against_daemon_wire_protocol() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn headful_compact_cli_drives_real_daemon_session() {
+    use agent_workstation::platform::{DesktopNode, DesktopTree};
     use std::path::Path;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command as AsyncCommand;
@@ -811,40 +812,42 @@ async fn headful_compact_cli_drives_real_daemon_session() {
         );
         serde_json::from_slice(&out.stdout).unwrap()
     };
+    fn control_ref<'a>(nodes: &'a [DesktopNode], name: &str, roles: &[&str]) -> Option<&'a str> {
+        nodes.iter().find_map(|node| {
+            if node.name == name && roles.contains(&node.role.as_str()) {
+                Some(node.qualified_ref.as_str())
+            } else {
+                control_ref(&node.children, name, roles)
+            }
+        })
+    }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-    let semantic = loop {
+    let (go, email) = loop {
         let snap = decode(desktop(&["snapshot", "--max-depth", "40", "--max-nodes", "400"]).await);
-        if snap["mode"] == "native_accessibility"
-            && snap["text"]
-                .as_str()
-                .is_some_and(|text| text.contains("push_button \"Go\""))
-        {
-            break snap;
+        if snap["mode"] == "native_accessibility" {
+            let tree: DesktopTree = serde_json::from_value(snap.clone()).unwrap();
+            // AT-SPI role names differ between browser/AT-SPI versions.
+            if let (Some(go), Some(email)) = (
+                control_ref(&tree.roots, "Go", &["button", "push_button"]),
+                control_ref(&tree.roots, "Email", &["entry", "text", "text_field"]),
+            ) {
+                break (go.to_owned(), email.to_owned());
+            }
         }
         if tokio::time::Instant::now() >= deadline {
             panic!(
-                "missing fixture controls: {}",
+                "missing fixture controls (mode {}, fallback {}): {}",
+                snap["mode"],
+                snap["fallback_reason"],
                 snap["text"].as_str().unwrap_or("<no tree>")
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     };
-    let text = semantic["text"].as_str().unwrap();
-    let get_ref = |needle: &str| -> String {
-        let line = text
-            .lines()
-            .find(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("missing {needle} in {text}"));
-        line.rsplit_once(" [")
-            .unwrap()
-            .1
-            .trim_end_matches(']')
-            .into()
-    };
-    let go = get_ref("push_button \"Go\"");
-    let email = get_ref(" \"Email\"");
     let focus = decode(desktop(&["focus", &email]).await);
     assert_eq!(focus["mode"], "native_accessibility");
+    assert_eq!(focus["target"], email);
+    // Chromium exposes native focus but does not implement EditableText.SetTextContents.
     let _ = decode(desktop(&["key", "ctrl+a"]).await);
     let _ = decode(desktop(&["type", "native@example.test"]).await);
     let _ = decode(desktop(&["click", &go]).await);

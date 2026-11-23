@@ -1560,10 +1560,12 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         let received_actions = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
         let actions_ref = std::sync::Arc::clone(&received_actions);
+        let address = format!("unix:path={}", sock.display());
 
         let server = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let actions_ref = std::sync::Arc::clone(&actions_ref);
+                let address = address.clone();
                 tokio::spawn(async move {
                     // SASL handshake (byte-exact, never over-reading into binary frames)
                     let mut nul = [0u8; 1];
@@ -1583,6 +1585,7 @@ mod tests {
                     {
                         let (sig, resp_body) = match member.as_str() {
                             "Hello" => ("s", encoded_string(":1.42")),
+                            "GetAddress" => ("s", encoded_string(&address)),
                             "GetConnectionUnixProcessID" => {
                                 let mut b = Vec::new();
                                 encode_u32(&mut b, 777);
@@ -1660,7 +1663,15 @@ mod tests {
                                 ("(iiii)", b)
                             }
                             "DoAction" | "GrabFocus" | "SetTextContents" => {
-                                actions_ref.lock().unwrap().push(format!("{member}:{path}"));
+                                let payload = if member == "SetTextContents" {
+                                    format!(":{}", decode_string(&body, &mut 0).unwrap())
+                                } else {
+                                    String::new()
+                                };
+                                actions_ref
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("{member}:{path}{payload}"));
                                 let mut b = Vec::new();
                                 encode_u32(&mut b, 1);
                                 ("b", b)
@@ -1676,7 +1687,8 @@ mod tests {
             }
         });
 
-        let adapter = LinuxPlatformAdapter::with_sockets(Some(sock), None, None, (1280, 800));
+        let adapter =
+            LinuxPlatformAdapter::with_sockets(Some(sock.clone()), None, None, (1280, 800));
         let tree = adapter.snapshot(TreeOptions::default()).await.unwrap();
         assert_eq!(tree.snapshot_id, "p1");
         assert_eq!(tree.platform, "linux");
@@ -1727,12 +1739,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(stale.code(), "stale-ref");
 
+        // Session mode rediscovers its private bus before acting and has
+        // no pointer/keyboard device to fall back to for editable text.
+        let session = LinuxPlatformAdapter::for_session(Some(sock), "ax-fixture".into());
+        let SessionCapture::Native(tree) = session
+            .capture_session(TreeOptions::default(), None, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("fixture did not return a native accessibility snapshot");
+        };
+        let target = NodeRef::parse(&tree.roots[0].children[0].qualified_ref).unwrap();
+        session
+            .act(DesktopAction::SetValue {
+                target,
+                value: "session text".into(),
+            })
+            .await
+            .unwrap();
+
         assert_eq!(
             *received_actions.lock().unwrap(),
             vec![
                 "DoAction:/btn/1",
                 "GrabFocus:/btn/1",
-                "SetTextContents:/btn/1",
+                "SetTextContents:/btn/1:ok",
+                "SetTextContents:/btn/1:session text",
             ]
         );
         server.abort();

@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(target_os = "linux", test))]
 use crate::error::{Error, Result};
 
 /// A captured desktop frame, RGBA8, top row first.
