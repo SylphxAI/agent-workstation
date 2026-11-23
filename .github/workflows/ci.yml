@@ -3,10 +3,7 @@ name: ci
 # Format, clippy, docs, unit tests and a headful integration test on a
 # headless Wayland desktop (sway + wayvnc + Chrome).
 #
-# GitHub-hosted standard runners are free only on a public repository, so
-# every job carries `github.event.repository.private == false`: a private copy
-# of this repository runs no hosted minute. `runs-on` names hosted labels only,
-# so fork pull requests never reach a self-hosted runner.
+# Build, test, and gate jobs use standard hosted runners only on public repositories.
 #
 # `ci-ok` is the one required check; it runs no repository code.
 
@@ -31,8 +28,23 @@ env:
   CARGO_INCREMENTAL: '0'
 
 jobs:
+  changes:
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: SylphxAI/.github/.github/workflows/changes.yml@6e0fab5388f5ae44afdd17abb2ec6c9b26f80b0e
+    with:
+      runner: ubuntu-latest
+
+  shared-baseline:
+    needs: changes
+    if: github.event.repository.visibility == 'public' || needs.changes.outputs.migrations != 'false'
+    uses: SylphxAI/.github/.github/workflows/shared-baseline-check.yml@6e0fab5388f5ae44afdd17abb2ec6c9b26f80b0e
+    with:
+      migrations: ${{ needs.changes.outputs.migrations }}
+
   lint:
-    if: github.event.repository.private == false
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -59,7 +71,7 @@ jobs:
         run: cargo doc --no-deps --all-features --locked
 
   test:
-    if: github.event.repository.private == false
+    if: github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -81,7 +93,7 @@ jobs:
         run: cargo test --all-features --locked --tests -- --nocapture --test-threads=1
 
   macos:
-    if: github.event.repository.private == false
+    if: github.event.repository.visibility == 'public'
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -100,7 +112,7 @@ jobs:
         run: cargo test --all-features --locked
 
   windows:
-    if: github.event.repository.private == false
+    if: github.event.repository.visibility == 'public'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -119,8 +131,8 @@ jobs:
         run: cargo test --all-features --locked
 
   ci-ok:
-    if: always() && github.event.repository.private == false
-    needs: [lint, test, macos, windows]
+    if: always() && github.event.repository.visibility == 'public'
+    needs: [lint, test, macos, windows, shared-baseline]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
