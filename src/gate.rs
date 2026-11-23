@@ -225,7 +225,6 @@ impl ControlGate {
     }
     /// Run a short commit while the same human control cycle is still active.
     /// Never keep this lock across a round trip or data transfer.
-    #[cfg(target_os = "linux")]
     pub(crate) fn with_human_control<T>(
         &self,
         expected: DateTime<Utc>,

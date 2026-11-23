@@ -10,7 +10,7 @@
 //! token is the authentication.
 //!
 //! Endpoints (relative to the page URL): `ws` (binary RFB), `state` (JSON),
-//! `events` (server-sent `state` events), `take` and `release` (POST,
+//! `events` (server-sent state and optional input events), `take` and `release` (POST,
 //! `{"note": "..."}` of at most [`MAX_NOTE_CHARS`] characters). A Wayland-backed
 //! session also serves `clipboard?since=<control start>` (UTF-8 paste via POST,
 //! selection changes via SSE), restricted to the current human control cycle.
@@ -55,6 +55,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixStream;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use url::Url;
 
 use crate::error::{Error, Result};
@@ -163,6 +164,45 @@ impl TakeoverStatus {
     }
 }
 
+/// Hint for a viewer's virtual keyboard layout. Never contains field text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputPurpose {
+    /// Default keyboard.
+    #[default]
+    Text,
+    /// Email address.
+    Email,
+    /// Web address.
+    Url,
+    /// Search query.
+    Search,
+    /// Decimal number.
+    Decimal,
+}
+
+/// Geometry and focus only; no field names, contents or text selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InputContext {
+    /// An editable control currently has remote keyboard focus.
+    pub active: bool,
+    /// Keyboard layout hint for the focused control.
+    pub purpose: InputPurpose,
+    /// Visible editable bounds as `[x, y, width, height]` in framebuffer pixels.
+    pub rects: Vec<[i32; 4]>,
+}
+
+/// Optional read-only snapshot provider. A missing or timed-out result becomes
+/// an empty snapshot. Futures can be dropped on hand-back or disconnect; do
+/// not spawn detached work here.
+pub type InputContextSource =
+    Arc<dyn Fn() -> futures::future::BoxFuture<'static, Option<InputContext>> + Send + Sync>;
+
+pub(crate) const MAX_EDITABLE_RECTS: usize = 128;
+const INPUT_DEBOUNCE: Duration = Duration::from_millis(180);
+const INPUT_POLL: Duration = Duration::from_millis(800);
+const INPUT_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// A running takeover server. Dropping it stops the server too.
 pub struct Takeover {
     addr: Option<SocketAddr>,
@@ -214,11 +254,19 @@ struct Shared {
     wayland: Option<PathBuf>,
     gate: Arc<ControlGate>,
     stop: watch::Receiver<bool>,
+    input_context: Option<InputContextSource>,
+    input_activity: watch::Sender<Option<Instant>>,
     // Serialize revocation with control changes from already admitted requests.
     control: std::sync::Mutex<()>,
 }
 
 impl Shared {
+    fn note_input_activity(&self) {
+        if self.input_activity.receiver_count() != 0 {
+            self.input_activity.send_replace(Some(Instant::now()));
+        }
+    }
+
     fn is_stopped(&self) -> bool {
         *self.stop.borrow() || self.stop.has_changed().is_err()
     }
@@ -235,7 +283,20 @@ impl Takeover {
         vnc_socket: PathBuf,
         gate: Arc<ControlGate>,
     ) -> Result<Takeover> {
-        Self::start_with_liveness(config, vnc_socket, gate, Arc::default(), None).await
+        Self::start_with_liveness(config, vnc_socket, gate, Arc::default(), None, None).await
+    }
+
+    /// Start with editable target and focus metadata on the authenticated
+    /// events stream. The provider is only called while a human viewer holds
+    /// control; a viewer joining mid-cycle gets its own initial snapshot.
+    pub async fn start_with_input_context(
+        config: TakeoverConfig,
+        vnc_socket: PathBuf,
+        gate: Arc<ControlGate>,
+        source: InputContextSource,
+    ) -> Result<Takeover> {
+        Self::start_with_liveness(config, vnc_socket, gate, Arc::default(), None, Some(source))
+            .await
     }
 
     pub(crate) async fn start_with_liveness(
@@ -244,6 +305,7 @@ impl Takeover {
         gate: Arc<ControlGate>,
         browser_exited: Arc<std::sync::atomic::AtomicBool>,
         #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] wayland: Option<PathBuf>,
+        input_context: Option<InputContextSource>,
     ) -> Result<Takeover> {
         let token = match config.token {
             Some(t) if t.is_empty() => {
@@ -278,6 +340,8 @@ impl Takeover {
             wayland,
             gate,
             stop: stop_rx.clone(),
+            input_context,
+            input_activity: watch::channel(None).0,
             control: std::sync::Mutex::new(()),
         });
         let app = Router::new()
@@ -549,13 +613,17 @@ async fn asset(uri: Uri) -> Response {
 }
 
 /// The holder as JSON, plus a key that changes whenever a client should hear.
-fn snapshot(shared: &Shared) -> (serde_json::Value, String) {
+fn snapshot(shared: &Shared) -> (serde_json::Value, String, Option<DateTime<Utc>>) {
     let gate = &shared.gate;
     let running = !shared
         .browser_exited
         .load(std::sync::atomic::Ordering::Acquire);
-    let (mut json, key) = match gate.holder() {
-        Holder::Agent => (serde_json::json!({ "holder": "agent" }), "agent".into()),
+    let (mut json, key, since) = match gate.holder() {
+        Holder::Agent => (
+            serde_json::json!({ "holder": "agent" }),
+            "agent".into(),
+            None,
+        ),
         Holder::Human {
             since,
             principal,
@@ -569,7 +637,7 @@ fn snapshot(shared: &Shared) -> (serde_json::Value, String) {
                 "holder": "human", "since": since, "principal": principal,
                 "idle_timeout_ms": timeout.map(millis), "idle_remaining_ms": remaining,
             });
-            (json, format!("human {since} {last_input}"))
+            (json, format!("human {since} {last_input}"), Some(since))
         }
     };
     json["browser_running"] = running.into();
@@ -577,7 +645,7 @@ fn snapshot(shared: &Shared) -> (serde_json::Value, String) {
     if shared.wayland.is_some() {
         json["wayland_clipboard"] = true.into();
     }
-    (json, format!("{key} browser={running}"))
+    (json, format!("{key} browser={running}"), since)
 }
 
 async fn state(State(s): State<Arc<Shared>>) -> Json<serde_json::Value> {
@@ -590,6 +658,7 @@ async fn take(State(s): State<Arc<Shared>>) -> Response {
         return StatusCode::GONE.into_response();
     }
     s.gate.take(None);
+    s.note_input_activity();
     Json(snapshot(&s).0).into_response()
 }
 
@@ -627,25 +696,143 @@ async fn release(State(s): State<Arc<Shared>>, body: Bytes) -> Response {
     Json(snapshot(&s).0).into_response()
 }
 
+// Keep probe state in the response body; dropping the viewer cancels its work.
+struct ViewerEvents {
+    shared: Arc<Shared>,
+    holder: watch::Receiver<Holder>,
+    stop: watch::Receiver<bool>,
+    activity: Option<watch::Receiver<Option<Instant>>>,
+    last_state: Option<String>,
+    last_input: Option<InputContext>,
+    since: Option<DateTime<Utc>>,
+    next_state: Instant,
+    next_input: Instant,
+    debounce_at: Option<Instant>,
+}
+
+impl ViewerEvents {
+    fn new(shared: Arc<Shared>) -> Self {
+        Self {
+            holder: shared.gate.subscribe(),
+            stop: shared.stop.clone(),
+            shared,
+            last_state: None,
+            last_input: None,
+            since: None,
+            activity: None,
+            next_state: Instant::now(),
+            next_input: Instant::now(),
+            debounce_at: None,
+        }
+    }
+
+    async fn next(&mut self) -> Option<Event> {
+        loop {
+            let s = &self.shared;
+            if s.is_stopped() {
+                return None;
+            }
+            let now = Instant::now();
+            if now >= self.next_state || self.holder.has_changed().ok()? {
+                self.holder.borrow_and_update();
+                // snapshot() also drives idle expiry. The same snapshot is the
+                // authority for both the state event and its input cycle.
+                let (data, key, since) = snapshot(s);
+                if since != self.since {
+                    self.since = since;
+                    self.activity = (since.is_some() && s.input_context.is_some())
+                        .then(|| s.input_activity.subscribe());
+                    self.last_input = None;
+                    self.next_input = now;
+                    self.debounce_at = None;
+                }
+                self.next_state = now + Duration::from_secs(1);
+                if self.last_state.as_ref() != Some(&key) {
+                    self.last_state = Some(key);
+                    return Some(Event::default().event("state").data(data.to_string()));
+                }
+            }
+
+            let mut wake = self.next_state;
+            if let (Some(since), Some(activity), Some(source)) =
+                (self.since, &mut self.activity, &s.input_context)
+            {
+                if activity.has_changed().ok()? {
+                    self.debounce_at = activity.borrow_and_update().map(|at| at + INPUT_DEBOUNCE);
+                }
+                let due = self
+                    .debounce_at
+                    .map_or(self.next_input, |at| at.min(self.next_input));
+                if now >= due {
+                    if s.gate.with_human_control(since, false, || Ok(())).is_err() {
+                        self.next_state = now;
+                        continue;
+                    }
+                    let mut context = tokio::select! {
+                        biased;
+                        _ = stopped(&mut self.stop) => return None,
+                        _ = self.holder.changed() => { self.next_state = now; continue; }
+                        r = tokio::time::timeout(INPUT_TIMEOUT, async { source().await }) =>
+                            r.ok().flatten().unwrap_or_default(),
+                    };
+                    self.next_input = Instant::now() + INPUT_POLL;
+                    self.debounce_at = None;
+                    context.rects.retain(|[_, _, w, h]| *w > 0 && *h > 0);
+                    context.rects.truncate(MAX_EDITABLE_RECTS);
+                    if !context.active {
+                        context.purpose = InputPurpose::Text;
+                    }
+                    if self.last_input.as_ref() != Some(&context) {
+                        let event = Event::default()
+                            .event("input")
+                            .json_data(InputUpdate {
+                                since,
+                                context: &context,
+                            })
+                            .expect("serializable input metadata");
+                        let _control = s.control.lock().unwrap_or_else(|p| p.into_inner());
+                        if !s.is_stopped()
+                            && s.gate.with_human_control(since, false, || Ok(())).is_ok()
+                        {
+                            self.last_input = Some(context);
+                            return Some(event);
+                        }
+                    }
+                    continue;
+                }
+                wake = wake.min(due);
+            }
+            tokio::select! {
+                biased;
+                _ = stopped(&mut self.stop) => return None,
+                r = self.holder.changed() => { r.ok()?; self.next_state = now; }
+                _ = async {
+                    if let Some(activity) = &mut self.activity {
+                        if activity.changed().await.is_ok() {
+                            self.debounce_at = activity.borrow_and_update().map(|at| at + INPUT_DEBOUNCE);
+                        }
+                    } else {
+                        std::future::pending().await
+                    }
+                } => {}
+                _ = tokio::time::sleep_until(wake) => {}
+            }
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct InputUpdate<'a> {
+    since: DateTime<Utc>,
+    #[serde(flatten)]
+    context: &'a InputContext,
+}
+
 async fn events(
     State(s): State<Arc<Shared>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let init = (s.gate.subscribe(), s.stop.clone(), None::<String>, s);
-    let stream = futures::stream::unfold(init, |(mut rx, mut stop, last, s)| async move {
-        loop {
-            rx.borrow_and_update();
-            // `holder()` also expires an idle person, so polling drives the idle hand-back.
-            let (json, key) = snapshot(&s);
-            if last.as_ref() != Some(&key) {
-                let event = Event::default().event("state").data(json.to_string());
-                return Some((Ok(event), (rx, stop, Some(key), s)));
-            }
-            tokio::select! {
-                _ = stopped(&mut stop) => return None,
-                _ = rx.changed() => {}
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-            }
-        }
+    let stream = futures::stream::unfold(ViewerEvents::new(s), |mut state| async move {
+        state.next().await.map(|event| (Ok(event), state))
     });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
@@ -809,6 +996,9 @@ async fn bridge_until_disconnected(socket: WebSocket, s: &Shared) {
                         }
                         if !out.is_empty() && vnc_tx.write_all(&out).await.is_err() {
                             break;
+                        }
+                        if inputs > 0 {
+                            s.note_input_activity();
                         }
                     }
                     Err(e) => {
@@ -1012,6 +1202,141 @@ mod tests {
         assert_eq!(f.pointer, Some((10, 20)));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn editable_events_are_authenticated_cycle_scoped_bounded_and_deduplicated() {
+        use http_body_util::BodyExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt as _;
+
+        let gate = ControlGate::with_human_idle_timeout(None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let source: InputContextSource = {
+            let calls = calls.clone();
+            Arc::new(move || {
+                let call = calls.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async move {
+                    match call {
+                        0 | 1 => Some(InputContext {
+                            active: true,
+                            purpose: InputPurpose::Email,
+                            rects: [[0, 0, 0, 1]]
+                                .into_iter()
+                                .chain((0..200).map(|x| [x, 12, 22, 32]))
+                                .collect(),
+                        }),
+                        2 => None,
+                        _ => std::future::pending().await,
+                    }
+                })
+            })
+        };
+        let takeover = Takeover::start_with_input_context(
+            TakeoverConfig {
+                bind: None,
+                public_url: Some(Url::parse("https://desk.example/").unwrap()),
+                token: Some("test-token".into()),
+            },
+            PathBuf::from("unused.sock"),
+            gate.clone(),
+            source,
+        )
+        .await
+        .unwrap();
+        let request = |path, method| {
+            takeover.router().oneshot(
+                Request::builder()
+                    .uri(path)
+                    .method(method)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+        };
+        let take = || request("/take?token=test-token", "POST");
+        let release = || request("/release?token=test-token", "POST");
+        assert_eq!(
+            request("/events", "GET").await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(take().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(
+            request("/events?token=wrong", "GET")
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "no authenticated viewer");
+        assert_eq!(release().await.unwrap().status(), StatusCode::OK);
+
+        let response = request("/events?token=test-token", "GET").await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        assert_eq!(event_data(&mut body, "state").await["holder"], "agent");
+        assert!(futures::poll!(Box::pin(body.frame())).is_pending());
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "agent holds control");
+
+        assert_eq!(take().await.unwrap().status(), StatusCode::OK);
+        let human = event_data(&mut body, "state").await;
+        assert_eq!(human["holder"], "human");
+        let input = event_data(&mut body, "input").await;
+        assert_eq!(input["since"], human["since"]);
+        assert_eq!(input["active"], true);
+        assert_eq!(input["purpose"], "email");
+        assert_eq!(input["rects"].as_array().unwrap().len(), MAX_EDITABLE_RECTS);
+        assert_eq!(input["rects"][0], serde_json::json!([0, 12, 22, 32]));
+        assert_eq!(
+            input.as_object().unwrap().len(),
+            4,
+            "geometry/focus/cycle only"
+        );
+
+        takeover.shared.note_input_activity();
+        assert!(futures::poll!(Box::pin(body.frame())).is_pending());
+        tokio::time::advance(INPUT_DEBOUNCE).await;
+        assert!(
+            futures::poll!(Box::pin(body.frame())).is_pending(),
+            "unchanged input must not stream again"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        let empty = event_data(&mut body, "input").await;
+        assert_eq!(
+            empty,
+            serde_json::json!({
+                "since": human["since"], "active": false, "purpose": "text", "rects": []
+            })
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+
+        // Hand-back while a provider is suspended cancels it and emits no input.
+        tokio::time::advance(INPUT_POLL).await;
+        assert!(futures::poll!(Box::pin(body.frame())).is_pending());
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+        assert_eq!(release().await.unwrap().status(), StatusCode::OK);
+        assert_eq!(event_data(&mut body, "state").await["holder"], "agent");
+        assert!(futures::poll!(Box::pin(body.frame())).is_pending());
+        assert_eq!(calls.load(Ordering::Relaxed), 4);
+
+        // A new cycle receives a baseline even when the source times out.
+        assert_eq!(take().await.unwrap().status(), StatusCode::OK);
+        let new = event_data(&mut body, "state").await;
+        assert_ne!(new["since"], human["since"]);
+        let timed_out = event_data(&mut body, "input").await;
+        assert_eq!(timed_out["since"], new["since"]);
+        assert_eq!(timed_out["rects"], serde_json::json!([]));
+        drop(body);
+        assert_eq!(takeover.shared.input_activity.receiver_count(), 0);
+    }
+
+    async fn event_data(body: &mut Body, name: &str) -> serde_json::Value {
+        use http_body_util::BodyExt as _;
+        let data = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        let text = std::str::from_utf8(&data).unwrap();
+        let mut lines = text.lines();
+        assert_eq!(lines.next().unwrap(), format!("event: {name}"));
+        serde_json::from_str(lines.next().unwrap().strip_prefix("data: ").unwrap()).unwrap()
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn clipboard_requires_auth_origin_and_current_human_cycle() {
@@ -1028,6 +1353,7 @@ mod tests {
             gate.clone(),
             Arc::default(),
             Some(dir.path().join("nonexistent-wayland.sock")),
+            None,
         )
         .await
         .unwrap();

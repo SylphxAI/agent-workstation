@@ -377,6 +377,7 @@ impl DesktopSession {
             self.gate.clone(),
             self.browser_exited.clone(),
             Some(socket),
+            None,
         )
         .await;
         match page {
