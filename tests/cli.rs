@@ -625,6 +625,7 @@ async fn compact_cli_exercises_all_subcommands_against_daemon_wire_protocol() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn headful_compact_cli_drives_real_daemon_session() {
+    use agent_workstation::platform::{DesktopNode, DesktopTree};
     use std::path::Path;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command as AsyncCommand;
@@ -797,22 +798,119 @@ async fn headful_compact_cli_drives_real_daemon_session() {
     assert!(shot.status.success());
     assert!(Path::new(&shot_path).metadata().unwrap().len() > 100);
 
-    // Desktop windows + snapshot + focus on live sway compositor
-    let dsnap = exec(vec!["desktop".into(), "snapshot".into()]).await;
-    assert!(
-        dsnap.status.success(),
-        "{}",
-        String::from_utf8_lossy(&dsnap.stderr)
-    );
-    let dsnap_text = String::from_utf8(dsnap.stdout).unwrap();
-    assert!(dsnap_text.contains("[@e1]"), "{dsnap_text}");
+    // The default daemon path must address the fixture's actual accessibility controls.
+    let desktop = |args: &[&str]| {
+        let mut cmd = vec!["--json".into(), "desktop".into()];
+        cmd.extend(args.iter().map(|arg| (*arg).to_owned()));
+        exec(cmd)
+    };
+    let decode = |out: std::process::Output| -> serde_json::Value {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    fn control_ref<'a>(nodes: &'a [DesktopNode], name: &str, roles: &[&str]) -> Option<&'a str> {
+        nodes.iter().find_map(|node| {
+            if node.name == name && roles.contains(&node.role.as_str()) {
+                Some(node.qualified_ref.as_str())
+            } else {
+                control_ref(&node.children, name, roles)
+            }
+        })
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    let (go, email) = loop {
+        let snap = decode(desktop(&["snapshot", "--max-depth", "40", "--max-nodes", "400"]).await);
+        if snap["mode"] == "native_accessibility" {
+            let tree: DesktopTree = serde_json::from_value(snap.clone()).unwrap();
+            // AT-SPI role names differ between browser/AT-SPI versions.
+            if let (Some(go), Some(email)) = (
+                control_ref(&tree.roots, "Go", &["button", "push_button"]),
+                control_ref(&tree.roots, "Email", &["entry", "text", "text_field"]),
+            ) {
+                break (go.to_owned(), email.to_owned());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "missing fixture controls (mode {}, fallback {}): {}",
+                snap["mode"],
+                snap["fallback_reason"],
+                snap["text"].as_str().unwrap_or("<no tree>")
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    };
+    let focus = decode(desktop(&["focus", &email]).await);
+    assert_eq!(focus["mode"], "native_accessibility");
+    assert_eq!(focus["target"], email);
+    // Chromium exposes native focus but does not implement EditableText.SetTextContents.
+    let _ = decode(desktop(&["key", "ctrl+a"]).await);
+    let _ = decode(desktop(&["type", "native@example.test"]).await);
+    let _ = decode(desktop(&["click", &go]).await);
+    let result = exec(vec![
+        "eval".into(),
+        "document.getElementById('out').textContent".into(),
+    ])
+    .await;
+    assert!(String::from_utf8_lossy(&result.stdout).contains("done:native@example.test:"));
 
-    let dfocus = exec(vec!["desktop".into(), "focus".into(), "@e1".into()]).await;
-    assert!(
-        dfocus.status.success(),
-        "{}",
-        String::from_utf8_lossy(&dfocus.stderr)
+    // Keep another session alive to test that its first snapshot cannot rebind a foreign ref.
+    let first: Value = serde_json::from_slice(&std::fs::read(&session_file).unwrap()).unwrap();
+    let first_id = first["session_id"].as_str().unwrap();
+    let second = decode(
+        exec(vec![
+            "--json".into(),
+            "open".into(),
+            fixture_url,
+            "--new".into(),
+            "--profile-dir".into(),
+            dir.path().join("other-profile").display().to_string(),
+        ])
+        .await,
     );
+    let second_id = second["session"].as_str().unwrap();
+    assert_ne!(second_id, first_id);
+    let shallow = decode(desktop(&["snapshot", "--max-depth", "1", "--max-nodes", "1"]).await);
+    assert_eq!(shallow["mode"], "native_accessibility");
+    assert_eq!(shallow["truncated"], true);
+    assert_eq!(shallow["total_nodes"], 1);
+    let reject = |out: std::process::Output| {
+        assert!(!out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("stale-ref"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    reject(desktop(&["click", &go]).await);
+    reject(desktop(&["focus", "@e1"]).await);
+    let app = shallow["roots"][0]["qualified_ref"].as_str().unwrap();
+    let subtree = decode(desktop(&["snapshot", "--root", app, "--max-depth", "2"]).await);
+    assert_eq!(subtree["mode"], "native_accessibility");
+    assert!(subtree["total_nodes"].as_u64().unwrap() > 1);
+    reject(desktop(&["snapshot", "--root", app]).await);
+
+    // Remove discovery for only this session, leaving the other session and
+    // compositor live. A native ref must not rebind to a fallback window.
+    let bus = dir.path().join("state").join(second_id).join("dbus");
+    let hidden = bus.with_file_name("hidden-bus");
+    std::fs::rename(&bus, &hidden).unwrap();
+    let fallback = decode(desktop(&["snapshot"]).await);
+    assert_eq!(fallback["mode"], "compositor");
+    assert_eq!(fallback["fallback_reason"], "accessibility_unavailable");
+    let window = fallback["windows"][0]["ref"].as_str().unwrap();
+    assert!(window.starts_with("@win-"));
+    let old_native = subtree["roots"][0]["qualified_ref"].as_str().unwrap();
+    reject(desktop(&["click", old_native]).await);
+    let focused = decode(desktop(&["focus", window]).await);
+    assert_eq!(focused["mode"], "compositor");
+    std::fs::rename(&hidden, &bus).unwrap();
+    let _ = decode(exec(vec!["--json".into(), "close".into()]).await);
+    std::fs::write(&session_file, serde_json::to_vec(&first).unwrap()).unwrap();
 
     // Takeover start -> atomic close refused -> takeover end -> atomic close succeeds
     let t_start = exec(vec!["takeover".into(), "start".into()]).await;

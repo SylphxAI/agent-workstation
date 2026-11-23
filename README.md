@@ -134,10 +134,29 @@ agent-workstation fill-secret @e3 vault/item/password --expect-origin https://ex
 agent-workstation eval "document.title"
 agent-workstation screenshot ./page.png
 agent-workstation desktop snapshot
-agent-workstation desktop focus @e1
+agent-workstation desktop focus '@<snapshot>:e1'   # use the exact ref printed above
 agent-workstation takeover start
 agent-workstation close
 ```
+
+On Linux, `desktop snapshot` uses the session's private AT-SPI2 accessibility
+bus first. Run `agent-workstation --json desktop snapshot` to see the mode:
+
+- `native_accessibility`: use each node's `qualified_ref`. `desktop click` invokes
+  a control; `desktop focus` focuses it natively; `desktop set-value` replaces
+  text on controls that implement AT-SPI EditableText. For a control that supports
+  focus but not EditableText, focus it by ref, then use `desktop type`.
+  Pointer gestures (double-click, other buttons, modifiers) require explicit
+  coordinates or a compositor window ref, not a semantic ref.
+- `compositor`: the response includes a `fallback_reason`. Refs name mapped
+  windows only; clicking one targets the window center, never a control.
+
+Session refs include a session and snapshot generation. Copy the full ref and
+use it before taking another snapshot. If `truncated` is true, re-root the read
+with `desktop snapshot --root '<qualified-ref>'`; use `--offset` to skip
+immediate children at that root (or top-level entries without `--root`).
+A subtree snapshot also rotates refs: use the newly returned root ref to page
+further. `desktop --host` still targets the local OS, not the daemon session.
 
 Version-synced progressive-disclosure agent instructions are built into the binary
 and work offline:
@@ -230,7 +249,7 @@ For headless Linux sessions, install `sway`, `wayvnc`, and a Chromium-family
 browser with Wayland support:
 
 ```sh
-sudo apt-get install sway wayvnc chromium
+sudo apt-get install sway wayvnc chromium dbus at-spi2-core
 ```
 
 ## Profiles

@@ -120,6 +120,31 @@ impl BrowserConfig {
         cmd.envs(self.extra_env.iter().cloned())
             .envs(desktop_env.iter().cloned())
             .envs(fp.launch_env());
+        // Explicit session bus configuration wins over inherited or caller-provided
+        // discovery hints. An empty address disables host session-bus discovery.
+        if let Some((_, bus)) = desktop_env
+            .iter()
+            .find(|(key, _)| key == "DBUS_SESSION_BUS_ADDRESS")
+        {
+            for key in [
+                "AT_SPI_BUS_ADDRESS",
+                "DBUS_STARTER_ADDRESS",
+                "DBUS_STARTER_BUS_TYPE",
+                "NO_AT_BRIDGE",
+                "DISPLAY",
+            ] {
+                cmd.env_remove(key);
+            }
+            if !bus.is_empty() {
+                cmd.arg("--force-renderer-accessibility");
+                // Chromium gates its Linux ATK bridge separately from the renderer tree.
+                cmd.env("ACCESSIBILITY_ENABLED", "1");
+            } else {
+                // An explicit invalid address prevents libdbus autolaunch.
+                cmd.env("DBUS_SESSION_BUS_ADDRESS", "disabled:");
+                cmd.env("ACCESSIBILITY_ENABLED", "0");
+            }
+        }
         cmd
     }
 }
