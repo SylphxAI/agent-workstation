@@ -246,15 +246,21 @@ pub enum DesktopCommand {
 
     /// Capture a structured accessibility/window snapshot with `@eN` / `@<snap>:eN` refs.
     Snapshot {
-        /// Maximum accessibility tree depth (host adapter mode).
+        /// Maximum accessibility tree depth.
         #[arg(long)]
         max_depth: Option<usize>,
-        /// Maximum accessibility tree nodes (host adapter mode).
+        /// Maximum accessibility tree nodes.
         #[arg(long)]
         max_nodes: Option<usize>,
-        /// Optional target process id filter (host adapter mode).
+        /// Optional target process id filter.
         #[arg(long)]
         pid: Option<u32>,
+        /// Capture a subtree at a current qualified ref (session mode).
+        #[arg(long)]
+        root: Option<String>,
+        /// Skip this many immediate children, or top-level roots (session mode).
+        #[arg(long)]
+        offset: Option<usize>,
     },
 
     /// Click at desktop pixel coordinates (`<x> <y>`) or a desktop snapshot ref (`@e1`).

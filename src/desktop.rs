@@ -1,10 +1,12 @@
 //! Portable desktop frames, input descriptions and window snapshots.
 
+#[cfg(any(target_os = "linux", test))]
 use std::collections::HashMap;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(any(target_os = "linux", test))]
 use crate::error::{Error, Result};
 
 /// A captured desktop frame, RGBA8, top row first.
@@ -126,7 +128,7 @@ pub struct DesktopWindow {
 /// A window paired with its snapshot ref (`e1`, `e2`, ...).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopWindowRef {
-    /// Snapshot-local ref identifier (`e1`, `e2`, ...).
+    /// Ref identifier (snapshot-qualified in daemon sessions).
     #[serde(rename = "ref")]
     pub ref_id: String,
     /// Underlying window metadata.
@@ -134,13 +136,13 @@ pub struct DesktopWindowRef {
     pub window: DesktopWindow,
 }
 
-/// A structured snapshot of the desktop window tree with `@eN` refs.
+/// A structured snapshot of the desktop window tree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DesktopSnapshot {
     /// Snapshot id, unique within the session (`d1`, `d2`, ...).
     /// Qualified refs (`@<id>:e1`) name this snapshot explicitly.
     pub id: String,
-    /// Compact outline with `[@eN]` refs.
+    /// Compact outline with window refs.
     pub text: String,
     /// Mapped windows in deterministic ref order.
     pub windows: Vec<DesktopWindowRef>,
@@ -148,13 +150,65 @@ pub struct DesktopSnapshot {
     pub refs: usize,
 }
 
-/// Parsed desktop ref (`@e1`, `e1`, or `@d1:e1`).
+/// The source of a session desktop snapshot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SessionDesktopSnapshot {
+    /// Nodes and controls from the session's private native accessibility bus.
+    NativeAccessibility {
+        /// Bounded tree with fully qualified refs.
+        #[serde(flatten)]
+        tree: crate::platform::DesktopTree,
+    },
+    /// Only compositor windows are available; refs cannot name controls.
+    Compositor {
+        /// Why the native accessibility tree was not used.
+        fallback_reason: DesktopFallbackReason,
+        /// Window-only snapshot.
+        #[serde(flatten)]
+        snapshot: DesktopSnapshot,
+        /// Whether the window list has more results after this page.
+        truncated: bool,
+    },
+}
+
+/// Result of focusing a desktop target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DesktopFocus {
+    /// An accessible control accepted native focus.
+    NativeAccessibility {
+        /// Ref that received focus.
+        target: crate::platform::NodeRef,
+    },
+    /// A compositor window received focus.
+    Compositor {
+        /// Focused window.
+        window: DesktopWindow,
+    },
+}
+
+/// Machine-readable reason that a session desktop snapshot is window-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopFallbackReason {
+    /// No private session D-Bus or AT-SPI service was reachable.
+    AccessibilityUnavailable,
+    /// The accessibility registry has not published any accessible applications.
+    NoAccessibleApplications,
+    /// The native accessibility read exceeded its deadline.
+    AccessibilityTimeout,
+}
+
+/// Parsed desktop ref (`@e1`, `e1`, or a qualified ref).
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ParsedDesktopRef {
     pub snapshot: Option<String>,
     pub id: String,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl ParsedDesktopRef {
     pub(crate) fn parse(raw: &str) -> Result<Self> {
         let s = raw.trim();
@@ -189,23 +243,54 @@ impl ParsedDesktopRef {
     }
 }
 
-/// Tracks the latest desktop snapshot for a session and enforces `StaleRef`.
+/// Tracks the latest fallback snapshot for a session and enforces `StaleRef`.
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Default)]
 pub(crate) struct DesktopSnapshotStore {
     next_seq: u64,
+    scope: Option<String>,
     current_id: Option<String>,
     refs: HashMap<String, DesktopWindow>,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl DesktopSnapshotStore {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn scoped(scope: String) -> Self {
+        Self {
+            scope: Some(scope),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn clear(&mut self) {
+        self.current_id = None;
+        self.refs.clear();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn is_active(&self) -> bool {
+        self.current_id.is_some()
+    }
+
     pub(crate) fn record(&mut self, windows: Vec<DesktopWindow>) -> DesktopSnapshot {
         self.next_seq += 1;
-        let id = format!("d{}", self.next_seq);
+        let id = match &self.scope {
+            Some(scope) => format!("{scope}.{}", self.next_seq),
+            None => format!("d{}", self.next_seq),
+        };
         let mut lines = Vec::with_capacity(windows.len());
         let mut entries = Vec::with_capacity(windows.len());
         self.refs.clear();
         for (idx, window) in windows.into_iter().enumerate() {
             let ref_id = format!("e{}", idx + 1);
+            let (display_ref, public_ref) = if self.scope.is_some() {
+                let qualified = format!("@{id}:{ref_id}");
+                (qualified.clone(), qualified)
+            } else {
+                (format!("@{ref_id}"), ref_id.clone())
+            };
             let app = window
                 .app_id
                 .as_deref()
@@ -214,7 +299,7 @@ impl DesktopSnapshotStore {
             let focus = if window.focused { " focused" } else { "" };
             let title = window.name.replace('\n', " ");
             lines.push(format!(
-                "window {:?}{app} id={} rect={},{} {}x{}{focus} [@{ref_id}]",
+                "window {:?}{app} id={} rect={},{} {}x{}{focus} [{display_ref}]",
                 title,
                 window.id,
                 window.rect.x,
@@ -223,7 +308,10 @@ impl DesktopSnapshotStore {
                 window.rect.height,
             ));
             self.refs.insert(ref_id.clone(), window.clone());
-            entries.push(DesktopWindowRef { ref_id, window });
+            entries.push(DesktopWindowRef {
+                ref_id: public_ref,
+                window,
+            });
         }
         self.current_id = Some(id.clone());
         let refs = entries.len();
@@ -237,6 +325,11 @@ impl DesktopSnapshotStore {
 
     pub(crate) fn resolve(&self, raw: &str) -> Result<DesktopWindow> {
         let parsed = ParsedDesktopRef::parse(raw)?;
+        if self.scope.is_some() && parsed.snapshot.is_none() {
+            return Err(Error::StaleRef(
+                "a qualified desktop ref is required".into(),
+            ));
+        }
         let Some(current) = &self.current_id else {
             return Err(Error::StaleRef(format!(
                 "{raw} (no desktop snapshot taken yet)"

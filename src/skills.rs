@@ -115,17 +115,17 @@ pub fn render_topic(topic: SkillTopic) -> String {
              ## Commands\n\
              - Inspect native host adapter capabilities (AT-SPI2/Wayland, macOS AX, Windows UIA):\n\
                `agent-workstation desktop --host capabilities`\n\
-             - Snapshot desktop accessibility/window tree with `@eN` / `@<snap>:eN` refs:\n\
+             - Snapshot desktop accessibility first; use the full `@<snap>:eN` ref in sessions:\n\
                `agent-workstation desktop snapshot`\n\
                `agent-workstation desktop --host snapshot --max-depth 8 --max-nodes 200`\n\
              - List mapped windows or focus a window by id or ref:\n\
                `agent-workstation desktop windows`\n\
-               `agent-workstation desktop focus @e1`\n\
+               `agent-workstation desktop focus @<snap>:e1`\n\
              - Click, double-click, or set accessible values directly:\n\
                `agent-workstation desktop click 640 400 --button left`\n\
-               `agent-workstation desktop click @e1`\n\
-               `agent-workstation desktop double-click @e1`\n\
-               `agent-workstation desktop set-value @e2 \"updated\"`\n\
+               `agent-workstation desktop click @<snap>:e1`\n\
+               `agent-workstation desktop double-click @<snap>:e1` (window-only fallback)\n\
+               `agent-workstation desktop set-value @<snap>:e2 \"updated\"`\n\
              - Send keyboard chords, Unicode text, wheel scroll, or capture the full display:\n\
                `agent-workstation desktop key ctrl+l`\n\
                `agent-workstation desktop key Return --hold-ms 200`\n\

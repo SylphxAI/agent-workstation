@@ -230,7 +230,7 @@ pub struct DesktopTree {
     pub snapshot_id: String,
     /// Host platform label (`linux`, `macos`, `windows`, `mock`, ...).
     pub platform: String,
-    /// Whether traversal stopped early due to `max_depth` or `max_nodes`.
+    /// Whether nodes were omitted (limits, paging, or a partial backend read).
     pub truncated: bool,
     /// Total number of nodes included in this snapshot.
     pub total_nodes: usize,
@@ -301,7 +301,7 @@ impl DesktopTree {
         write_nodes(&self.roots, 0, &mut lines);
         if self.truncated {
             lines.push(format!(
-                "... [truncated at {} nodes / depth {}]",
+                "... [truncated; {} nodes, depth limit {}]",
                 self.total_nodes, self.max_depth
             ));
         }
@@ -493,6 +493,7 @@ pub struct RawNode<H> {
 #[derive(Debug)]
 pub struct SnapshotIndex<H> {
     next_seq: u64,
+    scope: Option<String>,
     current_id: Option<String>,
     entries: HashMap<String, (DesktopNode, H)>,
 }
@@ -501,6 +502,7 @@ impl<H> Default for SnapshotIndex<H> {
     fn default() -> Self {
         Self {
             next_seq: 0,
+            scope: None,
             current_id: None,
             entries: HashMap::new(),
         }
@@ -508,6 +510,20 @@ impl<H> Default for SnapshotIndex<H> {
 }
 
 impl<H> SnapshotIndex<H> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn scoped(scope: String) -> Self {
+        Self {
+            scope: Some(scope),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn clear(&mut self) {
+        self.current_id = None;
+        self.entries.clear();
+    }
+
     /// Materialize a new [`DesktopTree`] from `raw_roots`, rotating the active
     /// snapshot id so qualified refs from earlier snapshots fail with
     /// [`AdapterError::StaleRef`].
@@ -519,7 +535,10 @@ impl<H> SnapshotIndex<H> {
     ) -> DesktopTree {
         let (max_depth, max_nodes) = options.effective_bounds();
         self.next_seq += 1;
-        let snapshot_id = format!("p{}", self.next_seq);
+        let snapshot_id = match &self.scope {
+            Some(scope) => format!("{scope}.{}", self.next_seq),
+            None => format!("p{}", self.next_seq),
+        };
         self.entries.clear();
         struct BuildCtx<'a, H> {
             max_depth: usize,
@@ -615,6 +634,11 @@ impl<H> SnapshotIndex<H> {
         &self,
         target: &NodeRef,
     ) -> std::result::Result<(&DesktopNode, &H), AdapterError> {
+        if self.scope.is_some() && target.snapshot.is_none() {
+            return Err(AdapterError::StaleRef(
+                "a qualified desktop ref is required".into(),
+            ));
+        }
         let Some(current) = &self.current_id else {
             return Err(AdapterError::StaleRef(format!(
                 "{target} (no desktop accessibility snapshot taken yet)"

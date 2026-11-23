@@ -10,13 +10,23 @@ use tokio::sync::Mutex;
 use crate::browser::{Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web};
 #[cfg(target_os = "linux")]
 use crate::compositor::{self, Compositor};
-use crate::desktop::{DesktopSnapshot, DesktopSnapshotStore, DesktopWindow};
+#[cfg(target_os = "linux")]
+use crate::desktop::DesktopSnapshotStore;
+use crate::desktop::{DesktopFocus, DesktopWindow, SessionDesktopSnapshot};
 use crate::error::{Error, Result};
 use crate::fingerprint::{Fingerprint, FingerprintDefaults};
 use crate::gate::{ControlGate, HandBack, Lease};
+#[cfg(target_os = "linux")]
+use crate::platform::{
+    DesktopAction, NodeRef, PlatformAdapter,
+    linux::{LinuxPlatformAdapter, SessionCapture},
+};
+use crate::platform::{PlatformCapabilities, TreeOptions};
 use crate::profile::Profile;
 use crate::proxy::{Proxy, ProxyEndpoint};
 use crate::secret::SecretResolver;
+#[cfg(target_os = "linux")]
+use crate::session_bus::SessionBus;
 use crate::takeover::{Takeover, TakeoverConfig, TakeoverStatus};
 #[cfg(target_os = "linux")]
 use crate::vnc::Vnc;
@@ -73,6 +83,8 @@ struct Processes {
     browser: Option<Browser>,
     #[cfg(target_os = "linux")]
     compositor: Option<Compositor>,
+    #[cfg(target_os = "linux")]
+    session_bus: Option<SessionBus>,
     proxy: Option<ProxyEndpoint>,
 }
 
@@ -112,7 +124,12 @@ pub struct DesktopSession {
     #[cfg(target_os = "linux")]
     browser_exited: Arc<std::sync::atomic::AtomicBool>,
     processes: Arc<std::sync::Mutex<Processes>>,
+    #[cfg(target_os = "linux")]
     desktop_snap: std::sync::Mutex<DesktopSnapshotStore>,
+    #[cfg(target_os = "linux")]
+    accessibility: LinuxPlatformAdapter,
+    #[cfg(target_os = "linux")]
+    has_private_bus: bool,
     #[cfg(target_os = "linux")]
     socket: PathBuf,
     #[cfg(target_os = "linux")]
@@ -130,11 +147,17 @@ impl DesktopSession {
     pub async fn start(config: SessionConfig) -> Result<Self> {
         let fingerprint = config.profile.fingerprint(&config.fingerprint_defaults)?;
         fingerprint.validate()?;
+        let mut scope_bytes = [0u8; 16];
+        getrandom::fill(&mut scope_bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let scope = scope_bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
         let size = (fingerprint.screen_width, fingerprint.screen_height);
         let gate = ControlGate::with_human_idle_timeout(config.human_idle_timeout);
         let compositor =
             Compositor::start(&config.compositor, &config.runtime_dir, size.0, size.1).await?;
-        let env = compositor.client_env();
+        let mut env = compositor.client_env();
         let socket = compositor.socket_path();
         let ipc_socket = compositor.ipc_socket().to_path_buf();
         let proxy = match &config.proxy {
@@ -173,6 +196,20 @@ impl DesktopSession {
                 }
             }
         };
+        let session_bus = SessionBus::start(compositor.runtime_dir(), &env).await.ok();
+        let accessibility = LinuxPlatformAdapter::for_session(
+            session_bus.as_ref().map(|bus| bus.socket().to_path_buf()),
+            format!("ax-{scope}"),
+        );
+        env.push((
+            "DBUS_SESSION_BUS_ADDRESS".into(),
+            session_bus
+                .as_ref()
+                .map(|bus| bus.address())
+                .unwrap_or_default()
+                .into(),
+        ));
+        let has_private_bus = session_bus.is_some();
         let log = config.runtime_dir.join("browser.log");
         let browser = match Browser::launch(
             &config.browser,
@@ -206,6 +243,7 @@ impl DesktopSession {
         let processes = Arc::new(std::sync::Mutex::new(Processes {
             browser: Some(browser),
             compositor: Some(compositor),
+            session_bus,
             proxy,
         }));
         let browser_exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -235,7 +273,11 @@ impl DesktopSession {
             vnc_binary: config.vnc,
             browser_exited,
             processes,
-            desktop_snap: std::sync::Mutex::new(DesktopSnapshotStore::default()),
+            desktop_snap: std::sync::Mutex::new(DesktopSnapshotStore::scoped(format!(
+                "win-{scope}"
+            ))),
+            accessibility,
+            has_private_bus,
             socket,
             ipc_socket,
             input,
@@ -486,6 +528,10 @@ async fn stop_processes(mut p: Processes) {
         b.shutdown().await;
     }
     #[cfg(target_os = "linux")]
+    if let Some(bus) = p.session_bus.take() {
+        bus.shutdown().await;
+    }
+    #[cfg(target_os = "linux")]
     if let Some(c) = p.compositor.take() {
         c.shutdown().await;
     }
@@ -714,6 +760,10 @@ impl<'a> Agent<'a> {
     /// [`Input::KeyDown`] are released when the steps end.
     pub async fn input(&self, steps: Vec<Input>) -> Result<()> {
         let _web = self.web().await?;
+        self.input_under_gate(steps).await
+    }
+
+    async fn input_under_gate(&self, steps: Vec<Input>) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = steps;
@@ -848,89 +898,237 @@ impl<'a> Agent<'a> {
         }
     }
 
-    /// Structured snapshot of the desktop window tree with `@eN` refs.
-    ///
-    /// Taking a new snapshot invalidates qualified `@<prev>:eN` refs from
-    /// earlier desktop snapshots (`Error::StaleRef`).
-    pub async fn desktop_snapshot(&self) -> Result<DesktopSnapshot> {
-        let windows = self.desktop_windows().await?;
-        let mut store = self
-            .session
-            .desktop_snap
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        Ok(store.record(windows))
+    /// The session's desktop backend capabilities, not those of the daemon's host.
+    pub fn desktop_capabilities(&self) -> Result<PlatformCapabilities> {
+        self.session.check(&self.principal)?;
+        #[cfg(target_os = "linux")]
+        return Ok(PlatformCapabilities {
+            platform: "linux".into(),
+            backend: "linux-session-atspi2+wayland".into(),
+            // The snapshot reports actual availability and the reason for degradation.
+            accessibility_tree: self.session.has_private_bus,
+            native_actions: self.session.has_private_bus,
+            keyboard_injection: true,
+            pointer_injection: true,
+            window_enumeration: true,
+        });
+        #[cfg(not(target_os = "linux"))]
+        Err(Error::Unsupported("desktop sessions require Linux".into()))
     }
 
-    /// Focus a desktop window by numeric compositor id or `@eN` / `@<snap>:eN` ref.
-    pub async fn desktop_focus(&self, target: &str) -> Result<DesktopWindow> {
-        self.session.check(&self.principal)?;
-        let trimmed = target.trim();
-        let window_id = if trimmed.chars().all(|c| c.is_ascii_digit()) && !trimmed.is_empty() {
-            trimmed
-                .parse::<u64>()
-                .map_err(|e| Error::InvalidInput(format!("window id {trimmed:?}: {e}")))?
-        } else {
-            self.session
-                .desktop_snap
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .resolve(trimmed)?
-                .id
-        };
+    /// Snapshot the native accessibility tree, or a typed compositor window fallback.
+    pub async fn desktop_snapshot(&self) -> Result<SessionDesktopSnapshot> {
+        self.desktop_snapshot_with(TreeOptions::default(), None, 0)
+            .await
+    }
+
+    /// Capture a bounded tree, optionally re-rooted at a current qualified ref.
+    /// Offset skips immediate children of that root (or top-level applications).
+    /// A successful capture replaces all refs from the previous capture.
+    pub async fn desktop_snapshot_with(
+        &self,
+        options: TreeOptions,
+        root: Option<&str>,
+        offset: usize,
+    ) -> Result<SessionDesktopSnapshot> {
+        let _web = self.web().await?;
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = window_id;
-            Err(Error::Unsupported(
-                "desktop window focus requires Linux".into(),
-            ))
+            let _ = (options, root, offset);
+            Err(Error::Unsupported("desktop sessions require Linux".into()))
         }
         #[cfg(target_os = "linux")]
         {
-            compositor::focus_window(&self.session.ipc_socket, window_id).await?;
-            let windows = compositor::list_windows(&self.session.ipc_socket).await?;
-            self.session.check(&self.principal)?;
-            windows
-                .into_iter()
-                .find(|w| w.id == window_id)
-                .ok_or_else(|| Error::NotFound(format!("window {window_id}")))
+            let root = root.map(NodeRef::parse).transpose()?;
+            if root.is_some() && options.pid.is_some() {
+                return Err(Error::InvalidInput(
+                    "root and pid are mutually exclusive".into(),
+                ));
+            }
+            if root.is_none() {
+                self.window_refs().clear();
+            }
+            match self
+                .session
+                .accessibility
+                .capture_session(options, root, offset)
+                .await?
+            {
+                SessionCapture::Native(tree) => {
+                    Ok(SessionDesktopSnapshot::NativeAccessibility { tree })
+                }
+                SessionCapture::Degraded(fallback_reason) => {
+                    let windows = compositor::list_windows(&self.session.ipc_socket)
+                        .await?
+                        .into_iter()
+                        .filter(|w| options.pid.is_none_or(|pid| w.pid == Some(pid)))
+                        .collect::<Vec<_>>();
+                    let (_, limit) = options.effective_bounds();
+                    let truncated = windows.len() > offset.saturating_add(limit);
+                    let snapshot = self
+                        .window_refs()
+                        .record(windows.into_iter().skip(offset).take(limit).collect());
+                    Ok(SessionDesktopSnapshot::Compositor {
+                        fallback_reason,
+                        snapshot,
+                        truncated,
+                    })
+                }
+            }
         }
     }
 
-    /// Click the centre of a desktop snapshot ref (`@eN` or `@<snap>:eN`).
+    #[cfg(target_os = "linux")]
+    fn window_refs(&self) -> std::sync::MutexGuard<'_, DesktopSnapshotStore> {
+        self.session
+            .desktop_snap
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Focus a compositor window by numeric id or an accessible node by qualified ref.
+    pub async fn desktop_focus(&self, target: &str) -> Result<DesktopFocus> {
+        let _web = self.web().await?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = target;
+            Err(Error::Unsupported("desktop sessions require Linux".into()))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let target = target.trim();
+            let id = if !target.is_empty() && target.bytes().all(|c| c.is_ascii_digit()) {
+                target
+                    .parse::<u64>()
+                    .map_err(|e| Error::InvalidInput(format!("window id {target:?}: {e}")))?
+            } else if self.window_refs().is_active() {
+                self.window_refs().resolve(target)?.id
+            } else {
+                let target = NodeRef::parse(target)?;
+                self.session
+                    .accessibility
+                    .act(DesktopAction::Focus {
+                        target: target.clone(),
+                    })
+                    .await?;
+                return Ok(DesktopFocus::NativeAccessibility { target });
+            };
+            compositor::focus_window(&self.session.ipc_socket, id).await?;
+            let windows = compositor::list_windows(&self.session.ipc_socket).await?;
+            windows
+                .into_iter()
+                .find(|w| w.id == id)
+                .map(|window| DesktopFocus::Compositor { window })
+                .ok_or_else(|| Error::NotFound(format!("window {id}")))
+        }
+    }
+
+    /// Invoke a native accessibility control or explicitly click a fallback window.
     pub async fn desktop_click_ref(
         &self,
         target: &str,
         button: Button,
         modifiers: Option<&str>,
     ) -> Result<()> {
-        self.session.check(&self.principal)?;
-        let window = self
-            .session
-            .desktop_snap
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .resolve(target)?;
-        let (x, y) = window.rect.center();
-        let mut steps = Vec::new();
-        if let Some(m) = modifiers {
-            steps.push(Input::KeyDown(m.to_owned()));
+        self.click_desktop_ref(target, button, modifiers, false)
+            .await
+    }
+
+    /// Double-click a fallback window. Native accessibility refs support semantic invocation only.
+    pub async fn desktop_double_click_ref(&self, target: &str) -> Result<()> {
+        self.click_desktop_ref(target, Button::Left, None, true)
+            .await
+    }
+
+    async fn click_desktop_ref(
+        &self,
+        raw: &str,
+        button: Button,
+        modifiers: Option<&str>,
+        double: bool,
+    ) -> Result<()> {
+        let _web = self.web().await?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (raw, button, modifiers, double);
+            Err(Error::Unsupported("desktop sessions require Linux".into()))
         }
-        steps.extend([
-            Input::Move { x, y },
-            Input::Button {
-                button,
-                pressed: true,
-            },
-            Input::Button {
-                button,
-                pressed: false,
-            },
-        ]);
-        if let Some(m) = modifiers {
-            steps.push(Input::KeyUp(m.to_owned()));
+        #[cfg(target_os = "linux")]
+        {
+            if !self.window_refs().is_active() {
+                let target = NodeRef::parse(raw)?;
+                self.session.accessibility.validate_target(&target)?;
+                if double || button != Button::Left || modifiers.is_some() {
+                    return Err(Error::Unsupported(
+                        "accessibility refs support native invocation, not pointer gestures".into(),
+                    ));
+                }
+                self.session
+                    .accessibility
+                    .act(DesktopAction::Click {
+                        target,
+                        button: None,
+                    })
+                    .await?;
+                return Ok(());
+            }
+            let window = self.window_refs().resolve(raw)?;
+            // Re-read the active window; a closed window must not click its former coordinates.
+            let window = compositor::list_windows(&self.session.ipc_socket)
+                .await?
+                .into_iter()
+                .find(|w| w.id == window.id)
+                .ok_or_else(|| Error::StaleRef(format!("{raw}: window no longer exists")))?;
+            let (x, y) = window.rect.center();
+            let mut steps = vec![Input::Move { x, y }];
+            if let Some(m) = modifiers {
+                steps.push(Input::KeyDown(m.to_owned()));
+            }
+            let click = [
+                Input::Button {
+                    button,
+                    pressed: true,
+                },
+                Input::Button {
+                    button,
+                    pressed: false,
+                },
+            ];
+            steps.extend(click.clone());
+            if double {
+                steps.push(Input::Wait(Duration::from_millis(40)));
+                steps.extend(click);
+            }
+            if let Some(m) = modifiers {
+                steps.push(Input::KeyUp(m.to_owned()));
+            }
+            self.input_under_gate(steps).await
         }
-        self.input(steps).await
+    }
+
+    /// Replace text through the referenced node's native editable-text interface.
+    pub async fn desktop_set_value(&self, raw: &str, value: String) -> Result<()> {
+        let _web = self.web().await?;
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (raw, value);
+            Err(Error::Unsupported("desktop sessions require Linux".into()))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            if self.window_refs().is_active() {
+                self.window_refs().resolve(raw)?;
+                return Err(Error::Unsupported(
+                    "window refs cannot set accessible values".into(),
+                ));
+            }
+            let target = NodeRef::parse(raw)?;
+            Ok(self
+                .session
+                .accessibility
+                .act(DesktopAction::SetValue { target, value })
+                .await?)
+        }
     }
 }
 

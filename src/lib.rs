@@ -38,6 +38,8 @@ pub mod profile;
 pub mod proxy;
 mod secret;
 pub mod session;
+#[cfg(target_os = "linux")]
+mod session_bus;
 pub mod skills;
 pub mod takeover;
 #[cfg(target_os = "linux")]
@@ -47,7 +49,8 @@ pub mod wayland;
 
 pub use browser::{BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab};
 pub use desktop::{
-    Button, DesktopRect, DesktopSnapshot, DesktopWindow, DesktopWindowRef, Frame, Input,
+    Button, DesktopFallbackReason, DesktopFocus, DesktopRect, DesktopSnapshot, DesktopWindow,
+    DesktopWindowRef, Frame, Input, SessionDesktopSnapshot,
 };
 pub use error::{Error, Result};
 pub use fingerprint::{Fingerprint, FingerprintDefaults};

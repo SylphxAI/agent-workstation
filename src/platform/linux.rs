@@ -6,6 +6,7 @@
 //! (`wayland::InputDevice`) and `sway` IPC (`compositor`) integrations.
 
 use std::io::ErrorKind;
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -15,10 +16,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::compositor;
-use crate::desktop::{Button, DesktopRect, DesktopWindow, Input};
+use crate::desktop::{Button, DesktopFallbackReason, DesktopRect, DesktopWindow, Input};
 use crate::platform::{
-    AdapterError, DesktopAction, DesktopTree, PlatformAdapter, PlatformCapabilities, RawNode,
-    SnapshotIndex, TreeOptions, parse_chord,
+    AdapterError, DesktopAction, DesktopTree, NodeRef, PlatformAdapter, PlatformCapabilities,
+    RawNode, SnapshotIndex, TreeOptions, parse_chord,
 };
 use crate::wayland::InputDevice;
 
@@ -27,7 +28,7 @@ const MAX_DBUS_BODY: usize = 8 * 1024 * 1024;
 
 // AT-SPI2 state bit indices (org.a11y.atspi.StateType):
 // state_set is `au` (array of 32-bit bitmasks); index = bit / 32, mask = 1 << (bit % 32).
-const ATSPI_STATE_ENABLED: u32 = 7;
+const ATSPI_STATE_ENABLED: u32 = 8;
 const ATSPI_STATE_FOCUSED: u32 = 12;
 
 /// Handle stored in [`SnapshotIndex`] for each Linux accessibility node.
@@ -48,10 +49,23 @@ pub enum LinuxHandle {
 #[derive(Debug)]
 pub struct LinuxPlatformAdapter {
     atspi_socket: Option<PathBuf>,
+    session: Option<SessionAccessibility>,
     sway_socket: Option<PathBuf>,
     wayland_socket: Option<PathBuf>,
     wayland_size: (u32, u32),
     index: Mutex<SnapshotIndex<LinuxHandle>>,
+}
+
+#[derive(Debug)]
+struct SessionAccessibility {
+    bus: Option<PathBuf>,
+    // Unique names are only unique within a single bus lifetime.
+    guid: Mutex<Option<String>>,
+}
+
+pub(crate) enum SessionCapture {
+    Native(DesktopTree),
+    Degraded(DesktopFallbackReason),
 }
 
 impl Default for LinuxPlatformAdapter {
@@ -80,6 +94,7 @@ impl LinuxPlatformAdapter {
             });
         Self {
             atspi_socket,
+            session: None,
             sway_socket,
             wayland_socket,
             wayland_size: (1920, 1080),
@@ -96,6 +111,7 @@ impl LinuxPlatformAdapter {
     ) -> Self {
         Self {
             atspi_socket,
+            session: None,
             sway_socket,
             wayland_socket,
             wayland_size,
@@ -103,14 +119,144 @@ impl LinuxPlatformAdapter {
         }
     }
 
+    pub(crate) fn for_session(session_bus: Option<PathBuf>, scope: String) -> Self {
+        Self {
+            atspi_socket: None,
+            session: Some(SessionAccessibility {
+                bus: session_bus,
+                guid: Mutex::new(None),
+            }),
+            sway_socket: None,
+            wayland_socket: None,
+            wayland_size: (0, 0),
+            index: Mutex::new(SnapshotIndex::scoped(scope)),
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        self.index.lock().unwrap_or_else(|p| p.into_inner()).clear();
+    }
+
+    pub(crate) fn validate_target(&self, target: &NodeRef) -> Result<(), AdapterError> {
+        self.index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .resolve(target)?;
+        Ok(())
+    }
+
+    pub(crate) async fn capture_session(
+        &self,
+        options: TreeOptions,
+        root: Option<NodeRef>,
+        offset: usize,
+    ) -> Result<SessionCapture, crate::Error> {
+        let session = self
+            .session
+            .as_ref()
+            .expect("session accessibility adapter");
+        let selected = if let Some(target) = &root {
+            let index = self.index.lock().unwrap_or_else(|p| p.into_inner());
+            let (node, handle) = index.resolve(target)?;
+            Some((node.app_id.clone(), node.pid, handle.clone()))
+        } else {
+            None
+        };
+        self.clear();
+        let (depth, nodes) = options.effective_bounds();
+        let capture = async {
+            let mut conn = if let Some(target) = &root {
+                self.connect_for_action(target).await?
+            } else {
+                self.connect_atspi().await?
+            };
+            let mut walk = Walk::new(depth, nodes, true);
+            let roots = if let Some((app_id, pid, LinuxHandle::AtSpi { bus, path })) = selected {
+                walk_atspi_node(&mut conn, &bus, &path, app_id, pid, 1, offset, &mut walk)
+                    .await
+                    .into_iter()
+                    .collect()
+            } else {
+                walk_atspi_apps(&mut conn, options.pid, offset, &mut walk).await?
+            };
+            Ok::<_, AdapterError>((roots, walk.truncated, conn.guid))
+        };
+        let (roots, truncated, guid) = match tokio::time::timeout(DBUS_TIMEOUT, capture).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(err)) if root.is_some() => return Err(err.into()),
+            Ok(Err(_)) => {
+                return Ok(SessionCapture::Degraded(
+                    DesktopFallbackReason::AccessibilityUnavailable,
+                ));
+            }
+            Err(_) if root.is_some() => {
+                return Err(crate::Error::Timeout("accessibility subtree".into()));
+            }
+            Err(_) => {
+                return Ok(SessionCapture::Degraded(
+                    DesktopFallbackReason::AccessibilityTimeout,
+                ));
+            }
+        };
+        if roots.is_empty() && !truncated && root.is_none() && options.pid.is_none() && offset == 0
+        {
+            return Ok(SessionCapture::Degraded(
+                DesktopFallbackReason::NoAccessibleApplications,
+            ));
+        }
+        if roots.is_empty() && root.is_some() {
+            return Err(crate::Error::StaleRef(
+                "accessibility subtree no longer exists".into(),
+            ));
+        }
+        *session.guid.lock().unwrap_or_else(|p| p.into_inner()) = Some(guid);
+        let mut tree = self
+            .index
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .build("linux", roots, options);
+        tree.truncated |= truncated;
+        if truncated {
+            tree.text = tree.render_outline();
+        }
+        Ok(SessionCapture::Native(tree))
+    }
+
+    async fn connect_atspi(&self) -> Result<DbusConn, AdapterError> {
+        let path = self
+            .resolve_atspi_socket()
+            .await?
+            .ok_or_else(|| AdapterError::Backend("AT-SPI2 bus is not reachable".into()))?;
+        DbusConn::connect(&path).await
+    }
+
+    async fn connect_for_action(&self, target: &NodeRef) -> Result<DbusConn, AdapterError> {
+        let conn = self.connect_atspi().await?;
+        if let Some(session) = &self.session
+            && session
+                .guid
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_deref()
+                != Some(&conn.guid)
+        {
+            return Err(AdapterError::StaleRef(format!(
+                "{target}: accessibility bus was replaced"
+            )));
+        }
+        Ok(conn)
+    }
+
     async fn resolve_atspi_socket(&self) -> Result<Option<PathBuf>, AdapterError> {
         if let Some(path) = &self.atspi_socket {
             return Ok(Some(path.clone()));
         }
         // Query session D-Bus `org.a11y.Bus.GetAddress` when present.
-        if let Some(session_bus) = discover_session_bus_socket()
-            && session_bus.exists()
-        {
+        let session_bus = match &self.session {
+            Some(session) => session.bus.clone(),
+            None => discover_session_bus_socket(),
+        };
+        if let Some(session_bus) = session_bus {
             match DbusConn::connect(&session_bus).await {
                 Ok(mut conn) => {
                     if let Ok(addr) = conn
@@ -225,15 +371,15 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                     LinuxHandle::AtSpi { bus, path }
                         if button.unwrap_or(Button::Left) == Button::Left =>
                     {
-                        let bus_path = self.resolve_atspi_socket().await?.ok_or_else(|| {
-                            AdapterError::Backend("AT-SPI2 bus is no longer reachable".into())
-                        })?;
-                        let mut conn = DbusConn::connect(&bus_path).await?;
+                        let mut conn = self.connect_for_action(&target).await?;
                         let mut body = Vec::new();
                         encode_i32(&mut body, 0);
                         let ok = conn
                             .call_bool(&bus, &path, "org.a11y.atspi.Action", "DoAction", "i", &body)
                             .await;
+                        if self.session.is_some() {
+                            return native_action_result(ok, &target, "DoAction(0)");
+                        }
                         if ok.unwrap_or(false) {
                             return Ok(());
                         }
@@ -282,10 +428,7 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                 };
                 match handle {
                     LinuxHandle::AtSpi { bus, path } => {
-                        let bus_path = self.resolve_atspi_socket().await?.ok_or_else(|| {
-                            AdapterError::Backend("AT-SPI2 bus is no longer reachable".into())
-                        })?;
-                        let mut conn = DbusConn::connect(&bus_path).await?;
+                        let mut conn = self.connect_for_action(&target).await?;
                         let ok = conn
                             .call_bool(
                                 &bus,
@@ -295,8 +438,11 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                                 "",
                                 &[],
                             )
-                            .await?;
-                        if ok {
+                            .await;
+                        if self.session.is_some() {
+                            return native_action_result(ok, &target, "GrabFocus");
+                        }
+                        if ok? {
                             Ok(())
                         } else {
                             Err(AdapterError::UnsupportedAction(format!(
@@ -321,10 +467,7 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                 };
                 match handle {
                     LinuxHandle::AtSpi { bus, path } => {
-                        let bus_path = self.resolve_atspi_socket().await?.ok_or_else(|| {
-                            AdapterError::Backend("AT-SPI2 bus is no longer reachable".into())
-                        })?;
-                        let mut conn = DbusConn::connect(&bus_path).await?;
+                        let mut conn = self.connect_for_action(&target).await?;
                         let mut body = Vec::new();
                         encode_string(&mut body, &value);
                         let ok = conn
@@ -336,8 +479,11 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                                 "s",
                                 &body,
                             )
-                            .await?;
-                        if ok {
+                            .await;
+                        if self.session.is_some() {
+                            return native_action_result(ok, &target, "SetTextContents");
+                        }
+                        if ok? {
                             Ok(())
                         } else {
                             Err(AdapterError::UnsupportedAction(format!(
@@ -408,6 +554,20 @@ impl PlatformAdapter for LinuxPlatformAdapter {
     }
 }
 
+fn native_action_result(
+    result: Result<bool, AdapterError>,
+    target: &NodeRef,
+    method: &str,
+) -> Result<(), AdapterError> {
+    match result {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(AdapterError::UnsupportedAction(format!(
+            "{target} refused {method}"
+        ))),
+        Err(err) => Err(err),
+    }
+}
+
 fn click_steps(x: f64, y: f64, button: Button) -> Vec<Input> {
     vec![
         Input::Move { x, y },
@@ -463,7 +623,7 @@ fn discover_session_bus_socket() -> Option<PathBuf> {
         .filter(|p| p.exists())
 }
 
-/// Extract a filesystem Unix socket path from a D-Bus address such as
+/// Extract a filesystem or Linux abstract Unix socket path from a D-Bus address such as
 /// `unix:path=/run/user/1000/at-spi/bus_0,guid=...`.
 pub(crate) fn parse_unix_dbus_path(addr: &str) -> Option<PathBuf> {
     for entry in addr.split(';') {
@@ -471,17 +631,32 @@ pub(crate) fn parse_unix_dbus_path(addr: &str) -> Option<PathBuf> {
             continue;
         };
         for pair in rest.split(',') {
-            if let Some(raw_path) = pair.trim().strip_prefix("path=")
-                && !raw_path.is_empty()
-            {
-                return Some(PathBuf::from(percent_decode(raw_path)));
+            let Some((key, value)) = pair.trim().split_once('=') else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            match key {
+                "path" => {
+                    let path = percent_decode(value);
+                    if path.starts_with(b"/") && !path.contains(&0) {
+                        return Some(PathBuf::from(std::ffi::OsString::from_vec(path)));
+                    }
+                }
+                "abstract" => {
+                    let mut path = vec![0];
+                    path.extend(percent_decode(value));
+                    return Some(PathBuf::from(std::ffi::OsString::from_vec(path)));
+                }
+                _ => {}
             }
         }
     }
     None
 }
 
-fn percent_decode(s: &str) -> String {
+fn percent_decode(s: &str) -> Vec<u8> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -498,7 +673,7 @@ fn percent_decode(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }
 
 // ---- Minimal first-party pure-Rust D-Bus 1.0 Unix-socket wire client --------
@@ -506,6 +681,7 @@ fn percent_decode(s: &str) -> String {
 struct DbusConn {
     stream: UnixStream,
     next_serial: u32,
+    guid: String,
 }
 
 async fn read_crlf_line(stream: &mut UnixStream) -> Result<String, AdapterError> {
@@ -549,6 +725,7 @@ impl DbusConn {
         let mut conn = Self {
             stream,
             next_serial: 1,
+            guid: String::new(),
         };
         conn.authenticate().await?;
         // Register on the bus via org.freedesktop.DBus.Hello.
@@ -590,6 +767,7 @@ impl DbusConn {
                 line.trim()
             )));
         }
+        self.guid = line.trim()[3..].to_owned();
         self.stream
             .write_all(b"BEGIN\r\n")
             .await
@@ -625,6 +803,20 @@ impl DbusConn {
                                 .unwrap_or_else(|| reply.error_name.clone());
                             if reply.error_name.contains("AccessDenied") {
                                 Err(AdapterError::PermissionDenied(detail))
+                            } else if reply.error_name == "org.freedesktop.DBus.Error.UnknownMethod"
+                                || reply.error_name == "org.freedesktop.DBus.Error.UnknownInterface"
+                            {
+                                Err(AdapterError::UnsupportedAction(format!(
+                                    "{interface}.{member}: {detail}"
+                                )))
+                            } else if reply.error_name == "org.freedesktop.DBus.Error.UnknownObject"
+                                || (dest.starts_with(':')
+                                    && reply.error_name
+                                        == "org.freedesktop.DBus.Error.NameHasNoOwner")
+                            {
+                                Err(AdapterError::StaleRef(format!(
+                                    "accessible object no longer exists: {detail}"
+                                )))
                             } else {
                                 Err(AdapterError::Backend(format!(
                                     "{}: {detail}",
@@ -836,6 +1028,49 @@ async fn walk_atspi_root(
     max_nodes: usize,
     pid_filter: Option<u32>,
 ) -> Result<Vec<RawNode<LinuxHandle>>, AdapterError> {
+    walk_atspi_apps(
+        conn,
+        pid_filter,
+        0,
+        &mut Walk::new(max_depth, max_nodes.saturating_add(1), false),
+    )
+    .await
+}
+
+struct Walk {
+    depth: usize,
+    remaining: usize,
+    truncated: bool,
+    strict: bool,
+}
+
+impl Walk {
+    fn new(depth: usize, remaining: usize, strict: bool) -> Self {
+        Self {
+            depth,
+            remaining,
+            truncated: false,
+            strict,
+        }
+    }
+
+    fn take(&mut self) -> bool {
+        if self.remaining == 0 {
+            self.truncated = true;
+            false
+        } else {
+            self.remaining -= 1;
+            true
+        }
+    }
+}
+
+async fn walk_atspi_apps(
+    conn: &mut DbusConn,
+    pid_filter: Option<u32>,
+    offset: usize,
+    walk: &mut Walk,
+) -> Result<Vec<RawNode<LinuxHandle>>, AdapterError> {
     let root_bus = "org.a11y.atspi.Registry";
     let root_path = "/org/a11y/atspi/accessible/root";
     let app_count = conn
@@ -848,19 +1083,24 @@ async fn walk_atspi_root(
         .await?
         .max(0) as usize;
 
-    let mut budget = max_nodes.saturating_add(1);
+    walk.truncated |= offset > 0 && app_count > 0;
     let mut roots = Vec::new();
-    for idx in 0..app_count {
-        if budget == 0 {
+    for idx in offset..app_count {
+        if !walk.take() {
             break;
         }
         let Ok((app_bus, app_path)) = conn
             .get_child_at_index(root_bus, root_path, idx as i32)
             .await
         else {
+            walk.truncated = true;
             continue;
         };
-        if app_bus.is_empty() || app_path == "/org/a11y/atspi/null" {
+        if app_bus.is_empty()
+            || app_path == "/org/a11y/atspi/null"
+            || (walk.strict && !app_bus.starts_with(':'))
+        {
+            walk.truncated = true;
             continue;
         }
         let pid = conn
@@ -878,17 +1118,7 @@ async fn walk_atspi_root(
         if pid_filter.is_some() && pid != pid_filter {
             continue;
         }
-        if let Some(node) = walk_atspi_node(
-            conn,
-            &app_bus,
-            &app_path,
-            None,
-            pid,
-            1,
-            max_depth,
-            &mut budget,
-        )
-        .await
+        if let Some(node) = walk_atspi_node(conn, &app_bus, &app_path, None, pid, 1, 0, walk).await
         {
             roots.push(node);
         }
@@ -904,16 +1134,11 @@ fn walk_atspi_node<'a>(
     app_id: Option<String>,
     pid: Option<u32>,
     depth: usize,
-    max_depth: usize,
-    budget: &'a mut usize,
+    offset: usize,
+    walk: &'a mut Walk,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RawNode<LinuxHandle>>> + Send + 'a>>
 {
     Box::pin(async move {
-        if *budget == 0 {
-            return None;
-        }
-        *budget = budget.saturating_sub(1);
-
         let role = conn
             .call_string(
                 bus,
@@ -923,9 +1148,15 @@ fn walk_atspi_node<'a>(
                 "",
                 &[],
             )
-            .await
-            .unwrap_or_else(|_| "unknown".into())
-            .replace(' ', "_");
+            .await;
+        let role = match role {
+            Ok(role) => role.replace(' ', "_"),
+            Err(_) if walk.strict => {
+                walk.truncated = true;
+                return None;
+            }
+            Err(_) => "unknown".into(),
+        };
         let name = conn
             .get_string_prop(bus, path, "org.a11y.atspi.Accessible", "Name")
             .await
@@ -938,48 +1169,67 @@ fn walk_atspi_node<'a>(
         };
         let focused = has_state(&states, ATSPI_STATE_FOCUSED);
         let bounds = conn.get_extents(bus, path).await.ok().flatten();
+        let role = limit_snapshot_string(role, walk.strict);
+        let name = limit_snapshot_string(name, walk.strict);
         let effective_app =
             app_id.or_else(|| (role == "application" && !name.is_empty()).then(|| name.clone()));
 
         let mut children = Vec::new();
-        if depth <= max_depth && *budget > 0 {
-            let count = conn
-                .get_i32_prop(bus, path, "org.a11y.atspi.Accessible", "ChildCount")
-                .await
-                .unwrap_or(0)
-                .max(0) as usize;
-            for idx in 0..count {
-                if *budget == 0 {
+        let count = match conn
+            .get_i32_prop(bus, path, "org.a11y.atspi.Accessible", "ChildCount")
+            .await
+        {
+            Ok(count) => count.max(0) as usize,
+            Err(_) => {
+                walk.truncated = true;
+                0
+            }
+        };
+        walk.truncated |= offset > 0 && count > 0;
+        let can_descend = if walk.strict {
+            depth < walk.depth
+        } else {
+            depth <= walk.depth
+        };
+        if can_descend {
+            for idx in offset..count {
+                if !walk.take() {
                     break;
                 }
                 let Ok((child_bus, child_path)) =
                     conn.get_child_at_index(bus, path, idx as i32).await
                 else {
+                    walk.truncated = true;
                     continue;
                 };
-                if child_path == "/org/a11y/atspi/null" {
+                if child_path == "/org/a11y/atspi/null"
+                    || (walk.strict && !child_bus.is_empty() && !child_bus.starts_with(':'))
+                {
+                    walk.truncated = true;
                     continue;
                 }
                 let target_bus = if child_bus.is_empty() {
-                    bus.to_owned()
+                    bus
                 } else {
-                    child_bus
+                    &child_bus
                 };
                 if let Some(child) = walk_atspi_node(
                     conn,
-                    &target_bus,
+                    target_bus,
                     &child_path,
                     effective_app.clone(),
                     pid,
                     depth + 1,
-                    max_depth,
-                    budget,
+                    0,
+                    walk,
                 )
                 .await
                 {
                     children.push(child);
                 }
             }
+        } else if count > offset {
+            walk.truncated = true;
         }
 
         Some(RawNode {
@@ -999,6 +1249,16 @@ fn walk_atspi_node<'a>(
             children,
         })
     })
+}
+
+fn limit_snapshot_string(mut text: String, strict: bool) -> String {
+    if strict && text.len() > 1024 {
+        if let Some(end) = (0..=1024).rev().find(|&i| text.is_char_boundary(i)) {
+            text.truncate(end);
+        }
+        text.push('…');
+    }
+    text
 }
 
 fn has_state(words: &[u32], bit: u32) -> bool {

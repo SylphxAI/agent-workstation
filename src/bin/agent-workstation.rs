@@ -420,6 +420,7 @@ impl From<Error> for ApiError {
             Error::InvalidInput(_) => StatusCode::BAD_REQUEST,
             Error::NotFound(_) => StatusCode::NOT_FOUND,
             Error::Refused(_) => StatusCode::FORBIDDEN,
+            Error::Unsupported(_) => StatusCode::UNPROCESSABLE_ENTITY,
             Error::Starting { .. } | Error::Timeout(_) => StatusCode::SERVICE_UNAVAILABLE,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -700,7 +701,17 @@ enum Op {
         modifiers: Option<String>,
     },
     DesktopWindows,
-    DesktopSnapshot,
+    DesktopSnapshot {
+        max_depth: Option<usize>,
+        max_nodes: Option<usize>,
+        pid: Option<u32>,
+        root: Option<String>,
+        offset: Option<usize>,
+    },
+    DesktopSetValue {
+        r#ref: String,
+        value: String,
+    },
     DesktopCapabilities,
     DesktopFocus {
         target: String,
@@ -837,13 +848,35 @@ async fn call(
             json!({ "ok": s.input(steps).await? })
         }
         Op::DesktopWindows => json!({ "windows": s.desktop_windows().await? }),
-        Op::DesktopSnapshot => {
-            serde_json::to_value(s.desktop_snapshot().await?).map_err(|e| bad(e.to_string()))?
+        Op::DesktopSnapshot {
+            max_depth,
+            max_nodes,
+            pid,
+            root,
+            offset,
+        } => {
+            let defaults = TreeOptions::default();
+            let options = TreeOptions {
+                max_depth: max_depth.unwrap_or(defaults.max_depth),
+                max_nodes: max_nodes.unwrap_or(defaults.max_nodes),
+                pid,
+            };
+            serde_json::to_value(
+                s.desktop_snapshot_with(options, root.as_deref(), offset.unwrap_or(0))
+                    .await?,
+            )
+            .map_err(|e| bad(e.to_string()))?
         }
         Op::DesktopCapabilities => {
-            serde_json::to_value(native_adapter().capabilities()).map_err(|e| bad(e.to_string()))?
+            serde_json::to_value(s.desktop_capabilities()?).map_err(|e| bad(e.to_string()))?
         }
-        Op::DesktopFocus { target } => json!({ "window": s.desktop_focus(&target).await? }),
+        Op::DesktopFocus { target } => {
+            serde_json::to_value(s.desktop_focus(&target).await?).map_err(|e| bad(e.to_string()))?
+        }
+        Op::DesktopSetValue { r#ref, value } => {
+            s.desktop_set_value(&r#ref, value).await?;
+            json!({ "ok": true })
+        }
         Op::DesktopClickRef {
             r#ref,
             button,
@@ -854,9 +887,7 @@ async fn call(
             json!({ "ok": true })
         }
         Op::DesktopDoubleClickRef { r#ref } => {
-            s.desktop_click_ref(&r#ref, Button::Left, None).await?;
-            tokio::time::sleep(Duration::from_millis(40)).await;
-            s.desktop_click_ref(&r#ref, Button::Left, None).await?;
+            s.desktop_double_click_ref(&r#ref).await?;
             json!({ "ok": true })
         }
         Op::Key { chord } => json!({ "ok": s.key(&chord).await? }),
@@ -1430,9 +1461,15 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
                         );
                     }
                 }
-                DesktopCommand::Snapshot { .. } => {
+                DesktopCommand::Snapshot {
+                    max_depth,
+                    max_nodes,
+                    pid,
+                    root,
+                    offset,
+                } => {
                     let resp = client
-                        .call_op(&id, json!({ "op": "desktop_snapshot" }))
+                        .call_op(&id, json!({ "op": "desktop_snapshot", "max_depth": max_depth, "max_nodes": max_nodes, "pid": pid, "root": root, "offset": offset }))
                         .await?;
                     if as_json {
                         println!(
@@ -1440,10 +1477,27 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
                             serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
                         );
                     } else {
-                        let snap_id = resp["id"].as_str().unwrap_or("?");
-                        let refs = resp["refs"].as_u64().unwrap_or(0);
+                        let mode = resp["mode"].as_str().unwrap_or("unknown");
+                        let snap_id = resp["snapshot_id"]
+                            .as_str()
+                            .or_else(|| resp["id"].as_str())
+                            .unwrap_or("?");
+                        let refs = resp["total_nodes"]
+                            .as_u64()
+                            .or_else(|| resp["refs"].as_u64())
+                            .unwrap_or(0);
                         let text = resp["text"].as_str().unwrap_or("");
-                        println!("# desktop snapshot {snap_id} ({refs} refs)");
+                        println!("# desktop snapshot {snap_id} ({refs} refs, {mode})");
+                        if let Some(reason) = resp["fallback_reason"].as_str() {
+                            println!("# window-only fallback: {reason}");
+                            if resp["truncated"] == true {
+                                println!("# truncated: use --offset to see more windows");
+                            }
+                        } else if resp["truncated"] == true {
+                            println!(
+                                "# use --root with a current ref, or --offset to page siblings"
+                            );
+                        }
                         if !text.is_empty() {
                             println!("{text}");
                         }
@@ -1499,11 +1553,21 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
                         println!("ok");
                     }
                 }
-                DesktopCommand::SetValue { .. } => {
-                    return Err(
-                        "desktop set-value requires --host (or use 'fill <ref> <value>' for browser fields)"
-                            .into(),
-                    );
+                DesktopCommand::SetValue { target, value } => {
+                    let resp = client
+                        .call_op(
+                            &id,
+                            json!({ "op": "desktop_set_value", "ref": target, "value": value }),
+                        )
+                        .await?;
+                    if as_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
+                        );
+                    } else {
+                        println!("ok");
+                    }
                 }
                 DesktopCommand::Type { text } => {
                     let resp = client
@@ -1588,6 +1652,8 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
                             "{}",
                             serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())?
                         );
+                    } else if let Some(target) = resp["target"].as_str() {
+                        println!("focused {target}");
                     } else {
                         let wid = resp["window"]["id"].as_u64().unwrap_or(0);
                         let name = resp["window"]["name"].as_str().unwrap_or("");
@@ -1777,7 +1843,12 @@ async fn run_host_desktop(action: DesktopCommand, as_json: bool) -> Result<(), S
             max_depth,
             max_nodes,
             pid,
+            root,
+            offset,
         } => {
+            if root.is_some() || offset.is_some() {
+                return Err("--root and --offset are for daemon session snapshots".into());
+            }
             let defaults = TreeOptions::default();
             let opts = TreeOptions {
                 max_depth: max_depth.unwrap_or(defaults.max_depth),
