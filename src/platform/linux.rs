@@ -23,6 +23,8 @@ use crate::platform::{
 };
 use crate::wayland::InputDevice;
 
+mod editable;
+
 const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_DBUS_BODY: usize = 8 * 1024 * 1024;
 
@@ -984,8 +986,17 @@ impl DbusConn {
         dest: &str,
         path: &str,
     ) -> Result<Option<DesktopRect>, AdapterError> {
+        self.get_extents_in(dest, path, 0).await // ATSPI_COORD_TYPE_SCREEN
+    }
+
+    async fn get_extents_in(
+        &mut self,
+        dest: &str,
+        path: &str,
+        coordinates: u32,
+    ) -> Result<Option<DesktopRect>, AdapterError> {
         let mut body = Vec::new();
-        encode_u32(&mut body, 0); // ATSPI_COORD_TYPE_SCREEN
+        encode_u32(&mut body, coordinates);
         let (_, resp) = self
             .call_raw(
                 dest,
@@ -1551,6 +1562,172 @@ mod tests {
             }
         }
         Some((serial, path, member, body))
+    }
+
+    #[tokio::test]
+    async fn editable_context_uses_only_native_metadata_in_the_focused_process() {
+        use crate::takeover::InputPurpose;
+
+        fn words(bits: &[u32]) -> Vec<u8> {
+            let mut b = Vec::new();
+            encode_u32(&mut b, 8);
+            for index in 0..2 {
+                let word = bits
+                    .iter()
+                    .filter(|&&i| i / 32 == index)
+                    .fold(0, |w, i| w | (1 << (i % 32)));
+                encode_u32(&mut b, word);
+            }
+            b
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("atspi.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(async move {
+            // Same fake desktop each time; focus advances from web document
+            // to native chrome. The registry advertises a foreign app first.
+            for focus in ["/web_field", "/omnibox", "/other_app"] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert!(
+                    read_crlf_line(&mut stream)
+                        .await
+                        .unwrap()
+                        .starts_with("\0AUTH EXTERNAL")
+                );
+                stream.write_all(b"OK deadbeef\r\n").await.unwrap();
+                assert_eq!(read_crlf_line(&mut stream).await.unwrap(), "BEGIN\r\n");
+                let mut focus_reads = 0;
+                while let Some((serial, path, member, body)) = read_client_call(&mut stream).await {
+                    let (sig, response) = match member.as_str() {
+                        "Hello" => ("s", encoded_string(":1.42")),
+                        "GetConnectionUnixProcessID" => {
+                            let pid: u32 = match decode_string(&body, &mut 0).unwrap().as_str() {
+                                ":1.10" => 777,
+                                ":1.11" => 778,
+                                bus => panic!("unexpected application {bus}"),
+                            };
+                            ("u", pid.to_le_bytes().to_vec())
+                        }
+                        "GetChildren" => {
+                            let refs: &[(&str, &str)] = match path.as_str() {
+                                "/org/a11y/atspi/accessible/root" => {
+                                    &[(":1.11", "/other_app"), (":1.10", "/app")]
+                                }
+                                "/app" => &[(":1.10", "/frame"), (":1.10", "/popup")],
+                                "/frame" => &[
+                                    (":1.10", "/omnibox"),
+                                    (":1.10", "/document"),
+                                    (":1.10", "/readonly"),
+                                ],
+                                "/omnibox" | "/readonly" => &[],
+                                _ => panic!("should not traverse {path}"),
+                            };
+                            let mut b = vec![0; 8];
+                            for &(bus, path) in refs {
+                                pad_to(&mut b, 8);
+                                encode_string(&mut b, bus);
+                                encode_string(&mut b, path);
+                            }
+                            let len = (b.len() - 8) as u32;
+                            b[..4].copy_from_slice(&len.to_le_bytes());
+                            ("a(so)", b)
+                        }
+                        "GetRole" => {
+                            let role: u32 = match path.as_str() {
+                                "/frame" => 23,
+                                "/omnibox" | "/readonly" => 79,
+                                "/document" => 95,
+                                _ => panic!("should not request role for {path}"),
+                            };
+                            ("u", role.to_le_bytes().to_vec())
+                        }
+                        "GetState" => {
+                            let mut bits = vec![8, 24, 25, 30]; // enabled, sensitive, showing, visible
+                            match path.as_str() {
+                                "/document" | "/frame" | "/popup" => (),
+                                "/readonly" => bits.extend([7, 43]), // contradictory: read-only wins
+                                "/omnibox" => {
+                                    bits.extend([7, 26, 37]); // editable, single-line, autocompletion
+                                    focus_reads += 1;
+                                    if focus == path || (focus == "/other_app" && focus_reads == 1)
+                                    {
+                                        bits.push(12); // third connection loses focus before recheck
+                                    }
+                                }
+                                _ => panic!("should not request state for {path}"),
+                            }
+                            ("au", words(&bits))
+                        }
+                        "GetExtents" => {
+                            assert_eq!(decode_u32(&body, &mut 0), Some(1)); // WINDOW, not SCREEN
+                            let rect: [i32; 4] = match path.as_str() {
+                                "/frame" => [0, 0, 620, 420], // Chromium shadow
+                                "/popup" => [0, 0, 50, 50],   // not the compositor-focused window
+                                "/omnibox" => [32, 43, 200, 28],
+                                _ => panic!("unexpected geometry call for {path}"),
+                            };
+                            (
+                                "(iiii)",
+                                rect.into_iter().flat_map(i32::to_le_bytes).collect(),
+                            )
+                        }
+                        _ => panic!("forbidden or unexpected call to {member} at {path}"),
+                    };
+                    stream
+                        .write_all(&build_reply(serial, sig, &response))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let adapter = LinuxPlatformAdapter::with_sockets(Some(sock), None, None, (900, 700));
+        assert!(
+            adapter
+                .editable_context([100, 200, 600, 400], None, true)
+                .await
+                .is_none()
+        );
+        for active in [false, true, false] {
+            let result = adapter
+                .editable_context([100, 200, 600, 400], Some(777), true)
+                .await
+                .unwrap();
+            assert_eq!(result.active, active);
+            assert_eq!(
+                result.purpose,
+                if active {
+                    InputPurpose::Url
+                } else {
+                    InputPurpose::Text
+                }
+            );
+            assert_eq!(result.rects, vec![[122, 233, 200, 28]]);
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn editable_context_bounds_a_stalled_bus() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("atspi.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let adapter = LinuxPlatformAdapter::with_sockets(Some(sock), None, None, (900, 700));
+        let start = tokio::time::Instant::now();
+        let mut probe =
+            std::pin::pin!(adapter.editable_context([0, 0, 900, 700], Some(777), false));
+        let (mut stream, _) = tokio::select! {
+            result = &mut probe => panic!("probe finished before the injected bus stall; present={}", result.is_some()),
+            accepted = listener.accept() => accepted.unwrap(),
+        };
+        tokio::select! {
+            result = &mut probe => panic!("probe finished before SASL; present={}", result.is_some()),
+            auth = read_crlf_line(&mut stream) => assert!(auth.unwrap().starts_with("\0AUTH EXTERNAL")),
+        }
+        // Keep the connection open but never answer SASL. The editable-context
+        // deadline must win over the shared D-Bus client's longer default.
+        assert!(probe.await.is_none());
+        assert_eq!(start.elapsed(), Duration::from_millis(400));
     }
 
     #[tokio::test]
