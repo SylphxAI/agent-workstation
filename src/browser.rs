@@ -267,6 +267,159 @@ impl Browser {
     }
 }
 
+/// Read the focused sway Chromium window without using or activating the
+/// agent's Web tab. An unavailable/ambiguous observation returns no metadata.
+#[cfg(target_os = "linux")]
+pub(crate) async fn editable_context(
+    endpoint: &str,
+    window: [i32; 4],
+) -> Option<crate::takeover::InputContext> {
+    let [_, _, width, height] = window;
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    tokio::time::timeout(Duration::from_millis(300), read_editables(endpoint, window))
+        .await
+        .ok()
+        .flatten()
+}
+
+#[cfg(target_os = "linux")]
+async fn read_editables(endpoint: &str, window: [i32; 4]) -> Option<crate::takeover::InputContext> {
+    use crate::takeover::{InputContext, InputPurpose};
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    struct Probe {
+        active: bool,
+        hint: String,
+        rects: Vec<[i32; 4]>,
+    }
+    let mut cdp = Cdp::connect(endpoint).await.ok()?;
+    let pages = cdp.pages().await.ok()?;
+    if pages.len() > 64 {
+        return None;
+    }
+    let mut selected = None;
+    for page in pages {
+        let target = page["targetId"].as_str()?;
+        let info = cdp
+            .call_in(
+                None,
+                "Browser.getWindowForTarget",
+                json!({"targetId": target}),
+                Duration::from_millis(100),
+            )
+            .await
+            .ok()?;
+        let bounds = &info["bounds"];
+        if bounds["windowState"] == "minimized" {
+            continue;
+        }
+        // Ozone/Wayland does not expose global window positions. Chromium's
+        // normal window bounds can include invisible client-side shadows
+        // (+20 px on both axes); sway reports the actual window geometry.
+        // Visibility alone is not enough: two windows' selected tabs can
+        // BOTH be visible and claim document focus. Refuse ambiguous matches.
+        let dw = bounds["width"]
+            .as_i64()?
+            .checked_sub(i64::from(window[2]))?;
+        let dh = bounds["height"]
+            .as_i64()?
+            .checked_sub(i64::from(window[3]))?;
+        if !(-2..=24).contains(&dw) || !(-2..=24).contains(&dh) {
+            continue;
+        }
+        let session = cdp.attach(target).await.ok()?;
+        let tree = cdp.call("Page.getFrameTree", json!({})).await.ok()?;
+        let frame = &tree["frameTree"]["frame"];
+        let frame_id = frame["id"].as_str()?;
+        let loader_id = frame["loaderId"].as_str()?;
+        let world = cdp
+            .call(
+                "Page.createIsolatedWorld",
+                json!({
+                    "frameId": frame_id, "worldName": "takeover-input-observer"
+                }),
+            )
+            .await
+            .ok()?;
+        let context = world["executionContextId"].as_i64()?;
+        let visible = evaluate_input_probe(
+            &mut cdp,
+            &session,
+            context,
+            "document.visibilityState === 'visible'",
+        )
+        .await?
+        .as_bool()?;
+        if visible {
+            if selected.is_some() {
+                return None;
+            }
+            selected = Some((session, context, frame_id.to_owned(), loader_id.to_owned()));
+        }
+    }
+    let (session, context, frame, loader) = selected?;
+    let expression = format!("{}({})", include_str!("browser/editable.js"), json!(window));
+    let value = evaluate_input_probe(&mut cdp, &session, context, &expression).await?;
+    let current = cdp
+        .call_in(
+            Some(&session),
+            "Page.getFrameTree",
+            json!({}),
+            Duration::from_millis(100),
+        )
+        .await
+        .ok()?;
+    let current = &current["frameTree"]["frame"];
+    if current["id"].as_str()? != frame || current["loaderId"].as_str()? != loader {
+        return None;
+    }
+    let mut probe: Probe = serde_json::from_value(value).ok()?;
+    if probe.rects.len() > 64 {
+        return None;
+    }
+    probe.rects.sort_unstable();
+    probe.rects.dedup();
+    Some(InputContext {
+        active: probe.active,
+        purpose: match probe.hint.as_str() {
+            "email" => InputPurpose::Email,
+            "url" => InputPurpose::Url,
+            "search" => InputPurpose::Search,
+            "decimal" => InputPurpose::Decimal,
+            _ => InputPurpose::Text,
+        },
+        rects: probe.rects,
+    })
+}
+
+#[cfg(target_os = "linux")]
+async fn evaluate_input_probe(
+    cdp: &mut Cdp,
+    session: &str,
+    context: i64,
+    expression: &str,
+) -> Option<Value> {
+    let mut response = cdp
+        .call_in(
+            Some(session),
+            "Runtime.evaluate",
+            json!({
+                "contextId": context, "expression": expression,
+                "returnByValue": true, "silent": true, "disableBreaks": true, "timeout": 40,
+            }),
+            Duration::from_millis(100),
+        )
+        .await
+        .ok()?;
+    if response.get("exceptionDetails").is_some() {
+        return None;
+    }
+    response.get_mut("result")?.as_object_mut()?.remove("value")
+}
+
 fn read_port_file(path: &Path) -> Option<(u16, String)> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
@@ -1667,3 +1820,7 @@ mod tests {
 #[cfg(test)]
 #[path = "browser/handoff_tests.rs"]
 mod handoff_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "browser/editable_tests.rs"]
+mod editable_tests;

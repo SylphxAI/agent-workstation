@@ -35,6 +35,10 @@ was never published.
 
 ### Added
 
+- Touch-first Takeover viewers open the soft keyboard when tapping a detected
+  editable target. Tapping away dismisses an automatically opened keyboard;
+  the toolbar can still pin, dismiss, or open it for undetected targets.
+
 - Web: CSS selectors wherever a ref is accepted (`Locator`); `focus`;
   in-page keys `press`, `press_and_hold`, `key_down`, `key_up`,
   `release_keys` (held modifiers apply to clicks); `eval` (with

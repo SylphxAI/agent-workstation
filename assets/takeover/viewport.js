@@ -4,7 +4,7 @@ const clamp = (n, lo, hi) => Math.min(hi, Math.max(lo, n));
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const middle = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
 
-export function createViewport({ screen, frame, cursor, send, focus, enabled, changed }) {
+export function createViewport({ screen, frame, cursor, send, focus, enabled, changed, onTap }) {
   const coarse = matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0;
   let trackpad = coarse, touchCursor = coarse, pan = false;
   let width = 0, height = 0, viewW = 0, viewH = 0;
@@ -218,7 +218,6 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
 
   screen.addEventListener('touchend', e => {
     e.preventDefault();
-    stopHold();
     if (multi) {
       const points = touches(e);
       if (points.length >= 2 && !pinch?.ids.every(id => points.some(p => p.id === id))) startPinch(points);
@@ -228,13 +227,20 @@ export function createViewport({ screen, frame, cursor, send, focus, enabled, ch
     if (!finger) return;
     const end = Array.from(e.changedTouches).find(t => t.identifier === finger.start.id);
     if (!end) return;
-    if (finger.dragging) { mask = 0; point(); }
-    else if (!finger.moved && !finger.held && enabled()) {
-      const p = local(end);
-      if (trackpad) { click(1, true); lastTap = { ...p, at: performance.now() }; }
-      else if (inFrame(p)) { point(toDesktop(p)); click(1, true); }
-    }
+    stopHold();
+    const tap = finger;
     finger = null;
+    if (tap.dragging) { mask = 0; point(); }
+    else if (width && !tap.moved && !tap.held && enabled()) {
+      const p = local(end);
+      if (dist(tap.start, p) >= 5 || (!trackpad && !inFrame(p))) return;
+      if (trackpad) lastTap = { ...p, at: performance.now() };
+      else point(toDesktop(p));
+      click(1, true);
+      // Report the actual RFB pixel after the press/release, before the
+      // trusted touchend returns. Focus may change the viewport geometry.
+      onTap?.({ x: Math.round(pos.x), y: Math.round(pos.y), trackpad });
+    }
   }, { passive: false });
   screen.addEventListener('touchcancel', cancel);
   screen.addEventListener('contextmenu', e => e.preventDefault());

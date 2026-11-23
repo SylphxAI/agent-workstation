@@ -1,5 +1,5 @@
 // Takeover page: the desktop over noVNC, gated by who holds control.
-import { desktopShortcut } from './input.js';
+import { createSoftKeyboard, desktopShortcut, requiresKeyboardGesture } from './input.js';
 import { createViewport } from './viewport.js';
 import RFB from './novnc/core/rfb.js';
 import KeyTable from './novnc/core/input/keysym.js';
@@ -23,10 +23,22 @@ let pasteQueue = Promise.resolve();
 const canInput = () => connected && holder === 'human' && !releasing && !modalOpen();
 const canSync = () => canInput() && !document.hidden && document.hasFocus();
 const sticky = new Set();
+const ime = $('ime');
+const coarsePointer = matchMedia('(pointer: coarse)');
+const gestureRequired = requiresKeyboardGesture(navigator);
+const keyboard = createSoftKeyboard({
+  coarse: () => coarsePointer.matches,
+  canInput,
+  asyncFocus: () => !gestureRequired && !document.hidden && document.hasFocus(),
+  focused: () => document.activeElement === ime,
+  focus: purpose => { ime.inputMode = purpose; ime.focus({ preventScroll: true }); },
+  blur: () => ime.blur(),
+});
 
 const viewport = createViewport({
   screen: $('screen'), frame: $('frame'), cursor: $('cursor'), enabled: canInput,
   send: (x, y, mask) => rfb?.sendPointer(x, y, mask),
+  onTap: keyboard.tap,
   focus: () => { if (document.activeElement !== $('ime')) rfb?.focus({ preventScroll: true }); },
   changed: ({ scale, fitted }) => {
     $('zoom').textContent = Math.round(scale * 100) + '%';
@@ -103,6 +115,9 @@ function connect() {
     connected = true;
     viewport.framebuffer(canvas.width, canvas.height);
     render();
+    // The server deduplicates input snapshots. Request a fresh baseline for
+    // this framebuffer instead of reusing geometry from a previous socket.
+    watchEvents();
     measureLatency();
   });
   connection.addEventListener('disconnect', () => {
@@ -111,6 +126,7 @@ function connect() {
     if (rfb !== connection) return;
     connected = false;
     rfb = null;
+    keyboard.reset();
     viewport.cancel();
     latencyProbe?.abort();
     latencyProbe = null;
@@ -137,6 +153,7 @@ $('reconnect').onclick = () => {
   viewport.cancel();
   reconnecting = true;
   connected = false;
+  keyboard.reset();
   $('latency').textContent = '—';
   latencyProbe?.abort();
   latencyProbe = null;
@@ -165,7 +182,7 @@ function render() {
   for (const id of ['kbd', 'keys-btn', 'clip-btn']) $(id).hidden = !human;
   if (!canInput()) {
     if (activeTray !== 'tools') setTray(null);
-    $('ime').blur();
+    keyboard.suspend();
     clearSticky();
   }
   if (rfb && rfb.viewOnly === canInput()) rfb.viewOnly = !canInput();
@@ -176,8 +193,9 @@ function render() {
 
 function apply(state) {
   const next = state.since ?? null;
-  if (next !== since && holder === 'human') viewport.cancel();
-  if (next !== since) {
+  const cycleChanged = next !== since || state.holder !== holder;
+  if (cycleChanged && holder === 'human') viewport.cancel();
+  if (cycleChanged) {
     resetClipboard();
     // A stale local dialog must not be able to commit in a new cycle.
     for (const id of ['clip-dlg', 'note-dlg']) if ($(id).open) $(id).close('cancel');
@@ -185,6 +203,7 @@ function apply(state) {
   }
   since = next;
   holder = state.holder;
+  if (cycleChanged) keyboard.reset();
   waylandClipboard = state.wayland_clipboard === true;
   browserRunning = state.browser_running !== false;
   deadline = holder === 'human' && state.idle_remaining_ms != null ? Date.now() + state.idle_remaining_ms : 0;
@@ -222,8 +241,22 @@ async function post(path, body) {
   apply(await res.json());
 }
 
-const events = new EventSource('events');
-events.addEventListener('state', e => apply(JSON.parse(e.data)));
+let events;
+function watchEvents() {
+  events?.close();
+  const source = events = new EventSource('events');
+  source.addEventListener('state', e => { if (source === events) apply(JSON.parse(e.data)); });
+  source.addEventListener('input', e => {
+    // A modal pauses keyboard effects, but still belongs to this cycle.
+    if (source !== events || !connected || holder !== 'human') return;
+    let state;
+    try { state = JSON.parse(e.data); } catch { /* invalidate unreadable geometry */ }
+    if (state && Object.hasOwn(state, 'since') && state.since !== since) return;
+    keyboard.update(state);
+  });
+  source.addEventListener('error', () => { if (source === events) keyboard.reset(); });
+}
+watchEvents();
 
 // Keys: sticky modifiers wrap the next key, then release.
 function clearSticky() {
@@ -265,7 +298,6 @@ function setTray(next) {
 for (const [id, button] of trays) $(button).onclick = () => setTray(activeTray === id ? null : id);
 
 // Soft keyboard: a hidden textarea collects typed and IME-composed text.
-const ime = $('ime');
 const NAMED = { Backspace: 'XK_BackSpace', Enter: 'XK_Return', Tab: 'XK_Tab', Escape: 'XK_Escape', Delete: 'XK_Delete',
   ArrowLeft: 'XK_Left', ArrowRight: 'XK_Right', ArrowUp: 'XK_Up', ArrowDown: 'XK_Down', Home: 'XK_Home', End: 'XK_End' };
 const INPUT_KEYS = { deleteContentBackward: 'XK_BackSpace', deleteContentForward: 'XK_Delete',
@@ -295,10 +327,7 @@ $('hud').addEventListener('pointerdown', e => {
   const button = e.target.closest('button');
   if (button && (button === $('kbd') || document.activeElement === ime)) e.preventDefault();
 });
-$('kbd').onclick = () => {
-  if (document.activeElement === ime) ime.blur();
-  else ime.focus({ preventScroll: true }); // must run inside the iOS tap activation
-};
+$('kbd').onclick = keyboard.toggle; // keep focus inside the trusted activation
 
 // Capture keyboard chords before noVNC consumes target-phase events. Leave
 // native paste's default action alone: it supplies text even where readText
@@ -390,6 +419,9 @@ function pasteText(text) {
 function showDialog(id) {
   viewport.cancel();
   $(id).returnValue = '';
+  // Do not let the browser restore focus to the hidden IME when the modal
+  // closes. Preserve the cycle's cached geometry and manual override.
+  keyboard.suspend();
   $(id).showModal();
   render();
 }

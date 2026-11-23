@@ -27,6 +27,8 @@ use crate::proxy::{Proxy, ProxyEndpoint};
 use crate::secret::SecretResolver;
 #[cfg(target_os = "linux")]
 use crate::session_bus::SessionBus;
+#[cfg(target_os = "linux")]
+use crate::takeover::{InputContext, InputContextSource, MAX_EDITABLE_RECTS};
 use crate::takeover::{Takeover, TakeoverConfig, TakeoverStatus};
 #[cfg(target_os = "linux")]
 use crate::vnc::Vnc;
@@ -127,7 +129,7 @@ pub struct DesktopSession {
     #[cfg(target_os = "linux")]
     desktop_snap: std::sync::Mutex<DesktopSnapshotStore>,
     #[cfg(target_os = "linux")]
-    accessibility: LinuxPlatformAdapter,
+    accessibility: Arc<LinuxPlatformAdapter>,
     #[cfg(target_os = "linux")]
     has_private_bus: bool,
     #[cfg(target_os = "linux")]
@@ -276,7 +278,7 @@ impl DesktopSession {
             desktop_snap: std::sync::Mutex::new(DesktopSnapshotStore::scoped(format!(
                 "win-{scope}"
             ))),
-            accessibility,
+            accessibility: Arc::new(accessibility),
             has_private_bus,
             socket,
             ipc_socket,
@@ -358,25 +360,42 @@ impl DesktopSession {
         if self.viewer().is_some() {
             return Ok(());
         }
-        let (env, runtime_dir, socket) = {
+        let (env, runtime_dir, socket, endpoint, browser_pid) = {
             let mut processes = self.processes.lock().unwrap_or_else(|p| p.into_inner());
-            if !processes.browser.as_mut().is_some_and(Browser::is_running) {
+            let browser = processes.browser.as_mut().ok_or(Error::Closed)?;
+            if !browser.is_running() {
                 return Err(Error::Closed);
             }
+            let endpoint = browser.endpoint().to_owned();
+            let pid = browser.pid()?;
             let c = processes.compositor.as_ref().ok_or(Error::Closed)?;
             (
                 c.client_env(),
                 c.runtime_dir().to_path_buf(),
                 c.socket_path(),
+                endpoint,
+                pid,
             )
         };
         let vnc = Vnc::start(&self.vnc_binary, &env, &runtime_dir).await?;
+        let source = TakeoverInput {
+            endpoint,
+            browser_pid,
+            ipc: self.ipc_socket.clone(),
+            accessibility: self.accessibility.clone(),
+        };
+        let source = Arc::new(source);
+        let input_context: InputContextSource = Arc::new(move || {
+            let source = source.clone();
+            Box::pin(async move { source.read().await })
+        });
         let page = Takeover::start_with_liveness(
             config,
             vnc.socket().to_path_buf(),
             self.gate.clone(),
             self.browser_exited.clone(),
             Some(socket),
+            Some(input_context),
         )
         .await;
         match page {
@@ -520,6 +539,64 @@ impl DesktopSession {
             return Err(Error::Closed);
         }
         self.gate.check(principal)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct TakeoverInput {
+    endpoint: String,
+    browser_pid: u32,
+    ipc: PathBuf,
+    accessibility: Arc<LinuxPlatformAdapter>,
+}
+
+#[cfg(target_os = "linux")]
+impl TakeoverInput {
+    async fn focused_window(&self) -> Option<DesktopWindow> {
+        compositor::list_windows(&self.ipc)
+            .await
+            .ok()?
+            .into_iter()
+            .find(|window| window.focused)
+    }
+
+    async fn read(&self) -> Option<InputContext> {
+        let window = self.focused_window().await?;
+        let rect = [
+            window.rect.x,
+            window.rect.y,
+            i32::try_from(window.rect.width).ok()?,
+            i32::try_from(window.rect.height).ok()?,
+        ];
+        let browser = window.pid == Some(self.browser_pid);
+        let (web, native) = tokio::join!(
+            async {
+                if browser {
+                    crate::browser::editable_context(&self.endpoint, rect).await
+                } else {
+                    None
+                }
+            },
+            self.accessibility
+                .editable_context(rect, window.pid, browser),
+        );
+        // Discard any result sampled across a focus, resize or placement change.
+        let current = self.focused_window().await?;
+        if current.id != window.id || current.rect != window.rect || current.pid != window.pid {
+            return None;
+        }
+        let mut context = web.unwrap_or_default();
+        if let Some(native) = native {
+            if native.active {
+                context.active = true;
+                context.purpose = native.purpose;
+            }
+            context.rects.extend(native.rects);
+        }
+        context.rects.sort_unstable();
+        context.rects.dedup();
+        context.rects.truncate(MAX_EDITABLE_RECTS);
+        Some(context)
     }
 }
 
