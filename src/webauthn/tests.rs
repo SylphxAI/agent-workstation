@@ -93,3 +93,194 @@ fn debug_and_invalid_key_diagnostics_are_redacted() {
     );
     assert!(!format!("{error:?}").contains(malformed));
 }
+
+#[test]
+fn canonical_origin_and_lease_config_validation() {
+    for valid in [
+        "https://app.example.com",
+        "https://app.example.com:8443",
+        "http://localhost",
+        "http://localhost:8080",
+        "http://sub.localhost:3000",
+    ] {
+        let cfg = WebAuthnCeremonyLeaseConfig::new(valid);
+        assert_eq!(cfg.validate().unwrap(), valid);
+    }
+
+    for invalid in [
+        "",
+        " https://app.example.com",
+        "https://app.example.com/",
+        "https://app.example.com/login",
+        "https://app.example.com?a=1",
+        "https://app.example.com#frag",
+        "https://user:pass@app.example.com",
+        "https://APP.example.com",
+        "https://app.example.com:443",
+        "http://localhost:80",
+        "http://app.example.com",
+        "file:///tmp/test.html",
+        "null",
+    ] {
+        let cfg = WebAuthnCeremonyLeaseConfig::new(invalid);
+        assert!(
+            matches!(cfg.validate(), Err(Error::InvalidInput(_))),
+            "expected rejection for {invalid:?}"
+        );
+    }
+
+    assert!(matches!(
+        WebAuthnCeremonyLeaseConfig::new("https://app.example.com")
+            .with_timeout(Duration::ZERO)
+            .validate(),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        WebAuthnCeremonyLeaseConfig::new("https://app.example.com")
+            .with_timeout(MAX_WEBAUTHN_CEREMONY_TIMEOUT + Duration::from_secs(1))
+            .validate(),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn validate_proxy_request_enforces_exact_origin_ancestors_scope_and_rp_id() {
+    let get_json = |origin: &str, same_origin: bool, rp_id: &str| {
+        json!({
+            "rpId": rp_id,
+            "challenge": "AAAA",
+            "extensions": {
+                "remoteDesktopClientOverride": {
+                    "origin": origin,
+                    "sameOriginWithAncestors": same_origin,
+                }
+            }
+        })
+        .to_string()
+    };
+    let create_json = |origin: &str, same_origin: bool, rp_id: &str| {
+        json!({
+            "rp": { "id": rp_id, "name": "Example" },
+            "challenge": "AAAA",
+            "extensions": {
+                "remoteDesktopClientOverride": {
+                    "origin": origin,
+                    "sameOriginWithAncestors": same_origin,
+                }
+            }
+        })
+        .to_string()
+    };
+
+    let req = validate_proxy_request(
+        WebAuthnOperation::Get,
+        get_json("https://app.example.com", true, "example.com"),
+        "https://app.example.com",
+        WebAuthnCeremonyScope::Get,
+        true,
+    )
+    .unwrap();
+    assert_eq!(req.operation, WebAuthnOperation::Get);
+    assert_eq!(req.origin, "https://app.example.com");
+    assert!(req.same_origin_with_ancestors);
+    assert_eq!(req.rp_id, "example.com");
+
+    let req = validate_proxy_request(
+        WebAuthnOperation::Create,
+        create_json("https://app.example.com", true, "example.com"),
+        "https://app.example.com",
+        WebAuthnCeremonyScope::Create,
+        true,
+    )
+    .unwrap();
+    assert_eq!(req.operation, WebAuthnOperation::Create);
+    assert_eq!(req.rp_id, "example.com");
+
+    assert_eq!(
+        validate_proxy_request(
+            WebAuthnOperation::Get,
+            get_json("https://other.example.com", true, "example.com"),
+            "https://app.example.com",
+            WebAuthnCeremonyScope::Any,
+            true,
+        )
+        .unwrap_err(),
+        WebAuthnDenyReason::OriginMismatch
+    );
+    assert_eq!(
+        validate_proxy_request(
+            WebAuthnOperation::Get,
+            get_json("https://app.example.com", false, "example.com"),
+            "https://app.example.com",
+            WebAuthnCeremonyScope::Any,
+            true,
+        )
+        .unwrap_err(),
+        WebAuthnDenyReason::CrossOriginAncestor
+    );
+    assert!(
+        validate_proxy_request(
+            WebAuthnOperation::Get,
+            get_json("https://app.example.com", false, "example.com"),
+            "https://app.example.com",
+            WebAuthnCeremonyScope::Any,
+            false,
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        validate_proxy_request(
+            WebAuthnOperation::Create,
+            create_json("https://app.example.com", true, "example.com"),
+            "https://app.example.com",
+            WebAuthnCeremonyScope::Get,
+            true,
+        )
+        .unwrap_err(),
+        WebAuthnDenyReason::ScopeMismatch
+    );
+    assert_eq!(
+        validate_proxy_request(
+            WebAuthnOperation::Get,
+            json!({ "rpId": "example.com" }).to_string(),
+            "https://app.example.com",
+            WebAuthnCeremonyScope::Any,
+            true,
+        )
+        .unwrap_err(),
+        WebAuthnDenyReason::MissingOriginMetadata
+    );
+    assert_eq!(
+        validate_proxy_request(
+            WebAuthnOperation::Get,
+            get_json("https://app.example.com", true, ""),
+            "https://app.example.com",
+            WebAuthnCeremonyScope::Any,
+            true,
+        )
+        .unwrap_err(),
+        WebAuthnDenyReason::MalformedRequest
+    );
+    assert_eq!(
+        validate_proxy_request(
+            WebAuthnOperation::Get,
+            "{not-json".into(),
+            "https://app.example.com",
+            WebAuthnCeremonyScope::Any,
+            true,
+        )
+        .unwrap_err(),
+        WebAuthnDenyReason::MalformedRequest
+    );
+}
+
+#[test]
+fn proxy_response_debug_redacts_response_json() {
+    let secret_payload = r#"{"signature":"synthetic-signature-bytes"}"#;
+    let resp = WebAuthnProxyResponse::Success {
+        response_json: secret_payload.into(),
+    };
+    let rendered = format!("{resp:?}");
+    assert!(rendered.contains("[redacted]"));
+    assert!(!rendered.contains("synthetic-signature-bytes"));
+}

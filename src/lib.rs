@@ -50,7 +50,7 @@ pub mod webauthn;
 
 pub use browser::{
     BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab, WEBMCP_DEFAULT_TIMEOUT_MS,
-    WEBMCP_MAX_TIMEOUT_MS, WebMcpTool,
+    WEBMCP_MAX_TIMEOUT_MS, WebAuthnCeremonyLease, WebMcpTool,
 };
 pub use desktop::{
     Button, DesktopFallbackReason, DesktopFocus, DesktopRect, DesktopSnapshot, DesktopWindow,
@@ -70,6 +70,10 @@ pub use secret::{Secret, SecretResolver};
 pub use session::{Agent, DesktopSession, MAX_HOLD, SessionConfig};
 pub use takeover::{Takeover, TakeoverConfig, TakeoverStatus};
 pub use webauthn::{
-    AuthenticatorProtocol, AuthenticatorTransport, PasskeyCredential, VirtualAuthenticatorId,
-    VirtualAuthenticatorOptions,
+    AuthenticatorProtocol, AuthenticatorTransport, DEFAULT_WEBAUTHN_CEREMONY_TIMEOUT,
+    MAX_WEBAUTHN_CEREMONY_TIMEOUT, PasskeyCredential, VirtualAuthenticatorId,
+    VirtualAuthenticatorOptions, WEBAUTHN_PROXY_EXTENSION_FLAG, WebAuthnCeremonyLeaseConfig,
+    WebAuthnCeremonyOutcome, WebAuthnCeremonyScope, WebAuthnDenyReason, WebAuthnDomError,
+    WebAuthnOperation, WebAuthnProxyRequest, WebAuthnProxyResponse, WebAuthnSigner,
+    webauthn_signer,
 };

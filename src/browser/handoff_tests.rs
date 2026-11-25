@@ -83,6 +83,7 @@ async fn fixture(gate: Arc<ControlGate>, fault: Fault) -> (Mutex<Web>, Arc<StdMu
             nonce: nonce().unwrap(),
             snapshots: 0,
             held: vec![],
+            webauthn_proxy_active: Arc::new(AtomicBool::new(false)),
         }),
         calls,
     )

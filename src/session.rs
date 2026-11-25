@@ -7,7 +7,10 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::browser::{Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web, WebMcpTool};
+use crate::browser::{
+    Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web, WebAuthnCeremonyLease,
+    WebMcpTool,
+};
 #[cfg(target_os = "linux")]
 use crate::compositor::{self, Compositor};
 #[cfg(target_os = "linux")]
@@ -36,6 +39,7 @@ use crate::vnc::Vnc;
 use crate::wayland::{self, InputDevice};
 use crate::{
     Button, Frame, Input, PasskeyCredential, VirtualAuthenticatorId, VirtualAuthenticatorOptions,
+    WebAuthnCeremonyLeaseConfig, WebAuthnSigner,
 };
 
 /// Longest key hold on the desktop or in a page.
@@ -849,6 +853,27 @@ impl<'a> Agent<'a> {
     /// Clear a virtual authenticator's in-memory credentials on the active page.
     pub async fn clear_credentials(&self, id: &VirtualAuthenticatorId) -> Result<()> {
         self.web().await?.clear_credentials(id).await
+    }
+
+    /// Arm a single-use, exact-origin WebAuthn ceremony lease backed by
+    /// Chromium's `chrome.webAuthenticationProxy` API and an out-of-browser
+    /// [`WebAuthnSigner`], under the session lease.
+    ///
+    /// Human takeover, lease handoff, or session closure immediately revokes
+    /// and detaches the lease fail-closed.
+    pub async fn arm_webauthn_ceremony(
+        &self,
+        config: WebAuthnCeremonyLeaseConfig,
+        signer: impl WebAuthnSigner + 'static,
+    ) -> Result<WebAuthnCeremonyLease> {
+        let mut web = self.web().await?;
+        self.session.check(&self.principal)?;
+        let watcher = crate::browser::webauthn_proxy::ControlWatcher::new(
+            self.session.gate.clone(),
+            self.principal.clone(),
+        );
+        web.arm_webauthn_ceremony_with_gate(config, Arc::new(signer), Some(watcher))
+            .await
     }
 
     /// Discover WebMCP tools on the active page, under the session lease.

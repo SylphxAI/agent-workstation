@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -22,7 +24,9 @@ use crate::fingerprint::Fingerprint;
 
 mod keys;
 mod webauthn;
+pub(crate) mod webauthn_proxy;
 mod webmcp;
+pub use webauthn_proxy::WebAuthnCeremonyLease;
 pub use webmcp::{WEBMCP_DEFAULT_TIMEOUT_MS, WEBMCP_MAX_TIMEOUT_MS, WebMcpTool};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
@@ -61,6 +65,16 @@ impl BrowserConfig {
             clear_env: false,
             extra_env: Vec::new(),
         }
+    }
+
+    /// Enable CDP unpacked-extension loading required by origin-bound WebAuthn
+    /// ceremony leases ([`Web::arm_webauthn_ceremony`]).
+    pub fn enable_webauthn_proxy(&mut self) -> &mut Self {
+        let flag = crate::WEBAUTHN_PROXY_EXTENSION_FLAG;
+        if !self.extra_args.iter().any(|arg| arg == flag) {
+            self.extra_args.push(flag.to_owned());
+        }
+        self
     }
 
     /// Browser arguments only, excluding any wrapper (exposed for inspection).
@@ -666,6 +680,8 @@ pub struct Web {
     snapshots: u64,
     /// Keys a page holds down (`key_down` without `key_up`), in press order.
     held: Vec<keys::Key>,
+    /// Whether an origin-bound WebAuthn proxy ceremony lease is currently armed.
+    webauthn_proxy_active: Arc<AtomicBool>,
 }
 
 // Inputs are serialized as an argument, never interpolated into source.
@@ -774,6 +790,7 @@ impl Web {
             nonce: nonce()?,
             snapshots: 0,
             held: Vec::new(),
+            webauthn_proxy_active: Arc::new(AtomicBool::new(false)),
         };
         web.browser_call("Target.setDiscoverTargets", json!({ "discover": true }))
             .await?;
@@ -1817,6 +1834,18 @@ mod tests {
         assert!(check_url("javascript:alert(1)").is_err());
         assert!(check_url("chrome://settings").is_err());
         assert!(check_url("nope").is_err());
+    }
+
+    #[test]
+    fn enable_webauthn_proxy_appends_extension_debugging_flag_once() {
+        let mut cfg = BrowserConfig::new("/usr/bin/chromium");
+        cfg.enable_webauthn_proxy().enable_webauthn_proxy();
+        let matches = cfg
+            .extra_args
+            .iter()
+            .filter(|a| a.as_str() == crate::WEBAUTHN_PROXY_EXTENSION_FLAG)
+            .count();
+        assert_eq!(matches, 1);
     }
 }
 
