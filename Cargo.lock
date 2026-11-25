@@ -23,6 +23,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "log",
  "png",
  "rustix",
  "serde",

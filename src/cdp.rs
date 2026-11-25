@@ -86,6 +86,7 @@ impl Cdp {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        let webauthn = method.starts_with("WebAuthn.");
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({ "id": id, "method": method, "params": params });
@@ -94,13 +95,28 @@ impl Cdp {
         }
         if let Err(e) = self.ws.send(Message::Text(msg.to_string().into())).await {
             self.healthy = false;
-            return Err(Error::protocol(format!("{method}: send failed: {e}")));
+            return Err(if webauthn {
+                Error::protocol(format!("{method}: send failed"))
+            } else {
+                Error::protocol(format!("{method}: send failed: {e}"))
+            });
         }
         let wait = async {
             loop {
-                let v = self.read_one().await?;
+                let v = self.read_one().await.map_err(|e| {
+                    if webauthn {
+                        Error::protocol(format!("{method}: could not read reply"))
+                    } else {
+                        e
+                    }
+                })?;
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
                     if let Some(err) = v.get("error") {
+                        if webauthn {
+                            // A backend may echo command arguments in diagnostic text.
+                            let code = err["code"].as_i64().unwrap_or_default();
+                            return Err(Error::protocol(format!("{method}: CDP error ({code})")));
+                        }
                         let text = err
                             .get("message")
                             .and_then(Value::as_str)
@@ -120,6 +136,7 @@ impl Cdp {
     }
 
     /// Next event (buffered first), waiting up to `timeout`.
+    /// Private keys are omitted from WebAuthn credential events.
     pub async fn next_event(&mut self, timeout: Duration) -> Result<Option<Value>> {
         if let Some(v) = self.events.pop_front() {
             return Ok(Some(v));
@@ -212,8 +229,22 @@ impl Cdp {
         loop {
             match self.ws.next().await {
                 Some(Ok(Message::Text(t))) => {
-                    return serde_json::from_str(&t)
-                        .map_err(|e| Error::protocol(format!("bad CDP frame: {e}")));
+                    let mut value: Value = serde_json::from_str(&t)
+                        .map_err(|e| Error::protocol(format!("bad CDP frame: {e}")))?;
+                    // WebAuthn emits key-bearing credential events even during ordinary
+                    // page evaluations. Export keys only through explicit command replies.
+                    if value["method"]
+                        .as_str()
+                        .is_some_and(|m| m.starts_with("WebAuthn."))
+                        && let Some(credential) = value
+                            .get_mut("params")
+                            .and_then(|params| params.get_mut("credential"))
+                            .and_then(Value::as_object_mut)
+                    {
+                        credential.remove("privateKey");
+                        credential.remove("cmtgKeys");
+                    }
+                    return Ok(value);
                 }
                 Some(Ok(Message::Close(_))) | None => {
                     self.healthy = false;
@@ -276,6 +307,62 @@ mod tests {
         assert!(cdp.is_healthy());
         drop(cdp);
         server.abort();
+    }
+
+    #[test]
+    fn websocket_payload_logging_is_disabled_at_compile_time() {
+        assert!(log::STATIC_MAX_LEVEL <= log::LevelFilter::Info);
+    }
+
+    #[tokio::test]
+    async fn webauthn_command_errors_and_buffered_events_do_not_expose_keys() {
+        let synthetic_key = "AQIDBA==";
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let command = ws.next().await.unwrap().unwrap();
+            let request: Value = serde_json::from_str(command.to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "WebAuthn.addCredential");
+            assert_eq!(request["sessionId"], "page-session");
+            for frame in [
+                json!({"method":"WebAuthn.credentialAdded","sessionId":"page-session","params":{
+                    "authenticatorId":"auth", "credential":{"credentialId":"AQ==", "privateKey":synthetic_key,"cmtgKeys":[synthetic_key]}
+                }}),
+                json!({"id":request["id"],"sessionId":"page-session","error":{
+                    "code":-32602,"message":format!("invalid key: {synthetic_key}"),"data":synthetic_key
+                }}),
+            ] {
+                ws.send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut cdp = Cdp::connect(&format!("ws://{address}")).await.unwrap();
+        let error = cdp
+            .call_in(
+                Some("page-session"),
+                "WebAuthn.addCredential",
+                json!({
+                    "authenticatorId":"auth","credential":{"privateKey":synthetic_key}
+                }),
+                CALL_TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "browser protocol: WebAuthn.addCredential: CDP error (-32602)"
+        );
+        assert!(!format!("{error:?}").contains(synthetic_key));
+        let event = cdp.next_event(Duration::ZERO).await.unwrap().unwrap();
+        assert_eq!(
+            event["params"]["credential"],
+            json!({"credentialId":"AQ=="})
+        );
+        assert!(!format!("{cdp:?}").contains(synthetic_key));
+        server.await.unwrap();
     }
 
     #[tokio::test]

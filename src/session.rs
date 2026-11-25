@@ -34,7 +34,9 @@ use crate::takeover::{Takeover, TakeoverConfig, TakeoverStatus};
 use crate::vnc::Vnc;
 #[cfg(target_os = "linux")]
 use crate::wayland::{self, InputDevice};
-use crate::{Button, Frame, Input};
+use crate::{
+    Button, Frame, Input, PasskeyCredential, VirtualAuthenticatorId, VirtualAuthenticatorOptions,
+};
 
 /// Longest key hold on the desktop or in a page.
 pub const MAX_HOLD: Duration = crate::browser::MAX_HOLD;
@@ -783,6 +785,70 @@ impl<'a> Agent<'a> {
     /// Evaluate a script expression in the page.
     pub async fn eval(&self, expression: &str) -> Result<Value> {
         self.web().await?.eval(expression).await
+    }
+
+    /// Enable Chromium's virtual WebAuthn environment on the active page, without native UI.
+    pub async fn enable_webauthn(&self) -> Result<()> {
+        self.web().await?.enable_webauthn().await
+    }
+
+    /// Disable virtual WebAuthn on the active page and discard its virtual authenticators.
+    pub async fn disable_webauthn(&self) -> Result<()> {
+        self.web().await?.disable_webauthn().await
+    }
+
+    /// Add a virtual authenticator on the active page under the session lease.
+    pub async fn add_virtual_authenticator(
+        &self,
+        options: &VirtualAuthenticatorOptions,
+    ) -> Result<VirtualAuthenticatorId> {
+        self.web().await?.add_virtual_authenticator(options).await
+    }
+
+    /// Remove a virtual authenticator from the active page.
+    pub async fn remove_virtual_authenticator(&self, id: &VirtualAuthenticatorId) -> Result<()> {
+        self.web().await?.remove_virtual_authenticator(id).await
+    }
+
+    /// Import a credential into a virtual authenticator on the active page.
+    pub async fn add_credential(
+        &self,
+        id: &VirtualAuthenticatorId,
+        credential: &PasskeyCredential,
+    ) -> Result<()> {
+        self.web().await?.add_credential(id, credential).await
+    }
+
+    /// Export credential material from a virtual authenticator on the active page.
+    pub async fn get_credentials(
+        &self,
+        id: &VirtualAuthenticatorId,
+    ) -> Result<Vec<PasskeyCredential>> {
+        let mut web = self.web().await?;
+        let mut control = self.session.gate.subscribe();
+        self.session.check(&self.principal)?;
+        tokio::select! {
+            biased;
+            _ = control.changed() => Err(Error::Refused("session control changed during credential export".into())),
+            result = web.get_credentials(id) => {
+                self.session.check(&self.principal)?;
+                result
+            },
+        }
+    }
+
+    /// Remove a credential from a virtual authenticator on the active page.
+    pub async fn remove_credential(
+        &self,
+        id: &VirtualAuthenticatorId,
+        credential_id: &[u8],
+    ) -> Result<()> {
+        self.web().await?.remove_credential(id, credential_id).await
+    }
+
+    /// Clear a virtual authenticator's in-memory credentials on the active page.
+    pub async fn clear_credentials(&self, id: &VirtualAuthenticatorId) -> Result<()> {
+        self.web().await?.clear_credentials(id).await
     }
 
     /// Discover WebMCP tools on the active page, under the session lease.

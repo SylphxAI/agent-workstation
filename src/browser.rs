@@ -21,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::fingerprint::Fingerprint;
 
 mod keys;
+mod webauthn;
 mod webmcp;
 pub use webmcp::{WEBMCP_DEFAULT_TIMEOUT_MS, WEBMCP_MAX_TIMEOUT_MS, WebMcpTool};
 

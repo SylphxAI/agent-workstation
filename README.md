@@ -115,6 +115,24 @@ text that depends on it. The generic input layer does not recognize browser
 shortcuts or resend input. Keys held by `Input::KeyDown` are released when
 the steps of that `input` call end.
 
+### Virtual WebAuthn (Chromium)
+
+Library callers can use `Agent::enable_webauthn` (or `browser::Web::enable_webauthn`)
+to enable Chromium's **software** virtual authenticator on the active page
+without native passkey UI. Use `add_virtual_authenticator(&VirtualAuthenticatorOptions::default())`
+before calling the page's usual WebAuthn registration or assertion API. The
+authenticator belongs to that page; it is not stored in the Chromium profile.
+Use `get_credentials` to export its credentials and `add_credential` to import them into
+a fresh virtual authenticator. Remove the authenticator or disable virtual
+WebAuthn on that page when finished.
+
+These operations are Rust library APIs, not daemon/CLI commands. Use only a
+trusted DevTools connection. Exported credentials contain raw private keys:
+store them as secrets, not as ordinary profile data or diagnostic output. The
+caller owns authorization, relying-party scope, and persistence. To keep
+WebSocket payloads out of diagnostics, this crate caps the Rust `log` facade at
+`info` at compile time for builds that include it.
+
 ## Daemon & Compact CLI
 
 ```sh
