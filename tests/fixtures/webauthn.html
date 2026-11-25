@@ -1,0 +1,94 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Local WebAuthn round trip</title>
+<script>
+const rpId = location.hostname;
+const userId = new Uint8Array([0, 1, 127, 128, 255]);
+const bytes = (buffer) => Array.from(new Uint8Array(buffer));
+
+async function register() {
+    const credential = await navigator.credentials.create({
+        publicKey: {
+            rp: {id: rpId, name: 'Local test'},
+            user: {id: userId, name: 'local', displayName: 'Local user'},
+            challenge: crypto.getRandomValues(new Uint8Array(32)),
+            pubKeyCredParams: [{type: 'public-key', alg: -7}],
+            authenticatorSelection: {
+                residentKey: 'required', requireResidentKey: true, userVerification: 'required',
+            },
+            attestation: 'none',
+        },
+        signal: AbortSignal.timeout(5000),
+    });
+    const response = credential.response;
+    const data = new DataView(response.getAuthenticatorData());
+    return {
+        rawId: bytes(credential.rawId), publicKey: bytes(response.getPublicKey()),
+        userHandle: bytes(userId), flags: data.getUint8(32), counter: data.getUint32(33),
+    };
+}
+
+// WebAuthn returns ES256 in ASN.1 DER; WebCrypto expects 32-byte r and s.
+function p1363(signature) {
+    const der = new Uint8Array(signature);
+    if (der[0] !== 0x30 || der[1] !== der.length - 2) throw new Error('Invalid ES256 sequence');
+    const out = new Uint8Array(64);
+    let offset = 2;
+    for (const scalar of [0, 32]) {
+        if (der[offset++] !== 0x02) throw new Error('Invalid ES256 integer');
+        const size = der[offset++];
+        const start = offset + (der[offset] === 0 ? 1 : 0);
+        offset += size;
+        const value = der.subarray(start, offset);
+        if (!size || value.length > 32 || offset > der.length) throw new Error('Invalid ES256 size');
+        out.set(value, scalar + 32 - value.length);
+    }
+    if (offset !== der.length) throw new Error('Trailing ES256 bytes');
+    return out;
+}
+
+const assertionOptions = () => ({
+    rpId, userVerification: 'required', challenge: crypto.getRandomValues(new Uint8Array(32)),
+});
+
+async function authenticate(spki) {
+    const publicKey = assertionOptions();
+    // No allowCredentials: a restored resident credential must be discoverable.
+    const credential = await navigator.credentials.get({publicKey, signal: AbortSignal.timeout(5000)});
+    const response = credential.response;
+    const data = new Uint8Array(response.authenticatorData);
+    const clientHash = await crypto.subtle.digest('SHA-256', response.clientDataJSON);
+    const signed = new Uint8Array(data.length + clientHash.byteLength);
+    signed.set(data);
+    signed.set(new Uint8Array(clientHash), data.length);
+    const key = await crypto.subtle.importKey(
+        'spki', Uint8Array.from(spki), {name: 'ECDSA', namedCurve: 'P-256'}, false, ['verify'],
+    );
+    const client = JSON.parse(new TextDecoder().decode(response.clientDataJSON));
+    const challenge = btoa(String.fromCharCode(...publicKey.challenge))
+        .replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '');
+    const rpHash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rpId));
+    return {
+        rawId: bytes(credential.rawId), userHandle: bytes(response.userHandle),
+        clientDataMatches: client.type === 'webauthn.get' && client.origin === location.origin &&
+            client.challenge === challenge,
+        rpHashMatches: bytes(rpHash).every((value, i) => value === data[i]),
+        signatureValid: await crypto.subtle.verify(
+            {name: 'ECDSA', hash: 'SHA-256'}, key, p1363(response.signature), signed,
+        ),
+        flags: data[32], counter: new DataView(response.authenticatorData).getUint32(33),
+    };
+}
+
+async function assertNoCredential() {
+    try {
+        const response = await navigator.credentials.get({
+            publicKey: assertionOptions(), signal: AbortSignal.timeout(1000),
+        });
+        return response === null;
+    } catch (error) {
+        if (['NotAllowedError', 'AbortError', 'TimeoutError'].includes(error.name)) return true;
+        throw error;
+    }
+}
+</script>

@@ -91,6 +91,11 @@ jobs:
           AGENT_WORKSTATION_WEBMCP_BROWSER: /usr/bin/google-chrome
           AGENT_WORKSTATION_WEBMCP_NO_SANDBOX: '1'
         run: cargo test --all-features --locked --test webmcp -- --nocapture
+      - name: WebAuthn integration (headless Chromium)
+        env:
+          AGENT_WORKSTATION_WEBAUTHN_BROWSER: /usr/bin/google-chrome
+          AGENT_WORKSTATION_WEBAUTHN_NO_SANDBOX: '1'
+        run: cargo test --all-features --locked --test webauthn -- --nocapture
       - name: Headful integration (headless Wayland + Chrome + wayvnc)
         env:
           AGENT_WORKSTATION_HEADFUL: '1'

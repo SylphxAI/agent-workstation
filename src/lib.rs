@@ -46,6 +46,7 @@ pub mod takeover;
 pub mod vnc;
 #[cfg(target_os = "linux")]
 pub mod wayland;
+pub mod webauthn;
 
 pub use browser::{
     BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab, WEBMCP_DEFAULT_TIMEOUT_MS,
@@ -68,3 +69,7 @@ pub use proxy::Proxy;
 pub use secret::{Secret, SecretResolver};
 pub use session::{Agent, DesktopSession, MAX_HOLD, SessionConfig};
 pub use takeover::{Takeover, TakeoverConfig, TakeoverStatus};
+pub use webauthn::{
+    AuthenticatorProtocol, AuthenticatorTransport, PasskeyCredential, VirtualAuthenticatorId,
+    VirtualAuthenticatorOptions,
+};
