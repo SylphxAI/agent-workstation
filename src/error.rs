@@ -74,6 +74,16 @@ pub enum Error {
     /// A request guard or credential-fill precondition refused the action.
     #[error("refused: {0}")]
     Refused(String),
+    /// A page tool requires approval from the trusted caller. Arguments are not retained.
+    #[error("WebMCP tool requires confirmation")]
+    WebMcpConfirmation {
+        /// The page-defined tool name.
+        tool: String,
+        /// The page-defined tool description.
+        description: String,
+        /// Supplied schema-declared argument names, with all values redacted.
+        arguments: serde_json::Map<String, serde_json::Value>,
+    },
     /// The session was closed.
     #[error("session closed")]
     Closed,
@@ -100,6 +110,7 @@ impl Error {
             Error::Process(_) => "process",
             Error::Profile(_) => "profile",
             Error::Refused(_) => "refused",
+            Error::WebMcpConfirmation { .. } => "confirmation_required",
             Error::Closed => "closed",
             Error::Io(_) => "io",
         }

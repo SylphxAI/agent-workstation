@@ -86,6 +86,11 @@ jobs:
           sudo apt-get install -yq --no-install-recommends sway wayvnc fonts-dejavu-core dbus at-spi2-core
       - name: Unit and behaviour tests
         run: cargo test --all-features --locked
+      - name: WebMCP integration (headless Chromium)
+        env:
+          AGENT_WORKSTATION_WEBMCP_BROWSER: /usr/bin/google-chrome
+          AGENT_WORKSTATION_WEBMCP_NO_SANDBOX: '1'
+        run: cargo test --all-features --locked --test webmcp -- --nocapture
       - name: Headful integration (headless Wayland + Chrome + wayvnc)
         env:
           AGENT_WORKSTATION_HEADFUL: '1'

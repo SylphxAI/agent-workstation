@@ -182,6 +182,48 @@ The first principal to call holds the session until it calls `release`;
 another principal gets `409` with code `leased`, and a person holding control
 answers `409` with code `human-in-control`.
 
+### WebMCP page tools
+
+Use `webmcp-list` to discover tools on the active page and `webmcp-call` to
+invoke one with a JSON object. Both use the session's existing lease. This
+requires a browser exposing the [WebMCP Model Context API](https://webmachinelearning.github.io/webmcp/)
+(on experimental Chromium builds, pass `--browser-arg=--enable-blink-features=WebMCP`
+to the daemon). The consumer checks `navigator.modelContext ?? document.modelContext`;
+a page without the consumer API gives an empty list and ordinary browsing is unchanged.
+
+```sh
+agent-workstation webmcp-list
+agent-workstation webmcp-call search '{"term":"example"}' --timeout-ms 2500
+```
+
+The library exposes `Agent::webmcp_list` and `Agent::webmcp_call`. The daemon
+accepts `{"op":"webmcp_list"}` and `{"op":"webmcp_call","name":"search","arguments":{"term":"example"}}`
+with the usual `principal` on `POST /sessions/{id}/call`; replies are `{"tools":[...]}`
+and `{"value":...}`. Discovery reads the page's current registrations on every
+call. Ordinary semantic `snapshot`, `query`, and `act` page tools use the same
+interface; the consumer does not dispatch on special tool names. Tool execution
+gets a real `AbortSignal` (default timeout 5 seconds, valid
+range 1–20,000 ms); dropping the invocation future also sends an abort. Abort
+is cooperative and cannot undo side effects a tool has already performed.
+
+- `agent_hidden` tools are omitted and not callable by name; marked output
+  subtrees are omitted. A page exposing semantic element actions must also
+  check visibility of the actual target at execution time.
+- `agent_secret` tools or schemas requiring secret custody are not executed;
+  their descriptions/schemas are withheld. Marked output is replaced with
+  `[redacted]` before it is returned. The consumer cannot infer unmarked secrets.
+- `agent_confirm` requires an explicit, trusted caller decision. An unconfirmed
+  call returns `403` with `code: "confirmation_required"`, `tool`, `description`,
+  and `arguments` (only schema-declared keys, with every value redacted). Use
+  `--confirmed` / `"confirmed": true` **only** after independent approval of that
+  specific invocation. This does not satisfy any separate page-side consent gate.
+
+Markers can be declared on a tool, in adapter annotations, or on schema objects
+(native WebIDL drops unknown annotation fields). Any marker value other than
+`false` is treated as set. Page tool metadata and results are untrusted content.
+These checks apply to the WebMCP surface; they are not a sandbox around page
+JavaScript and do not modify general-purpose DOM, accessibility, or `eval` access.
+
 ### Supervision and snapshot admission
 
 Every daemon route requires `Authorization: Bearer <token>`, using the

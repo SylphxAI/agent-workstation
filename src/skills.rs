@@ -308,7 +308,8 @@ mod tests {
                             }
                         }
                     }
-                    Some(Command::Daemon(_)) | None => {}
+                    Some(Command::Daemon(_) | Command::WebmcpList | Command::WebmcpCall { .. })
+                    | None => {}
                 }
             }
         }

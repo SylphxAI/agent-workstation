@@ -33,7 +33,8 @@ use agent_workstation::cli::{
 };
 use agent_workstation::{
     BrowserConfig, Button, Cookie, DesktopAction, DesktopSession, Error, Holder, Input, NodeRef,
-    Profile, Proxy, Secret, SecretResolver, SessionConfig, TreeOptions, native_adapter,
+    Profile, Proxy, Secret, SecretResolver, SessionConfig, TreeOptions, WEBMCP_DEFAULT_TIMEOUT_MS,
+    native_adapter,
 };
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::rejection::PathRejection;
@@ -413,6 +414,20 @@ impl IntoResponse for ApiError {
 
 impl From<Error> for ApiError {
     fn from(e: Error) -> Self {
+        if let Error::WebMcpConfirmation {
+            tool,
+            description,
+            arguments,
+        } = &e
+        {
+            return ApiError(
+                StatusCode::FORBIDDEN,
+                json!({
+                    "code": e.code(), "message": e.to_string(), "tool": tool,
+                    "description": description, "arguments": arguments,
+                }),
+            );
+        }
         let status = match &e {
             Error::HumanInControl { .. } | Error::Leased { .. } => StatusCode::CONFLICT,
             Error::StaleRef(_) => StatusCode::CONFLICT,
@@ -674,6 +689,16 @@ enum Op {
     Eval {
         expression: String,
     },
+    WebmcpList,
+    WebmcpCall {
+        name: String,
+        #[serde(default = "webmcp_empty_arguments")]
+        arguments: Value,
+        #[serde(default)]
+        confirmed: bool,
+        #[serde(default = "webmcp_default_timeout")]
+        timeout_ms: u64,
+    },
     Html {
         r#ref: Option<String>,
     },
@@ -749,6 +774,14 @@ enum Op {
     Release,
 }
 
+fn webmcp_empty_arguments() -> Value {
+    json!({})
+}
+
+fn webmcp_default_timeout() -> u64 {
+    WEBMCP_DEFAULT_TIMEOUT_MS
+}
+
 async fn call(
     State(app): State<Shared>,
     Extension(session): Extension<Arc<DesktopSession>>,
@@ -805,6 +838,15 @@ async fn call(
         }
         Op::ReleaseKeys => json!({ "ok": s.release_keys().await? }),
         Op::Eval { expression } => json!({ "value": s.eval(&expression).await? }),
+        Op::WebmcpList => json!({ "tools": s.webmcp_list().await? }),
+        Op::WebmcpCall {
+            name,
+            arguments,
+            confirmed,
+            timeout_ms,
+        } => {
+            json!({ "value": s.webmcp_call(&name, arguments, confirmed, timeout_ms).await? })
+        }
         Op::Html { r#ref } => json!({ "html": s.html(r#ref.as_deref()).await? }),
         Op::Cookies { urls } => json!({ "cookies": s.cookies(&urls).await? }),
         Op::SetCookies { cookies } => json!({ "ok": s.set_cookies(&cookies).await? }),
@@ -1125,6 +1167,9 @@ impl DaemonClient {
 
 fn format_daemon_error(status: StatusCode, value: &Value) -> String {
     if let Some(obj) = value.as_object() {
+        if obj.get("code").and_then(Value::as_str) == Some("confirmation_required") {
+            return value.to_string();
+        }
         let code = obj.get("code").and_then(Value::as_str);
         let msg = obj.get("message").and_then(Value::as_str);
         match (code, msg) {
@@ -1415,6 +1460,31 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
                     serde_json::to_string(&resp["value"]).map_err(|e| e.to_string())?
                 );
             }
+        }
+        Command::WebmcpList => {
+            let id = client.resolve_session().await?;
+            let response = client.call_op(&id, json!({ "op": "webmcp_list" })).await?;
+            println!("{response}");
+        }
+        Command::WebmcpCall {
+            name,
+            arguments,
+            confirmed,
+            timeout_ms,
+        } => {
+            let arguments: Value = serde_json::from_str(&arguments)
+                .map_err(|_| "WebMCP arguments must be valid JSON".to_owned())?;
+            let id = client.resolve_session().await?;
+            let response = client
+                .call_op(
+                    &id,
+                    json!({
+                        "op": "webmcp_call", "name": name, "arguments": arguments,
+                        "confirmed": confirmed, "timeout_ms": timeout_ms,
+                    }),
+                )
+                .await?;
+            println!("{response}");
         }
         Command::Screenshot {
             path,

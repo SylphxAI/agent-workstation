@@ -21,6 +21,8 @@ use crate::error::{Error, Result};
 use crate::fingerprint::Fingerprint;
 
 mod keys;
+mod webmcp;
+pub use webmcp::{WEBMCP_DEFAULT_TIMEOUT_MS, WEBMCP_MAX_TIMEOUT_MS, WebMcpTool};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);

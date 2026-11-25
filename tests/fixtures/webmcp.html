@@ -1,0 +1,29 @@
+<!doctype html><title>Page tools</title>
+<p>Ordinary page content</p>
+<script>
+window.effects = {hidden: 0, confirmed: 0, secret: 0, clicks: 0, started: 0, aborted: 0};
+window.ready = (async () => {
+    const context = document.modelContext;
+    if (location.pathname === '/plain') return;
+    const add = (name, execute, inputSchema, options) =>
+        context.registerTool({name, description: `Run ${name}`, inputSchema, execute}, options);
+    const object = {type: 'object'};
+    const hidden = {type: 'object', agent_hidden: true};
+    const confirm = {type: 'object', agent_confirm: 'Run this action?', properties: {text: {type: 'string'}}};
+    const secret = {type: 'object', properties: {credential: {type: 'string', agent_secret: true, default: 'fixture-secret'}}};
+    const registration = new AbortController();
+    window.unregister = () => registration.abort();
+    await add('echo', (input, {signal}) => ({input, realSignal: signal instanceof AbortSignal}), object,
+        {signal: registration.signal});
+    window.registerAgain = () => add('echo', () => ({new: true}), object);
+    await add('plain_text', () => 'false', object);
+    await add('hidden', () => ++effects.hidden, hidden);
+    await add('gated', () => ++effects.confirmed > 0 && {ok: true}, confirm);
+    await add('secret', () => ++effects.secret, secret);
+    await add('throws', () => { throw new Error('fixture-secret'); }, object);
+    await add('slow', (_input, {signal}) => new Promise(() => {
+        effects.started++;
+        signal.addEventListener('abort', () => { if (signal.aborted) effects.aborted++; }, {once: true});
+    }), object);
+})();
+</script>

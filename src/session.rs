@@ -7,7 +7,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::browser::{Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web};
+use crate::browser::{Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web, WebMcpTool};
 #[cfg(target_os = "linux")]
 use crate::compositor::{self, Compositor};
 #[cfg(target_os = "linux")]
@@ -783,6 +783,45 @@ impl<'a> Agent<'a> {
     /// Evaluate a script expression in the page.
     pub async fn eval(&self, expression: &str) -> Result<Value> {
         self.web().await?.eval(expression).await
+    }
+
+    /// Discover WebMCP tools on the active page, under the session lease.
+    pub async fn webmcp_list(&self) -> Result<Vec<WebMcpTool>> {
+        let mut web = self.web().await?;
+        let mut control = self.session.gate.subscribe();
+        self.session.check(&self.principal)?;
+        tokio::select! {
+            biased;
+            _ = control.changed() => Err(self.webmcp_control_changed()),
+            result = web.webmcp_list() => result,
+        }
+    }
+
+    /// Invoke a WebMCP tool under the session lease. Dropping the future aborts it.
+    pub async fn webmcp_call(
+        &self,
+        name: &str,
+        input: Value,
+        confirmed: bool,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let mut web = self.web().await?;
+        let mut control = self.session.gate.subscribe();
+        self.session.check(&self.principal)?;
+        tokio::select! {
+            biased;
+            _ = control.changed() => Err(self.webmcp_control_changed()),
+            result = web.webmcp_call(name, input, confirmed, timeout_ms) => result,
+        }
+    }
+
+    fn webmcp_control_changed(&self) -> Error {
+        self.session
+            .check(&self.principal)
+            .err()
+            .unwrap_or_else(|| {
+                Error::Refused("session control changed during WebMCP operation".into())
+            })
     }
 
     /// Outer HTML of an element, or of the document.
