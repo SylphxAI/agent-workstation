@@ -189,6 +189,24 @@ pub enum Command {
         js: String,
     },
 
+    /// Discover page-defined WebMCP tools.
+    WebmcpList,
+
+    /// Invoke a page-defined WebMCP tool with a JSON argument object.
+    WebmcpCall {
+        /// Page-defined tool name from webmcp-list.
+        name: String,
+        /// JSON argument object.
+        #[arg(default_value = "{}")]
+        arguments: String,
+        /// The caller obtained human approval for this operation.
+        #[arg(long)]
+        confirmed: bool,
+        /// Deadline in milliseconds (1–20000).
+        #[arg(long, default_value_t = crate::WEBMCP_DEFAULT_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+
     /// Capture a PNG screenshot of the active page (or full desktop with `--desktop`).
     Screenshot {
         /// Optional output file path for the PNG bytes.

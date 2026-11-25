@@ -1,0 +1,36 @@
+<!doctype html><title>Semantic page tools</title>
+<script>
+const counter = {clicks: 0, documentCalls: 0};
+const tools = new Map();
+Object.defineProperty(navigator, 'modelContext', {value: {
+    getTools: async () => [...tools.values()],
+    executeTool: (tool, input, options) => {
+        if (tools.get(tool.name) !== tool || !(options.signal instanceof AbortSignal)) throw new Error();
+        return tool.execute(input, options);
+    },
+    provideContext: ({tools: registrations}) => registrations.forEach(tool => tools.set(tool.name, tool)),
+}});
+Object.defineProperty(document, 'modelContext', {value: {
+    getTools: () => { counter.documentCalls++; throw new Error('wrong context'); },
+    executeTool: () => { throw new Error('wrong context'); },
+}});
+const nodes = [
+    {ref: 'save', role: 'button', label: 'Save'},
+    {ref: 'private', agent_hidden: true, label: 'fixture-hidden'},
+    {ref: 'password', secret: true, role: 'text', label: 'fixture-secret', value: 'fixture-secret'},
+    {ref: 'value', agent_secret: true, value: 'fixture-secret'},
+];
+navigator.modelContext.provideContext({tools: [
+    {name: 'ui.snapshot', description: 'Read the semantic tree', inputSchema: {type: 'object'},
+        execute: () => ({role: 'window', children: nodes})},
+    {name: 'ui.query', description: 'Query the semantic tree', inputSchema: {type: 'object'},
+        execute: ({ref}) => nodes.filter(node => node.ref === ref)},
+    {name: 'ui.act', description: 'Perform a semantic action', inputSchema: {type: 'object'},
+        annotations: {consequentialHint: true}, execute: ({ref, action}) => {
+            if (ref === 'save' && action === 'click') { counter.clicks++; return {ok: true}; }
+            if (ref === 'locked') return {isError: true, error: {code: 'confirmation_required', ref}};
+            return {isError: true, error: {code: 'not_found'}};
+        }},
+    {name: 'invisible', description: 'Never discover', annotations: {agent_hidden: null}, execute: () => ++counter.clicks},
+]});
+</script>

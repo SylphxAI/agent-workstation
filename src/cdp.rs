@@ -20,6 +20,7 @@ pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One CDP connection.
 pub struct Cdp {
+    endpoint: String,
     ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     session_id: Option<String>,
@@ -47,12 +48,17 @@ impl Cdp {
         .map_err(|_| Error::Timeout("CDP connect".into()))?
         .map_err(|e| Error::protocol(format!("CDP connect: {e}")))?;
         Ok(Self {
+            endpoint: endpoint.to_owned(),
             ws,
             next_id: 0,
             session_id: None,
             events: VecDeque::new(),
             healthy: true,
         })
+    }
+
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     /// Whether the socket is still usable.

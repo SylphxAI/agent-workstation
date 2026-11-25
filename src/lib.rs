@@ -47,7 +47,10 @@ pub mod vnc;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 
-pub use browser::{BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab};
+pub use browser::{
+    BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab, WEBMCP_DEFAULT_TIMEOUT_MS,
+    WEBMCP_MAX_TIMEOUT_MS, WebMcpTool,
+};
 pub use desktop::{
     Button, DesktopFallbackReason, DesktopFocus, DesktopRect, DesktopSnapshot, DesktopWindow,
     DesktopWindowRef, Frame, Input, SessionDesktopSnapshot,

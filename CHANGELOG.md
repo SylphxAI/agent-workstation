@@ -35,6 +35,9 @@ was never published.
 
 ### Added
 
+- Discover and call page-provided WebMCP tools through the library, daemon,
+  and CLI, with bounded browser-side cancellation and safety marker checks.
+
 - Touch-first Takeover viewers open the soft keyboard when tapping a detected
   editable target. Tapping away dismisses an automatically opened keyboard;
   the toolbar can still pin, dismiss, or open it for undetected targets.

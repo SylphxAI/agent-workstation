@@ -152,6 +152,7 @@ impl ControlGate {
             s.lease = None;
             s.lease_id = None;
             s.cycle = None;
+            self.holder.send_modify(|_| {});
             true
         } else {
             false
