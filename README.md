@@ -115,21 +115,41 @@ text that depends on it. The generic input layer does not recognize browser
 shortcuts or resend input. Keys held by `Input::KeyDown` are released when
 the steps of that `input` call end.
 
-### Virtual WebAuthn (Chromium)
+### WebAuthn (Chromium)
 
-Library callers can use `Agent::enable_webauthn` (or `browser::Web::enable_webauthn`)
+#### Origin-bound ceremony leases (`chrome.webAuthenticationProxy`)
+
+For exact-origin, top-document passkey ceremonies where private keys must stay
+outside Chromium, enable unpacked extension loading on `BrowserConfig`
+(`browser.enable_webauthn_proxy()`, which passes `--enable-unsafe-extension-debugging`)
+and arm a single-use lease with `Agent::arm_webauthn_ceremony` (or
+`browser::Web::arm_webauthn_ceremony`):
+
+- Private keys remain strictly inside the caller's `WebAuthnSigner` implementation
+  and never enter Chromium or its `FrameTreeNode`.
+- While armed, a temporary per-lease MV3 extension connects to an authenticated
+  loopback bridge (pinned to the loaded extension ID and a per-lease 256-bit
+  token) and intercepts modal `navigator.credentials.create()` / `get()` calls.
+- Before invoking `WebAuthnSigner`, the bridge enforces Chromium's browser-process
+  `extensions.remoteDesktopClientOverride.{origin, sameOriginWithAncestors}`
+  assertions (`origin == allowed_origin` and `sameOriginWithAncestors == true`
+  by default), atomically refusing same-RP different-origin navigations (including
+  BFCache and Service Worker navigations) and delegated cross-origin iframes with
+  `NotAllowedError`.
+- Any virtual WebAuthn environment on the active page is disabled on arm so it
+  cannot shadow the proxy. Calling `finish().await`, `cancel().await`, hitting the
+  lease deadline, losing session control (human takeover or close), or dropping
+  the lease detaches the proxy and uninstalls the temporary extension so normal
+  conditional autofill remains unaffected outside armed ceremonies.
+
+#### Virtual WebAuthn (CDP)
+
+Library callers can also use `Agent::enable_webauthn` (or `browser::Web::enable_webauthn`)
 to enable Chromium's **software** virtual authenticator on the active page
-without native passkey UI. Use `add_virtual_authenticator(&VirtualAuthenticatorOptions::default())`
-before calling the page's usual WebAuthn registration or assertion API. The
-authenticator belongs to that page; it is not stored in the Chromium profile.
-Use `get_credentials` to export its credentials and `add_credential` to import them into
-a fresh virtual authenticator. Remove the authenticator or disable virtual
-WebAuthn on that page when finished.
-
-These operations are Rust library APIs, not daemon/CLI commands. Use only a
-trusted DevTools connection. Exported credentials contain raw private keys:
-store them as secrets, not as ordinary profile data or diagnostic output. The
-caller owns authorization, relying-party scope, and persistence. To keep
+without native passkey UI. Note that Chromium attaches CDP virtual authenticators
+to the page's `FrameTreeNode` (inherited by descendant frames and preserved across
+same-tab navigations), and exported credentials contain raw private keys: store
+them as secrets, not as ordinary profile data or diagnostic output. To keep
 WebSocket payloads out of diagnostics, this crate caps the Rust `log` facade at
 `info` at compile time for builds that include it.
 

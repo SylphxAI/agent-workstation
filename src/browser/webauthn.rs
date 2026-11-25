@@ -1,4 +1,8 @@
-//! Typed WebAuthn commands on the active page's attached CDP session.
+//! Typed WebAuthn commands on the active page's attached CDP session and
+//! origin-bound ceremony leases via Chromium's `chrome.webAuthenticationProxy`.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -6,14 +10,26 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::Web;
-use crate::webauthn::WireCredential;
+use super::webauthn_proxy::{ControlWatcher, WebAuthnCeremonyLease, arm_lease};
+use crate::webauthn::{WebAuthnCeremonyLeaseConfig, WebAuthnSigner, WireCredential};
 use crate::{
     Error, PasskeyCredential, Result, VirtualAuthenticatorId, VirtualAuthenticatorOptions,
 };
 
 impl Web {
     /// Enable virtual WebAuthn on the active page, suppressing Chromium's native UI.
+    ///
+    /// Note: Chromium attaches CDP virtual authenticators to the page's
+    /// `FrameTreeNode` (inherited by descendant frames and preserved across
+    /// same-tab navigations). For exact-origin, top-document enforcement without
+    /// placing private keys in Chromium, use [`Web::arm_webauthn_ceremony`].
     pub async fn enable_webauthn(&mut self) -> Result<()> {
+        if self.webauthn_proxy_active.load(Ordering::Acquire) {
+            return Err(Error::Refused(
+                "cannot enable virtual WebAuthn while an origin-bound WebAuthn ceremony lease is active"
+                    .into(),
+            ));
+        }
         self.webauthn_call("WebAuthn.enable", json!({ "enableUI": false }))
             .await?;
         Ok(())
@@ -31,6 +47,12 @@ impl Web {
         &mut self,
         options: &VirtualAuthenticatorOptions,
     ) -> Result<VirtualAuthenticatorId> {
+        if self.webauthn_proxy_active.load(Ordering::Acquire) {
+            return Err(Error::Refused(
+                "cannot add a virtual authenticator while an origin-bound WebAuthn ceremony lease is active"
+                    .into(),
+            ));
+        }
         #[derive(Deserialize)]
         #[serde(rename_all = "camelCase")]
         struct Added {
@@ -119,6 +141,55 @@ impl Web {
         )
         .await?;
         Ok(())
+    }
+
+    /// Arm a single-use, exact-origin WebAuthn ceremony lease backed by
+    /// Chromium's `chrome.webAuthenticationProxy` API and an out-of-browser
+    /// [`WebAuthnSigner`].
+    ///
+    /// Private keys stay strictly in `signer` and never enter Chromium. Any
+    /// active CDP virtual WebAuthn environment on the active page is disabled
+    /// first so virtual authenticators cannot shadow the proxy. The browser
+    /// must be launched with [`crate::WEBAUTHN_PROXY_EXTENSION_FLAG`]
+    /// (see [`crate::BrowserConfig::enable_webauthn_proxy`]).
+    ///
+    /// While the lease is armed, callers can continue driving the page (for
+    /// example clicking a sign-in button or calling [`Web::eval`]), then await
+    /// [`WebAuthnCeremonyLease::finish`] to detach and uninstall the bridge.
+    pub async fn arm_webauthn_ceremony(
+        &mut self,
+        config: WebAuthnCeremonyLeaseConfig,
+        signer: impl WebAuthnSigner + 'static,
+    ) -> Result<WebAuthnCeremonyLease> {
+        self.arm_webauthn_ceremony_with_gate(config, Arc::new(signer), None)
+            .await
+    }
+
+    pub(crate) async fn arm_webauthn_ceremony_with_gate(
+        &mut self,
+        config: WebAuthnCeremonyLeaseConfig,
+        signer: Arc<dyn WebAuthnSigner>,
+        control: Option<ControlWatcher>,
+    ) -> Result<WebAuthnCeremonyLease> {
+        // Validate early before mutating any browser WebAuthn state.
+        let _ = config.validate()?;
+        if self.cdp.session_id().is_none() {
+            return Err(Error::Refused(
+                "WebAuthn ceremony lease requires an attached page target".into(),
+            ));
+        }
+        // Chromium gives FrameTreeNode virtual authenticators precedence over
+        // chrome.webAuthenticationProxy; explicitly disable any virtual
+        // environment on the active page so it cannot shadow this lease.
+        self.webauthn_call("WebAuthn.disable", json!({})).await?;
+        arm_lease(
+            self.cdp.endpoint().to_owned(),
+            self.webauthn_proxy_active.clone(),
+            config,
+            signer,
+            control,
+        )
+        .await
     }
 
     async fn webauthn_call(&mut self, method: &str, params: Value) -> Result<Value> {
