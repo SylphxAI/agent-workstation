@@ -1107,15 +1107,18 @@ impl DbusConn {
         let length = decode_u32(&resp, &mut cursor).unwrap_or(0) as usize;
         // AT-SPI currently reports two 32-bit words. Accept additional words,
         // but refuse incomplete, empty or mismatched replies.
-        if sig != "au" || length == 0 || length % 4 != 0 || resp.len() != cursor + length {
+        if sig != "au" || length == 0 || resp.len() != cursor + length {
             return Err(AdapterError::Backend(
                 "invalid accessibility state reply".into(),
             ));
         }
-        Ok(resp[cursor..]
-            .chunks_exact(4)
-            .map(|word| u32::from_le_bytes(word.try_into().expect("four-byte state word")))
-            .collect())
+        let (words, remainder) = resp[cursor..].as_chunks::<4>();
+        if !remainder.is_empty() {
+            return Err(AdapterError::Backend(
+                "invalid accessibility state reply".into(),
+            ));
+        }
+        Ok(words.iter().copied().map(u32::from_le_bytes).collect())
     }
 
     async fn get_extents(
