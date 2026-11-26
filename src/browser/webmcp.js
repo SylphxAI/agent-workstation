@@ -59,38 +59,53 @@
     const stopped = new Promise(resolve => signal.addEventListener('abort', () => {
         resolve({status: signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled'});
     }, {once: true}));
+    // Native getTools may include same-origin child frames. Never request
+    // other origins, and keep only the top-level source.
+    const local = tool => {
+        const source = 'source' in tool ? tool.source : ('window' in tool ? tool.window : undefined);
+        return (source === globalThis && tool.origin === globalThis.origin) ||
+            (source === undefined && !('origin' in tool)); // local adapter
+    };
     const run = async () => {
         if (op === 'list') {
             const usable = ctx => ctx != null && typeof ctx.getTools === 'function' && typeof ctx.executeTool === 'function';
             const candidate = navigator.modelContext;
             const context = usable(candidate) ? candidate : document.modelContext;
             if (!usable(context)) return {status: 'ok', value: []};
-            // Native getTools also discovers same-origin child frames. Never
-            // request other origins, and keep only the top-level source.
-            const tools = (await context.getTools()).filter(tool => {
-                const source = 'source' in tool ? tool.source : ('window' in tool ? tool.window : undefined);
-                const own = source === globalThis && tool.origin === globalThis.origin;
-                const localAdapter = source === undefined && !('origin' in tool);
-                return (own || localAdapter) && !hidden(tool);
-            });
-            signal.throwIfAborted();
-            const value = tools.map(describe);
-            // Do not resurrect discovery refs when this document is restored
-            // from the back/forward cache. Replace the preceding listener too.
-            const previous = globalThis[registry];
-            if (previous) removeEventListener('pagehide', previous.clear);
-            const clear = () => { delete globalThis[registry]; };
+            // Older browser builds dispatch descriptors by name internally.
+            // Invalidate the discovered set whenever the browser reports a
+            // registry change, rather than allowing a same-name replacement.
+            globalThis[registry]?.clear();
+            const binding = {generation, context, tools: [], changed: false, clear: null};
+            const changed = () => { binding.changed = true; };
+            const clear = () => {
+                context.removeEventListener?.('toolchange', changed);
+                removeEventListener('pagehide', clear);
+                delete globalThis[registry];
+            };
+            binding.clear = clear;
+            context.addEventListener?.('toolchange', changed);
             addEventListener('pagehide', clear, {once: true});
-            Object.defineProperty(globalThis, registry, {value: {generation, context, tools, clear}, configurable: true});
-            return {status: 'ok', value};
+            Object.defineProperty(globalThis, registry, {value: binding, configurable: true});
+            const tools = (await context.getTools()).filter(tool => local(tool) && !hidden(tool));
+            signal.throwIfAborted();
+            if (binding.changed) return {status: 'stale'};
+            binding.tools = tools;
+            return {status: 'ok', value: tools.map(describe)};
         }
         const binding = globalThis[registry];
-        if (binding?.generation !== generation) return {status: 'stale'};
+        if (binding?.generation !== generation || binding.changed) return {status: 'stale'};
         const {context, tools} = binding;
         // Keep the actual Tool descriptor so the native API rejects a removed
         // or replaced registration even when another tool reuses its name.
         const tool = tools[index];
         if (!tool || hidden(tool)) return {status: 'not_found'};
+        // Browser versions differ in the exception for a removed registration.
+        // Check presence, but never dispatch a fresh descriptor by name.
+        const current = await context.getTools();
+        signal.throwIfAborted();
+        if (!current.some(t => t.name === tool.name && local(t))) return {status: 'not_found'};
+        if (binding.changed) return {status: 'stale'};
         if (secret(tool) || markers.some(marker => hasMarker(input, marker))) return {status: 'refused'};
         if (requiresConfirmation(tool) && confirmed !== true) {
             // No caller-supplied values or keys go back to the approval channel.

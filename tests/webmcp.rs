@@ -199,10 +199,24 @@ async fn real_headless_chromium_webmcp() {
 
     let echo = discover(&mut web, "echo").await.unwrap();
     web.eval("unregister()").await.unwrap();
-    assert!(matches!(
-        web.webmcp_call(&echo, json!({}), false, 5_000).await,
-        Err(Error::NotFound(_))
-    ));
+    let removed = web.webmcp_call(&echo, json!({}), false, 5_000).await;
+    assert!(
+        matches!(removed, Err(Error::NotFound(_) | Error::StaleRef(_))),
+        "{removed:?}"
+    );
+    web.eval("registerAgain()").await.unwrap();
+    let replaced = web.webmcp_call(&echo, json!({}), false, 5_000).await;
+    assert!(
+        matches!(replaced, Err(Error::NotFound(_) | Error::StaleRef(_))),
+        "{replaced:?}"
+    );
+    assert_eq!(
+        call(&mut web, "echo", json!({})).await.unwrap(),
+        json!({"new":true})
+    );
+    web.navigate(&format!("{origin}/native")).await.unwrap();
+    web.eval("window.ready").await.unwrap();
+    web.eval("unregister()").await.unwrap();
     assert!(
         !web.webmcp_list()
             .await

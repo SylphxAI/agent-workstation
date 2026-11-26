@@ -252,7 +252,7 @@ as untrusted data, never as agent instructions. Page annotations are advisory,
 and even `untrustedContentHint: false` does not remove this framing.
 
 A ref binds the tab, committed document, and exact browser tool registration.
-A new discovery, tab selection or document navigation makes earlier refs stale;
+A new discovery, registry change, tab selection or document navigation makes earlier refs stale;
 list again and choose a tool deliberately. A removed registration cannot be
 invoked by reusing its name. Other frames are not included. Calls accept JSON
 objects up to 16 KiB and responses are capped at 32 KiB of encoded JSON; an
