@@ -102,6 +102,8 @@ fn fixture_tree() -> Vec<RawNode<String>> {
         pid: Some(4200),
         enabled: true,
         focused: true,
+        editable: false,
+        checked: false,
         bounds: Some(DesktopRect {
             x: 0,
             y: 0,
@@ -118,6 +120,8 @@ fn fixture_tree() -> Vec<RawNode<String>> {
             pid: Some(4200),
             enabled: true,
             focused: false,
+            editable: false,
+            checked: false,
             bounds: Some(DesktopRect {
                 x: 0,
                 y: 0,
@@ -135,6 +139,8 @@ fn fixture_tree() -> Vec<RawNode<String>> {
                     pid: Some(4200),
                     enabled: true,
                     focused: false,
+                    editable: false,
+                    checked: false,
                     bounds: Some(DesktopRect {
                         x: 16,
                         y: 8,
@@ -153,6 +159,8 @@ fn fixture_tree() -> Vec<RawNode<String>> {
                     pid: Some(4200),
                     enabled: true,
                     focused: false,
+                    editable: false,
+                    checked: false,
                     bounds: Some(DesktopRect {
                         x: 272,
                         y: 8,

@@ -627,3 +627,142 @@ impl SecretResolver for NavigatingResolver<'_> {
         Ok(Secret::new(SECRET.into()))
     }
 }
+
+#[tokio::test]
+async fn native_gtk_dialog_uses_session_refs_for_focus_text_and_click() {
+    use agent_workstation::{SessionDesktopSnapshot, TreeOptions};
+    use std::process::Stdio;
+
+    if std::env::var("AGENT_WORKSTATION_HEADFUL").as_deref() != Ok("1") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = dir.path().join("desktop");
+    let desk = DesktopSession::start(config(&dir.path().join("profile"), &runtime, false))
+        .await
+        .unwrap();
+    let leased = desk.lease("other-agent").unwrap();
+    assert!(leased.clone().release());
+    let agent = desk.lease("agent").unwrap();
+    assert!(matches!(
+        desk.lease("other-agent"),
+        Err(Error::Leased { .. })
+    ));
+    assert!(matches!(
+        leased.desktop_snapshot().await,
+        Err(Error::Leased { .. })
+    ));
+
+    let display = std::fs::read_dir(&runtime)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .find(|name| {
+            name.to_str()
+                .is_some_and(|s| s.starts_with("wayland-") && !s.ends_with(".lock"))
+        })
+        .expect("session Wayland socket");
+    let receipt = dir.path().join("applied.txt");
+    let mut gtk = tokio::process::Command::new("/usr/bin/python3")
+        .args(["-c", include_str!("fixtures/atspi-dialog.py")])
+        .arg(&receipt)
+        .env("GDK_BACKEND", "wayland")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("WAYLAND_DISPLAY", display)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", runtime.join("dbus").display()),
+        )
+        .env_remove("AT_SPI_BUS_ADDRESS")
+        .env_remove("NO_AT_BRIDGE")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+
+    let opts = TreeOptions {
+        pid: Some(gtk.id().expect("GTK fixture PID")),
+        ..TreeOptions::default()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (entry, apply) = loop {
+        if let SessionDesktopSnapshot::NativeAccessibility { tree } =
+            agent.desktop_snapshot_with(opts, None, 0).await.unwrap()
+        {
+            let mut nodes = tree.roots.iter().collect::<Vec<_>>();
+            let mut entry = None;
+            let mut apply = None;
+            let mut checked = false;
+            let mut dialog = false;
+            while let Some(node) = nodes.pop() {
+                match node.name.as_str() {
+                    "AT-SPI Test Dialog" => dialog = node.role == "dialog",
+                    "Fixture Entry" => {
+                        assert!(node.enabled && node.editable);
+                        entry = Some(node.qualified_ref.clone());
+                    }
+                    "Fixture Apply" => apply = Some(node.qualified_ref.clone()),
+                    "Fixture Checked" => checked = node.checked,
+                    _ => {}
+                }
+                nodes.extend(&node.children);
+            }
+            if let (Some(entry), Some(apply)) = (entry, apply) {
+                assert!(checked && dialog);
+                break (entry, apply);
+            }
+        }
+        assert!(
+            gtk.try_wait().unwrap().is_none(),
+            "GTK fixture exited before registration"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "GTK dialog not found on the session bus"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    desk.gate().take(None);
+    assert!(matches!(
+        agent.desktop_snapshot().await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(matches!(
+        agent.desktop_focus(&entry).await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(matches!(
+        agent.desktop_set_value(&entry, "blocked".into()).await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(matches!(
+        agent.desktop_click_ref(&apply, Button::Left, None).await,
+        Err(Error::HumanInControl { .. })
+    ));
+    assert!(!receipt.exists());
+    assert!(desk.gate().release(None));
+
+    agent.desktop_focus(&entry).await.unwrap();
+    agent
+        .desktop_set_value(&entry, "native café".into())
+        .await
+        .unwrap();
+    agent
+        .desktop_click_ref(&apply, Button::Left, None)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while std::fs::read_to_string(&receipt).as_deref().ok() != Some("native café") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("native click applies the ref-edited text");
+    gtk.kill().await.unwrap();
+    assert!(matches!(
+        agent.desktop_click_ref(&apply, Button::Left, None).await,
+        Err(Error::StaleRef(_))
+    ));
+    desk.close().await;
+}
