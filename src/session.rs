@@ -120,6 +120,9 @@ impl Viewer {
 /// Web and desktop operations act on the same window and share one control
 /// gate: while a person holds control, every call returns
 /// [`Error::HumanInControl`].
+///
+/// Await [`Self::close`] before archiving or reopening the profile. Dropping
+/// the session without closing it only kills its child processes.
 #[derive(Debug)]
 pub struct DesktopSession {
     gate: Arc<ControlGate>,
@@ -503,9 +506,9 @@ impl DesktopSession {
 
     /// Close the session: new calls fail with [`Error::Closed`], calls in
     /// flight finish first, then the takeover page, the VNC server, the
-    /// browser (gracefully, so it flushes the profile) and the compositor
-    /// stop. Safe to call from any holder of a shared reference, and more
-    /// than once.
+    /// browser stop. The session bus and compositor remain available until
+    /// the browser exits, so it can flush the profile. Safe to call from any
+    /// holder of a shared reference, and more than once.
     pub async fn close(&self) {
         self.gate.close();
         self.finish_close().await;
@@ -607,6 +610,7 @@ impl TakeoverInput {
 }
 
 async fn stop_processes(mut p: Processes) {
+    // Wait for the browser to exit before either display or bus can go away.
     if let Some(b) = p.browser.take() {
         b.shutdown().await;
     }
