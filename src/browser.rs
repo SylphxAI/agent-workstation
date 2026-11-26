@@ -33,6 +33,7 @@ pub use webmcp::{
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Snapshot text beyond this many lines is cut.
 const MAX_SNAPSHOT_LINES: usize = 2_000;
 
@@ -48,6 +49,7 @@ pub struct BrowserConfig {
     pub extra_args: Vec<String>,
     /// Optional executable and leading arguments prepended to the browser command.
     /// Empty launches the browser directly; entries are passed verbatim, not through a shell.
+    /// The wrapper should exec the browser so the owned child receives shutdown signals.
     pub wrapper: Vec<String>,
     /// Clear the inherited environment instead of only removing `DISPLAY`.
     pub clear_env: bool,
@@ -249,12 +251,21 @@ impl Browser {
 
     /// Close gracefully (flushing the profile), then kill after a grace period.
     ///
-    /// Every tab is closed first, which ends the browser the way a person
-    /// closing its last window does. `Browser.close` is only the fallback:
-    /// Chromium crashes in it while a native bubble such as "Save password?"
-    /// is open, and a crash loses the cookies it had not written yet.
+    /// Close tabs first and give Chromium time to exit as it would when the
+    /// last window is closed. On Unix, use Chromium's OS shutdown handler if
+    /// a keepalive (such as extension activity) holds the process open, or
+    /// if DevTools is unavailable. `Browser.close` is a fallback because it
+    /// can crash Chromium when a native bubble is open.
     pub async fn shutdown(mut self) {
-        if let Ok(mut cdp) = Cdp::connect(&self.endpoint).await {
+        self.shutdown_child().await;
+    }
+
+    async fn shutdown_child(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let mut cdp = Cdp::connect(&self.endpoint).await.ok();
+        if let Some(cdp) = &mut cdp {
             for page in cdp.pages().await.unwrap_or_default() {
                 if let Some(id) = page["targetId"].as_str() {
                     let _ = cdp
@@ -267,22 +278,45 @@ impl Browser {
                         .await;
                 }
             }
-            if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
-                .await
-                .is_ok()
+            if self.wait_for_exit().await {
+                return;
+            }
+        }
+
+        #[cfg(unix)]
+        if let Some(pid) = self.child.id().and_then(|id| {
+            i32::try_from(id)
+                .ok()
+                .and_then(rustix::process::Pid::from_raw)
+        }) {
+            // Signal only the owned, unreaped child, not its process group:
+            // Chromium needs its subprocesses alive during the profile flush.
+            if rustix::process::kill_process(pid, rustix::process::Signal::TERM).is_ok()
+                && self.wait_for_exit().await
             {
+                return;
+            }
+        }
+
+        if let Some(cdp) = &mut cdp {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
             }
             let _ =
                 tokio::time::timeout(Duration::from_secs(3), cdp.call("Browser.close", json!({})))
                     .await;
         }
-        if tokio::time::timeout(Duration::from_secs(5), self.child.wait())
-            .await
-            .is_err()
-        {
+        if !self.wait_for_exit().await {
+            tracing::warn!("browser did not exit gracefully; killing it");
             let _ = self.child.kill().await;
         }
+    }
+
+    async fn wait_for_exit(&mut self) -> bool {
+        matches!(
+            tokio::time::timeout(SHUTDOWN_GRACE, self.child.wait()).await,
+            Ok(Ok(_))
+        )
     }
 }
 
@@ -1669,6 +1703,34 @@ fn render_tree(nodes: &[Value], start: usize) -> (String, HashMap<String, i64>) 
 mod tests {
     use super::*;
     use crate::fingerprint::FingerprintDefaults;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shutdown_without_devtools_waits_for_sigterm_handler() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "trap 'exit 42' TERM; echo ready; read -r line"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        // Child::wait closes any stdin it still owns. Keep the fixture
+        // blocked on read until it handles SIGTERM.
+        let _stdin = child.stdin.take().unwrap();
+        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some("ready"));
+        let mut browser = Browser {
+            child,
+            endpoint: "not a WebSocket URL".into(),
+        };
+
+        browser.shutdown_child().await;
+        // The handler's exit code proves SIGTERM was handled and reaped, not
+        // merely sent before an immediate SIGKILL or a return to the caller.
+        assert_eq!(browser.child.try_wait().unwrap().unwrap().code(), Some(42));
+    }
 
     #[test]
     fn launch_args_are_headful_wayland_with_seed_and_proxy() {

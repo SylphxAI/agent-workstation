@@ -74,14 +74,7 @@ fn config(profile: &std::path::Path, runtime: &std::path::Path) -> SessionConfig
 
 /// A second DevTools client on the active tab, for observation only.
 async fn observer(a: &Agent<'_>, profile: &std::path::Path) -> Cdp {
-    let port = std::fs::read_to_string(profile.join("user-data/DevToolsActivePort")).unwrap();
-    let mut lines = port.lines();
-    let endpoint = format!(
-        "ws://127.0.0.1:{}{}",
-        lines.next().unwrap(),
-        lines.next().unwrap()
-    );
-    let mut cdp = Cdp::connect(&endpoint).await.unwrap();
+    let mut cdp = browser_observer(profile).await;
     let active = a
         .tabs()
         .await
@@ -91,6 +84,17 @@ async fn observer(a: &Agent<'_>, profile: &std::path::Path) -> Cdp {
         .unwrap();
     cdp.attach(&active.id).await.unwrap();
     cdp
+}
+
+async fn browser_observer(profile: &std::path::Path) -> Cdp {
+    let port = std::fs::read_to_string(profile.join("user-data/DevToolsActivePort")).unwrap();
+    let mut lines = port.lines();
+    let endpoint = format!(
+        "ws://127.0.0.1:{}{}",
+        lines.next().unwrap(),
+        lines.next().unwrap()
+    );
+    Cdp::connect(&endpoint).await.unwrap()
 }
 
 async fn eval(cdp: &mut Cdp, expression: &str) -> Value {
@@ -577,6 +581,138 @@ async fn serve_login() -> String {
         }
     });
     format!("http://{addr}/")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn close_with_an_extension_flushes_the_profile_before_desktop_teardown() {
+    if !headful() {
+        return;
+    }
+    let (profile, rt, extension) = (
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+        tempfile::tempdir().unwrap(),
+    );
+    std::fs::write(
+        extension.path().join("manifest.json"),
+        r#"{"manifest_version":3,"name":"Shutdown fixture","version":"1.0",
+            "background":{"service_worker":"worker.js"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        extension.path().join("worker.js"),
+        "self.fixtureReady = true;",
+    )
+    .unwrap();
+
+    let run = rt.path().join("a");
+    let mut cfg = config(profile.path(), &run);
+    cfg.browser.extra_args.extend([
+        format!("--load-extension={}", extension.path().display()),
+        // An idle MV3 worker need not hold the browser open on every build.
+        // Force the no-window keepalive independently of that implementation detail.
+        "--keep-alive-for-test".into(),
+        "--enable-logging=stderr".into(),
+        "--vmodule=shutdown_signal_handlers_posix=1".into(),
+    ]);
+    cfg.browser.enable_webauthn_proxy(); // Branded Chrome ignores --load-extension.
+    let desk = DesktopSession::start(cfg).await.unwrap();
+    let agent = desk.lease("fixture").unwrap();
+    let url = serve_login().await;
+    agent.navigate(&url).await.unwrap();
+    let mut cdp = browser_observer(profile.path()).await;
+    let worker = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut installed = false;
+        loop {
+            let targets = cdp.call("Target.getTargets", json!({})).await.unwrap();
+            if let Some(worker) = targets["targetInfos"].as_array().unwrap().iter().find(|t| {
+                t["type"] == "service_worker"
+                    && t["url"].as_str().is_some_and(|url| {
+                        url.starts_with("chrome-extension://") && url.ends_with("/worker.js")
+                    })
+            }) {
+                break worker["targetId"].as_str().unwrap().to_owned();
+            }
+            if !installed {
+                let extensions = cdp
+                    .call("Extensions.getExtensions", json!({}))
+                    .await
+                    .unwrap();
+                if extensions["extensions"].as_array().unwrap().is_empty() {
+                    cdp.call("Extensions.loadUnpacked", json!({"path": extension.path()}))
+                        .await
+                        .unwrap();
+                }
+                installed = true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("MV3 worker target did not start");
+    let mut worker_cdp = browser_observer(profile.path()).await;
+    worker_cdp.attach(&worker).await.unwrap(); // Attached workers do not idle out.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while eval(&mut worker_cdp, "self.fixtureReady === true").await != true {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("MV3 worker script did not run");
+
+    let pages = cdp.pages().await.unwrap();
+    assert_eq!(pages.len(), 1);
+    let target = pages[0]["targetId"].as_str().unwrap();
+    cdp.call("Target.setDiscoverTargets", json!({"discover": true}))
+        .await
+        .unwrap();
+    agent
+        .eval("document.cookie = 'flush=worker-active; Max-Age=86400; Path=/'")
+        .await
+        .unwrap();
+    let closing = desk.close();
+    tokio::pin!(closing);
+    tokio::select! {
+        () = &mut closing => panic!("browser did not survive its last tab closing"),
+        result = cdp.wait_target_destroyed(target, Duration::from_secs(10)) => result.unwrap(),
+    }
+    for socket in ["sway.sock", "dbus"] {
+        tokio::net::UnixStream::connect(run.join(socket))
+            .await
+            .unwrap();
+    }
+    closing.await;
+
+    let log = std::fs::read_to_string(run.join("browser.log")).unwrap();
+    assert!(log.contains("Handling shutdown for signal 15"), "{log}");
+    let data = profile.path().join("user-data");
+    let prefs: Value =
+        serde_json::from_slice(&std::fs::read(data.join("Default/Preferences")).unwrap()).unwrap();
+    assert!(matches!(
+        prefs["profile"]["exit_type"].as_str(),
+        Some("Normal" | "SessionEnded")
+    ));
+    for socket in ["sway.sock", "dbus"] {
+        assert!(
+            tokio::net::UnixStream::connect(run.join(socket))
+                .await
+                .is_err()
+        );
+    }
+    let state: Value =
+        serde_json::from_slice(&std::fs::read(data.join("Local State")).unwrap()).unwrap();
+    assert!(state["profile"]["info_cache"]["Default"].is_object());
+
+    let reopened = DesktopSession::start(config(profile.path(), &rt.path().join("b")))
+        .await
+        .unwrap();
+    let agent = reopened.lease("fixture").unwrap();
+    agent.navigate(&url).await.unwrap();
+    assert_eq!(
+        agent.eval("c.textContent").await.unwrap(),
+        "flush=worker-active"
+    );
+    reopened.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
