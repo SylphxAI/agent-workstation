@@ -27,7 +27,9 @@ mod webauthn;
 pub(crate) mod webauthn_proxy;
 mod webmcp;
 pub use webauthn_proxy::WebAuthnCeremonyLease;
-pub use webmcp::{WEBMCP_DEFAULT_TIMEOUT_MS, WEBMCP_MAX_TIMEOUT_MS, WebMcpTool};
+pub use webmcp::{
+    WEBMCP_DEFAULT_TIMEOUT_MS, WEBMCP_MAX_TIMEOUT_MS, WebMcpDiscovery, WebMcpResult, WebMcpTool,
+};
 
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
 const LOAD_TIMEOUT: Duration = Duration::from_secs(30);
@@ -682,6 +684,8 @@ pub struct Web {
     held: Vec<keys::Key>,
     /// Whether an origin-bound WebAuthn proxy ceremony lease is currently armed.
     webauthn_proxy_active: Arc<AtomicBool>,
+    webmcp_registry: String,
+    webmcp_discovery: Option<webmcp::Discovery>,
 }
 
 // Inputs are serialized as an argument, never interpolated into source.
@@ -791,6 +795,8 @@ impl Web {
             snapshots: 0,
             held: Vec::new(),
             webauthn_proxy_active: Arc::new(AtomicBool::new(false)),
+            webmcp_registry: webmcp::random_key()?,
+            webmcp_discovery: None,
         };
         web.browser_call("Target.setDiscoverTargets", json!({ "discover": true }))
             .await?;
@@ -1467,6 +1473,7 @@ impl Web {
     }
 
     fn drop_refs(&mut self, why: &str) {
+        self.webmcp_discovery = None;
         if self.refs.take().is_some() || self.dropped.is_some() {
             self.dropped = Some(why.to_string());
         }

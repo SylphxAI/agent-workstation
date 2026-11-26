@@ -248,9 +248,11 @@ async fn mock_call(
         | "hold_key" | "scroll" => json!({ "ok": true }),
         "eval" => json!({ "value": 42 }),
         "webmcp_list" => {
-            json!({"tools": [{"name":"echo", "description":"Echo input", "inputSchema":{"type":"object"}, "annotations":{}}]})
+            json!({"untrusted":true,"origin":"https://example.com","tools": [{"ref":"wm_test_0","name":"echo", "description":"Echo input", "inputSchema":{"type":"object"}, "annotations":{}}]})
         }
-        "webmcp_call" => json!({"value": body["arguments"]}),
+        "webmcp_call" => {
+            json!({"untrusted":true,"origin":"https://example.com","value": body["arguments"]})
+        }
         "page_screenshot" => json!({
             "width": 1280,
             "height": 800,
@@ -458,10 +460,11 @@ async fn compact_cli_exercises_all_subcommands_against_daemon_wire_protocol() {
     let list = exec(vec!["webmcp-list".into()]).await;
     assert!(list.status.success());
     let list: Value = serde_json::from_slice(&list.stdout).unwrap();
+    assert_eq!(list["untrusted"], true);
     assert_eq!(list["tools"][0]["name"], "echo");
     let reply = exec(vec![
         "webmcp-call".into(),
-        "echo".into(),
+        list["tools"][0]["ref"].as_str().unwrap().into(),
         r#"{"text":"hello"}"#.into(),
         "--timeout-ms".into(),
         "1200".into(),
@@ -470,11 +473,11 @@ async fn compact_cli_exercises_all_subcommands_against_daemon_wire_protocol() {
     assert!(reply.status.success());
     assert_eq!(
         serde_json::from_slice::<Value>(&reply.stdout).unwrap(),
-        json!({"value":{"text":"hello"}})
+        json!({"untrusted":true,"origin":"https://example.com","value":{"text":"hello"}})
     );
     state.lock().unwrap().next_call_error.push_back((StatusCode::FORBIDDEN, json!({
         "code":"confirmation_required", "message":"WebMCP tool requires confirmation", "tool":"guarded",
-        "description":"Guarded action", "arguments": {"text":"[redacted]"}
+        "description":"Guarded action", "untrusted":true, "arguments": {"text":"[redacted]"}
     })));
     let refused = exec(vec![
         "webmcp-call".into(),
@@ -487,6 +490,7 @@ async fn compact_cli_exercises_all_subcommands_against_daemon_wire_protocol() {
     let error = String::from_utf8(refused.stderr).unwrap();
     assert!(error.contains(r#""code":"confirmation_required""#));
     assert!(error.contains(r#""text":"[redacted]""#));
+    assert!(error.contains(r#""untrusted":true"#));
     assert!(!error.contains(SENTINEL_SECRET));
 
     // 6. screenshot writes PNG to disk
@@ -647,7 +651,7 @@ async fn compact_cli_exercises_all_subcommands_against_daemon_wire_protocol() {
     assert!(recorded.iter().any(|(_, p, b)| p == "/sessions/sess-1/call"
         && *b
             == json!({
-                "op":"webmcp_call", "principal":"agent-cli-test", "name":"echo",
+                "op":"webmcp_call", "principal":"agent-cli-test", "ref":"wm_test_0",
                 "arguments":{"text":"hello"}, "confirmed":false, "timeout_ms":1200
             })));
     assert!(recorded.iter().any(|(_, p, b)| p == "/sessions/sess-1/call"

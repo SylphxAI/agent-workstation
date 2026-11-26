@@ -1,6 +1,6 @@
 // Run in the page's main world: an isolated world cannot see page adapters.
 // Never print exceptions, source objects, arguments, or unfiltered results.
-(async function ({op, name, input, confirmed, key, timeout}) {
+(async function ({op, index, input, confirmed, key, timeout, limit, registry, generation}) {
     const markers = ['agent_hidden', 'agent_confirm', 'agent_secret'];
     const marked = (value, marker) => value != null && typeof value === 'object' &&
         Object.hasOwn(value, marker) && value[marker] !== false;
@@ -60,18 +60,37 @@
         resolve({status: signal.reason?.name === 'TimeoutError' ? 'timeout' : 'cancelled'});
     }, {once: true}));
     const run = async () => {
-        const context = navigator.modelContext ?? document.modelContext;
-        if (context == null || typeof context.getTools !== 'function' || typeof context.executeTool !== 'function') {
-            return op === 'list' ? {status: 'ok', value: []} : {status: 'not_found'};
+        if (op === 'list') {
+            const usable = ctx => ctx != null && typeof ctx.getTools === 'function' && typeof ctx.executeTool === 'function';
+            const candidate = navigator.modelContext;
+            const context = usable(candidate) ? candidate : document.modelContext;
+            if (!usable(context)) return {status: 'ok', value: []};
+            // Native getTools also discovers same-origin child frames. Never
+            // request other origins, and keep only the top-level source.
+            const tools = (await context.getTools()).filter(tool => {
+                const source = 'source' in tool ? tool.source : ('window' in tool ? tool.window : undefined);
+                const own = source === globalThis && tool.origin === globalThis.origin;
+                const localAdapter = source === undefined && !('origin' in tool);
+                return (own || localAdapter) && !hidden(tool);
+            });
+            signal.throwIfAborted();
+            const value = tools.map(describe);
+            // Do not resurrect discovery refs when this document is restored
+            // from the back/forward cache. Replace the preceding listener too.
+            const previous = globalThis[registry];
+            if (previous) removeEventListener('pagehide', previous.clear);
+            const clear = () => { delete globalThis[registry]; };
+            addEventListener('pagehide', clear, {once: true});
+            Object.defineProperty(globalThis, registry, {value: {generation, context, tools, clear}, configurable: true});
+            return {status: 'ok', value};
         }
-        const tools = await context.getTools();
-        signal.throwIfAborted();
-        // Resolve again at call time. Use the actual Tool object (not its
-        // name) so native implementations reject a replaced registration.
-        if (op === 'list') return {status: 'ok', value: tools.filter(t => !hidden(t)).map(describe)};
-        const matches = tools.filter(t => t.name === name);
-        if (matches.length !== 1 || hidden(matches[0])) return {status: 'not_found'};
-        const tool = matches[0];
+        const binding = globalThis[registry];
+        if (binding?.generation !== generation) return {status: 'stale'};
+        const {context, tools} = binding;
+        // Keep the actual Tool descriptor so the native API rejects a removed
+        // or replaced registration even when another tool reuses its name.
+        const tool = tools[index];
+        if (!tool || hidden(tool)) return {status: 'not_found'};
         if (secret(tool) || markers.some(marker => hasMarker(input, marker))) return {status: 'refused'};
         if (requiresConfirmation(tool) && confirmed !== true) {
             // No caller-supplied values or keys go back to the approval channel.
@@ -88,6 +107,7 @@
         // Native WebMCP serializes objects to a string; adapters may return
         // the object directly. Unstructured string results remain strings.
         if (typeof result === 'string') {
+            if (result.length > limit) return {status: 'too_large'};
             try {
                 const parsed = JSON.parse(result);
                 if (parsed !== null && typeof parsed === 'object') result = parsed;
@@ -96,9 +116,18 @@
         return {status: 'ok', value: sanitize(result) ?? null};
     };
     try {
-        return await Promise.race([stopped, run()]);
-    } catch {
-        return {status: 'failed'};
+        const reply = JSON.stringify(await Promise.race([stopped, run()]));
+        if (reply.length <= limit && new TextEncoder().encode(reply).length <= limit) return reply;
+        return '{"status":"too_large"}';
+    } catch (error) {
+        let status;
+        switch (error?.name) {
+            case 'NotAllowedError': case 'SecurityError': status = 'refused'; break;
+            case 'NotFoundError': status = 'not_found'; break;
+            case 'InvalidStateError': status = 'stale'; break;
+            default: status = 'failed';
+        }
+        return JSON.stringify({status});
     } finally {
         clearTimeout(timer);
         delete globalThis[key];

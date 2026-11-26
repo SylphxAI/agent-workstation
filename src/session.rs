@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::browser::{
     Browser, BrowserConfig, Cookie, PageImage, Snapshot, Tab, Web, WebAuthnCeremonyLease,
-    WebMcpTool,
+    WebMcpDiscovery, WebMcpResult,
 };
 #[cfg(target_os = "linux")]
 use crate::compositor::{self, Compositor};
@@ -903,7 +903,7 @@ impl<'a> Agent<'a> {
     }
 
     /// Discover WebMCP tools on the active page, under the session lease.
-    pub async fn webmcp_list(&self) -> Result<Vec<WebMcpTool>> {
+    pub async fn webmcp_list(&self) -> Result<WebMcpDiscovery> {
         let mut web = self.web().await?;
         let mut control = self.session.gate.subscribe();
         self.session.check(&self.principal)?;
@@ -917,18 +917,18 @@ impl<'a> Agent<'a> {
     /// Invoke a WebMCP tool under the session lease. Dropping the future aborts it.
     pub async fn webmcp_call(
         &self,
-        name: &str,
+        tool_ref: &str,
         input: Value,
         confirmed: bool,
         timeout_ms: u64,
-    ) -> Result<Value> {
+    ) -> Result<WebMcpResult> {
         let mut web = self.web().await?;
         let mut control = self.session.gate.subscribe();
         self.session.check(&self.principal)?;
         tokio::select! {
             biased;
             _ = control.changed() => Err(self.webmcp_control_changed()),
-            result = web.webmcp_call(name, input, confirmed, timeout_ms) => result,
+            result = web.webmcp_call(tool_ref, input, confirmed, timeout_ms) => result,
         }
     }
 

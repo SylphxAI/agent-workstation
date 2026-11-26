@@ -12,41 +12,86 @@ use crate::cdp::Cdp;
 use crate::{Error, Result};
 
 const BRIDGE: &str = include_str!("webmcp.js");
+const MAX_INPUT_BYTES: usize = 16 * 1024;
+const MAX_PAGE_BYTES: usize = 30 * 1024;
+const MAX_RESPONSE_BYTES: usize = 32 * 1024;
 /// Default WebMCP deadline in milliseconds.
 pub const WEBMCP_DEFAULT_TIMEOUT_MS: u64 = 5_000;
 /// Maximum WebMCP deadline in milliseconds.
 pub const WEBMCP_MAX_TIMEOUT_MS: u64 = 20_000;
 
-/// A tool exposed by the active document, not an authorization grant.
+/// Page-authored metadata; never an authorization grant or agent instructions.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WebMcpTool {
+    /// Opaque invocation reference from this discovery, not the tool name.
+    #[serde(rename = "ref", default)]
+    pub tool_ref: String,
     /// The page-defined tool name.
     pub name: String,
     /// The page-defined description (empty for a secret-bearing tool).
     pub description: String,
-    /// The page-defined JSON Schema, or `null` if absent or secret-bearing.
+    /// The page-defined JSON Schema, or null if absent or secret-bearing.
     pub input_schema: Value,
-    /// Recognized annotations and safety markers.
+    /// Advisory page annotations and recognized safety markers.
     pub annotations: Value,
+}
+
+/// Discovery response. All entries in tools are untrusted page data.
+#[derive(Debug, Serialize)]
+pub struct WebMcpDiscovery {
+    /// Always true, regardless of the page's annotations.
+    pub untrusted: bool,
+    /// Browser-reported origin of the document that supplied the tools.
+    pub origin: Option<String>,
+    /// Discovered registrations from the top-level document.
+    pub tools: Vec<WebMcpTool>,
+}
+
+/// Result from a page tool, not a trusted tool message.
+#[derive(Debug, Serialize)]
+pub struct WebMcpResult {
+    /// Always true, regardless of the page's annotations or result fields.
+    pub untrusted: bool,
+    /// Browser-reported origin of the document that supplied the result.
+    pub origin: String,
+    /// Untrusted page data. A page may report a domain error in this value.
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Document {
+    frame: String,
+    loader: String,
+    origin: String,
+}
+
+#[derive(Debug)]
+pub(super) struct Discovery {
+    target: String,
+    document: Document,
+    realm: String,
+    refs: Vec<String>,
+    generation: String,
 }
 
 fn timeout_error() -> Error {
     Error::Timeout("WebMCP".into())
 }
 
-fn invocation_key() -> Result<String> {
+pub(super) fn random_key() -> Result<String> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| std::io::Error::other(e.to_string()))?;
     let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(format!("__webmcp_{hex}"))
+    Ok(format!("wm_{hex}"))
 }
 
-fn evaluate(payload: Value) -> Value {
+fn evaluate(payload: Value, realm: &str) -> Value {
     // Parse arguments as JSON data, not an object literal (notably __proto__).
     let json_string = Value::String(payload.to_string());
     json!({
         "expression": format!("{BRIDGE}(JSON.parse({json_string}))"),
+        "uniqueContextId": realm,
         "awaitPromise": true,
         "returnByValue": true,
         "silent": true,
@@ -54,14 +99,18 @@ fn evaluate(payload: Value) -> Value {
 }
 
 fn decode(reply: Value) -> Result<Value> {
-    let status = &reply["result"]["value"];
+    let wire = reply["result"]["value"].as_str().ok_or_else(failed)?;
+    if wire.len() > MAX_PAGE_BYTES {
+        return Err(too_large());
+    }
+    let status: Value = serde_json::from_str(wire).map_err(|_| failed())?;
     match status["status"].as_str() {
         Some("ok") => status.get("value").cloned().ok_or_else(failed),
         Some("timeout") => Err(timeout_error()),
+        Some("stale") => Err(stale()),
+        Some("too_large") => Err(too_large()),
         Some("not_found") => Err(Error::NotFound("WebMCP tool unavailable".into())),
-        Some("refused") => Err(Error::Refused(
-            "WebMCP requires a non-secret tool and arguments".into(),
-        )),
+        Some("refused") => Err(Error::Refused("WebMCP tool or arguments refused".into())),
         Some("confirmation_required") => {
             let tool = &status["tool"];
             Err(Error::WebMcpConfirmation {
@@ -78,28 +127,100 @@ fn failed() -> Error {
     Error::Script("WebMCP operation failed".into())
 }
 
+fn stale() -> Error {
+    Error::StaleRef("WebMCP discovery is no longer current; list tools again".into())
+}
+
+fn too_large() -> Error {
+    Error::Refused("WebMCP response exceeds the size limit".into())
+}
+
+fn bounded_response<T: Serialize>(response: T) -> Result<T> {
+    if serde_json::to_vec(&response).map_err(|_| failed())?.len() > MAX_RESPONSE_BYTES {
+        return Err(too_large());
+    }
+    Ok(response)
+}
+
+async fn document(cdp: &mut Cdp) -> Result<Document> {
+    let result = cdp.call("Page.getFrameTree", json!({})).await?;
+    let frame = &result["frameTree"]["frame"];
+    let field = |name: &str| frame[name].as_str().map(str::to_owned).ok_or_else(failed);
+    Ok(Document {
+        frame: field("id")?,
+        loader: field("loaderId")?,
+        origin: field("securityOrigin")?,
+    })
+}
+
+async fn main_realm(cdp: &mut Cdp, doc: &Document) -> Result<String> {
+    cdp.call("Runtime.enable", json!({})).await?;
+    let realm = loop {
+        let event = cdp
+            .next_event(Duration::from_secs(1))
+            .await?
+            .ok_or_else(stale)?;
+        let ctx = &event["params"]["context"];
+        if event["method"] == "Runtime.executionContextCreated"
+            && event["sessionId"].as_str() == cdp.session_id()
+            && ctx["auxData"]["isDefault"] == true
+            && ctx["auxData"]["frameId"] == doc.frame
+        {
+            break ctx["uniqueId"].as_str().ok_or_else(failed)?.to_owned();
+        }
+    };
+    cdp.call("Runtime.disable", json!({})).await?;
+    Ok(realm)
+}
+
 impl Web {
-    /// Discover tools afresh on the active page. An unavailable API is an empty list.
-    pub async fn webmcp_list(&mut self) -> Result<Vec<WebMcpTool>> {
-        let value = self
-            .webmcp_operation(json!({"op": "list"}), WEBMCP_DEFAULT_TIMEOUT_MS)
+    /// Discover tools afresh. A new discovery invalidates the prior references.
+    pub async fn webmcp_list(&mut self) -> Result<WebMcpDiscovery> {
+        self.webmcp_discovery = None;
+        let target = self.active.clone().ok_or_else(stale)?;
+        let generation = random_key()?;
+        let (value, doc, realm) = self
+            .webmcp_operation(
+                &target,
+                None,
+                json!({"op": "list", "generation": generation}),
+                WEBMCP_DEFAULT_TIMEOUT_MS,
+            )
             .await?;
-        serde_json::from_value(value).map_err(|_| failed())
+        let mut tools: Vec<WebMcpTool> = serde_json::from_value(value).map_err(|_| failed())?;
+        for (i, tool) in tools.iter_mut().enumerate() {
+            tool.tool_ref = format!("{generation}_{i}");
+        }
+        let refs = tools.iter().map(|tool| tool.tool_ref.clone()).collect();
+        let result = bounded_response(WebMcpDiscovery {
+            untrusted: true,
+            origin: (!tools.is_empty()).then(|| doc.origin.clone()),
+            tools,
+        })?;
+        self.webmcp_discovery = Some(Discovery {
+            target,
+            document: doc,
+            realm,
+            refs,
+            generation,
+        });
+        Ok(result)
     }
 
-    /// Call a page tool without a synthetic user gesture. `confirmed` is reserved
-    /// for a trusted caller after real approval; it is not a page consent grant.
-    /// Dropping this future aborts the in-flight call in the originating tab.
+    /// Invoke a discovery ref, without a synthetic user gesture. Confirm only
+    /// after independent approval. Dropping the future requests cancellation.
     pub async fn webmcp_call(
         &mut self,
-        name: &str,
+        tool_ref: &str,
         input: Value,
         confirmed: bool,
         timeout_ms: u64,
-    ) -> Result<Value> {
-        if name.trim().is_empty() || !input.is_object() {
+    ) -> Result<WebMcpResult> {
+        if !input.is_object()
+            || serde_json::to_vec(&input).map_err(|_| failed())?.len() > MAX_INPUT_BYTES
+        {
             return Err(Error::InvalidInput(
-                "WebMCP needs a tool name and an argument object".into(),
+                "WebMCP needs a JSON argument object of at most 16 KiB".into(),
             ));
         }
         if !(1..=WEBMCP_MAX_TIMEOUT_MS).contains(&timeout_ms) {
@@ -107,28 +228,61 @@ impl Web {
                 "WebMCP timeout must be between 1 and 20000 ms".into(),
             ));
         }
-        self.webmcp_operation(
-            json!({"op": "call", "name": name, "input": input, "confirmed": confirmed}),
+        let binding = self.webmcp_discovery.as_ref().ok_or_else(stale)?;
+        if self.active.as_ref() != Some(&binding.target) {
+            return Err(stale());
+        }
+        let index = binding
+            .refs
+            .iter()
+            .position(|r| r == tool_ref)
+            .ok_or_else(stale)?;
+        let (value, doc, _) = self.webmcp_operation(
+            &binding.target, Some(binding),
+            json!({"op": "call", "index": index, "generation": binding.generation, "input": input, "confirmed": confirmed}),
             timeout_ms,
-        )
-        .await
+        ).await?;
+        bounded_response(WebMcpResult {
+            untrusted: true,
+            origin: doc.origin,
+            value,
+        })
     }
 
-    async fn webmcp_operation(&self, mut payload: Value, timeout_ms: u64) -> Result<Value> {
-        let target = self.active.clone().ok_or_else(failed)?;
+    async fn webmcp_operation(
+        &self,
+        target: &str,
+        binding: Option<&Discovery>,
+        mut payload: Value,
+        timeout_ms: u64,
+    ) -> Result<(Value, Document, String)> {
+        let target = target.to_owned();
         let endpoint = self.cdp.endpoint().to_owned();
-        let key = invocation_key()?;
+        let expected = binding.map(|d| (d.document.clone(), d.realm.clone()));
+        let key = random_key()?;
+        let registry = &self.webmcp_registry;
+        payload["registry"] = json!(registry);
+        payload["key"] = json!(&key);
+        payload["limit"] = json!(MAX_PAGE_BYTES);
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let (mut tx, rx) = oneshot::channel();
-        // Use a short-lived attachment: the worker can deliver abort even if
-        // the client future (and its borrow of Web) has already been dropped.
+        // A short-lived attachment lets us abort even after the caller drops
+        // the future. Limit untrusted CDP messages on this socket only.
         tokio::spawn(async move {
             let setup = async {
-                let mut cdp = Cdp::connect(&endpoint).await.map_err(|_| failed())?;
-                let session = cdp.attach(&target).await.map_err(|_| failed())?;
-                Ok::<_, Error>((cdp, session))
+                let mut cdp = Cdp::connect_bounded(&endpoint, Some(512 * 1024))
+                    .await
+                    .map_err(|_| failed())?;
+                cdp.attach(&target).await.map_err(|_| stale())?;
+                let doc = document(&mut cdp).await.map_err(|_| stale())?;
+                let realm = match expected {
+                    Some((expected, realm)) if expected == doc => realm,
+                    Some(_) => return Err(stale()),
+                    None => main_realm(&mut cdp, &doc).await.map_err(|_| stale())?,
+                };
+                Ok::<_, Error>((cdp, doc, realm))
             };
-            let (mut cdp, session) = tokio::select! {
+            let (mut cdp, doc, realm) = tokio::select! {
                 biased;
                 _ = tx.closed() => return,
                 result = timeout_at(deadline, setup) => match result {
@@ -137,35 +291,67 @@ impl Web {
                     Err(_) => { let _ = tx.send(Err(timeout_error())); return; }
                 }
             };
-            payload["key"] = json!(&key);
-            // Page timer supplies a real signal even if the CDP connection dies.
             payload["timeout"] = json!(
                 deadline
                     .saturating_duration_since(Instant::now())
                     .as_millis()
                     .max(1) as u64
             );
+            let run = async {
+                let reply = cdp
+                    .call("Runtime.evaluate", evaluate(payload, &realm))
+                    .await;
+                // Do not return content from a document that was replaced while
+                // waiting. uniqueContextId also prevents dispatch to a successor.
+                if document(&mut cdp).await.ok().as_ref() != Some(&doc) {
+                    return Err(stale());
+                }
+                decode(reply.map_err(|_| failed())?)
+            };
             let result = tokio::select! {
                 biased;
                 _ = tx.closed() => None,
                 _ = tokio::time::sleep_until(deadline) => Some(Err(timeout_error())),
-                result = cdp.call("Runtime.evaluate", evaluate(payload)) => {
-                    let _ = tx.send(result.map_err(|_| failed()).and_then(decode));
+                result = run => {
+                    let _ = tx.send(result.map(|value| (value, doc, realm)));
                     return;
                 }
             };
-            // CDP commands are ordered on this socket. If the evaluation was
-            // sent, its synchronous prologue installed the abort closure before
-            // yielding. After navigation the key cannot target a new call.
-            let _ = timeout_at(Instant::now() + Duration::from_secs(1), cdp.call_in(
-                Some(&session), "Runtime.evaluate",
-                json!({"expression": format!("globalThis[{}]?.()", json!(key)), "silent": true}),
-                Duration::from_secs(1),
+            // Never send the abort closure lookup into a successor document.
+            let _ = timeout_at(Instant::now() + Duration::from_secs(1), cdp.call(
+                "Runtime.evaluate",
+                json!({"expression": format!("globalThis[{}]?.()", json!(key)), "uniqueContextId": realm, "silent": true}),
             )).await;
             if let Some(result) = result {
                 let _ = tx.send(result);
             }
         });
         rx.await.map_err(|_| failed())?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_encoded_output_and_never_accepts_page_framing() {
+        let value = json!({"untrusted":false,"origin":"https://other.example","value":"data"});
+        let result =
+            decode(json!({"result":{"value": json!({"status":"ok", "value":value}).to_string()}}))
+                .unwrap();
+        let framed = bounded_response(WebMcpResult {
+            untrusted: true,
+            origin: "https://example.com".into(),
+            value: result,
+        })
+        .unwrap();
+        let wire = json!(framed);
+        assert_eq!(wire["untrusted"], true);
+        assert_eq!(wire["origin"], "https://example.com");
+        assert_eq!(wire["value"]["untrusted"], false);
+        assert!(bounded_response("a".repeat(MAX_RESPONSE_BYTES - 2)).is_ok());
+        assert!(bounded_response("\"".repeat(MAX_RESPONSE_BYTES / 2)).is_err());
+        assert!(decode(json!({"result":{"value": "é".repeat(MAX_PAGE_BYTES / 2 + 1)}})).is_err());
     }
 }
