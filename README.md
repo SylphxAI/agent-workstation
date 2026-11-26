@@ -184,8 +184,12 @@ bus first. Run `agent-workstation --json desktop snapshot` to see the mode:
   a control; `desktop focus` focuses it natively; `desktop set-value` replaces
   text on controls that implement AT-SPI EditableText. For a control that supports
   focus but not EditableText, focus it by ref, then use `desktop type`.
-  Pointer gestures (double-click, other buttons, modifiers) require explicit
-  coordinates or a compositor window ref, not a semantic ref.
+  The tree includes focus, enabled, editable and checked states as reported by
+  the app, and bounds when exposed. Before a native action, the session verifies
+  that the ref still belongs to the current bus and accessibility tree.
+  Native refs never turn into coordinate clicks: even reported bounds cannot
+  prove which Wayland surface will receive a click. Use explicit coordinates or
+  a compositor window ref for pointer gestures.
 - `compositor`: the response includes a `fallback_reason`. Refs name mapped
   windows only; clicking one targets the window center, never a control.
 

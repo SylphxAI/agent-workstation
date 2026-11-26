@@ -30,7 +30,12 @@ const MAX_DBUS_BODY: usize = 8 * 1024 * 1024;
 
 // AT-SPI2 state bit indices (org.a11y.atspi.StateType):
 // state_set is `au` (array of 32-bit bitmasks); index = bit / 32, mask = 1 << (bit % 32).
+const ATSPI_STATE_CHECKED: u32 = 4;
+const ATSPI_STATE_DEFUNCT: u32 = 6;
+const ATSPI_STATE_EDITABLE: u32 = 7;
 const ATSPI_STATE_ENABLED: u32 = 8;
+const ATSPI_STATE_STALE: u32 = 27;
+const REGISTRY: (&str, &str) = ("org.a11y.atspi.Registry", "/org/a11y/atspi/accessible/root");
 const ATSPI_STATE_FOCUSED: u32 = 12;
 
 /// Handle stored in [`SnapshotIndex`] for each Linux accessibility node.
@@ -42,6 +47,8 @@ pub enum LinuxHandle {
         bus: String,
         /// Accessible object path (e.g. `/org/a11y/atspi/accessible/42`).
         path: String,
+        /// The parent chain observed in a session snapshot, starting at the application.
+        ancestors: Vec<(String, String)>,
     },
     /// A Wayland/`sway` compositor container id (`con_id`).
     SwayWindow(u64),
@@ -168,12 +175,25 @@ impl LinuxPlatformAdapter {
         let (depth, nodes) = options.effective_bounds();
         let capture = async {
             let mut conn = if let Some(target) = &root {
-                self.connect_for_action(target).await?
+                self.connect_for_ref(target).await?
             } else {
                 self.connect_atspi().await?
             };
             let mut walk = Walk::new(depth, nodes, true);
-            let roots = if let Some((app_id, pid, LinuxHandle::AtSpi { bus, path })) = selected {
+            let roots = if let Some((
+                app_id,
+                pid,
+                LinuxHandle::AtSpi {
+                    bus,
+                    path,
+                    ancestors,
+                },
+            )) = selected
+            {
+                let target = root.as_ref().expect("selected ref");
+                conn.validate_attachment(&ancestors, &bus, &path, target)
+                    .await?;
+                walk.ancestors = ancestors;
                 walk_atspi_node(&mut conn, &bus, &path, app_id, pid, 1, offset, &mut walk)
                     .await
                     .into_iter()
@@ -232,7 +252,7 @@ impl LinuxPlatformAdapter {
         DbusConn::connect(&path).await
     }
 
-    async fn connect_for_action(&self, target: &NodeRef) -> Result<DbusConn, AdapterError> {
+    async fn connect_for_ref(&self, target: &NodeRef) -> Result<DbusConn, AdapterError> {
         let conn = self.connect_atspi().await?;
         if let Some(session) = &self.session
             && session
@@ -247,6 +267,26 @@ impl LinuxPlatformAdapter {
             )));
         }
         Ok(conn)
+    }
+
+    async fn connect_for_action(
+        &self,
+        target: &NodeRef,
+        ancestors: &[(String, String)],
+        bus: &str,
+        path: &str,
+    ) -> Result<DbusConn, AdapterError> {
+        if self.session.is_none() {
+            return self.connect_atspi().await;
+        }
+        tokio::time::timeout(DBUS_TIMEOUT, async {
+            let mut conn = self.connect_for_ref(target).await?;
+            conn.validate_attachment(ancestors, bus, path, target)
+                .await?;
+            Ok(conn)
+        })
+        .await
+        .map_err(|_| AdapterError::Backend("accessibility target validation timed out".into()))?
     }
 
     async fn resolve_atspi_socket(&self) -> Result<Option<PathBuf>, AdapterError> {
@@ -273,6 +313,14 @@ impl LinuxPlatformAdapter {
                         .await
                         && let Some(path) = parse_unix_dbus_path(&addr)
                     {
+                        if self.session.is_some() {
+                            // Never follow a broker response to a host/abstract socket, or
+                            // a symlink escaping this workstation's private runtime directory.
+                            let path = tokio::fs::canonicalize(path).await.ok();
+                            return Ok(path.filter(|p| {
+                                session_bus.parent().is_some_and(|rt| p.starts_with(rt))
+                            }));
+                        }
                         return Ok(Some(path));
                     }
                 }
@@ -347,6 +395,8 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                     pid: w.pid,
                     enabled: true,
                     focused: w.focused,
+                    editable: false,
+                    checked: false,
                     bounds: Some(w.rect),
                     actions: vec!["focus".into(), "click".into()],
                     children: Vec::new(),
@@ -370,10 +420,14 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                     (n.clone(), h.clone())
                 };
                 match handle {
-                    LinuxHandle::AtSpi { bus, path }
-                        if button.unwrap_or(Button::Left) == Button::Left =>
-                    {
-                        let mut conn = self.connect_for_action(&target).await?;
+                    LinuxHandle::AtSpi {
+                        bus,
+                        path,
+                        ancestors,
+                    } if button.unwrap_or(Button::Left) == Button::Left => {
+                        let mut conn = self
+                            .connect_for_action(&target, &ancestors, &bus, &path)
+                            .await?;
                         let mut body = Vec::new();
                         encode_i32(&mut body, 0);
                         let ok = conn
@@ -429,8 +483,14 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                     idx.resolve(&target)?.1.clone()
                 };
                 match handle {
-                    LinuxHandle::AtSpi { bus, path } => {
-                        let mut conn = self.connect_for_action(&target).await?;
+                    LinuxHandle::AtSpi {
+                        bus,
+                        path,
+                        ancestors,
+                    } => {
+                        let mut conn = self
+                            .connect_for_action(&target, &ancestors, &bus, &path)
+                            .await?;
                         let ok = conn
                             .call_bool(
                                 &bus,
@@ -468,8 +528,14 @@ impl PlatformAdapter for LinuxPlatformAdapter {
                     idx.resolve(&target)?.1.clone()
                 };
                 match handle {
-                    LinuxHandle::AtSpi { bus, path } => {
-                        let mut conn = self.connect_for_action(&target).await?;
+                    LinuxHandle::AtSpi {
+                        bus,
+                        path,
+                        ancestors,
+                    } => {
+                        let mut conn = self
+                            .connect_for_action(&target, &ancestors, &bus, &path)
+                            .await?;
                         let mut body = Vec::new();
                         encode_string(&mut body, &value);
                         let ok = conn
@@ -758,16 +824,12 @@ impl DbusConn {
             .map_err(|_| AdapterError::Backend("D-Bus auth reply timeout".into()))??;
 
         if line.starts_with("REJECTED") {
-            return Err(AdapterError::PermissionDenied(format!(
-                "D-Bus SASL EXTERNAL authentication rejected: {}",
-                line.trim()
-            )));
+            return Err(AdapterError::PermissionDenied(
+                "D-Bus SASL EXTERNAL authentication rejected".into(),
+            ));
         }
         if !line.starts_with("OK ") {
-            return Err(AdapterError::Backend(format!(
-                "unexpected D-Bus auth reply: {}",
-                line.trim()
-            )));
+            return Err(AdapterError::Backend("unexpected D-Bus auth reply".into()));
         }
         self.guid = line.trim()[3..].to_owned();
         self.stream
@@ -801,16 +863,14 @@ impl DbusConn {
                     return match reply.msg_type {
                         2 => Ok((reply.signature, reply.body)),
                         3 => {
-                            let detail = decode_string(&reply.body, &mut 0)
-                                .unwrap_or_else(|| reply.error_name.clone());
+                            // Providers may echo editable text or other private content in errors.
+                            let detail = format!("D-Bus rejected {interface}.{member}");
                             if reply.error_name.contains("AccessDenied") {
                                 Err(AdapterError::PermissionDenied(detail))
                             } else if reply.error_name == "org.freedesktop.DBus.Error.UnknownMethod"
                                 || reply.error_name == "org.freedesktop.DBus.Error.UnknownInterface"
                             {
-                                Err(AdapterError::UnsupportedAction(format!(
-                                    "{interface}.{member}: {detail}"
-                                )))
+                                Err(AdapterError::UnsupportedAction(detail))
                             } else if reply.error_name == "org.freedesktop.DBus.Error.UnknownObject"
                                 || (dest.starts_with(':')
                                     && reply.error_name
@@ -820,10 +880,7 @@ impl DbusConn {
                                     "accessible object no longer exists: {detail}"
                                 )))
                             } else {
-                                Err(AdapterError::Backend(format!(
-                                    "{}: {detail}",
-                                    reply.error_name
-                                )))
+                                Err(AdapterError::Backend(detail))
                             }
                         }
                         other => Err(AdapterError::Backend(format!(
@@ -963,22 +1020,105 @@ impl DbusConn {
         Ok((child_bus, child_path))
     }
 
+    async fn accessible_children(
+        &mut self,
+        bus: &str,
+        path: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, String)>, AdapterError> {
+        // Request references only, not accessible text or values.
+        let invalid =
+            || AdapterError::Backend("invalid or over-limit accessibility children reply".into());
+        let (sig, bytes) = self
+            .call_raw(
+                bus,
+                path,
+                "org.a11y.atspi.Accessible",
+                "GetChildren",
+                "",
+                &[],
+            )
+            .await?;
+        if sig != "a(so)" {
+            return Err(invalid());
+        }
+        let mut cursor = 0;
+        let length = decode_u32(&bytes, &mut cursor).ok_or_else(invalid)? as usize;
+        align_cursor(&mut cursor, 8);
+        if cursor.checked_add(length) != Some(bytes.len()) {
+            return Err(invalid());
+        }
+        let mut children = Vec::new();
+        for _ in 0..limit {
+            if cursor == bytes.len() {
+                break;
+            }
+            align_cursor(&mut cursor, 8);
+            let bus = decode_string(&bytes, &mut cursor).ok_or_else(invalid)?;
+            let path = decode_string(&bytes, &mut cursor).ok_or_else(invalid)?;
+            if path != "/org/a11y/atspi/null" && path.starts_with('/') {
+                children.push((bus, path));
+            }
+        }
+        if cursor != bytes.len() {
+            return Err(invalid());
+        }
+        Ok(children)
+    }
+
+    // Validate the original chain from the registry down, not just that the
+    // leaf still responds. A detached subtree can still export live objects.
+    async fn validate_attachment(
+        &mut self,
+        ancestors: &[(String, String)],
+        bus: &str,
+        path: &str,
+        target: &NodeRef,
+    ) -> Result<(), AdapterError> {
+        let stale = || AdapterError::StaleRef(format!("{target}: accessible node is detached"));
+        let mut parent = REGISTRY;
+        for child in ancestors
+            .iter()
+            .map(|(b, p)| (b.as_str(), p.as_str()))
+            .chain([(bus, path)])
+        {
+            let children = self
+                .accessible_children(parent.0, parent.1, super::MAX_ALLOWED_NODES)
+                .await?;
+            if !children.iter().any(|(b, p)| {
+                (b == child.0 || (b.is_empty() && parent.0 == child.0)) && p == child.1
+            }) {
+                return Err(stale());
+            }
+            parent = child;
+        }
+        let states = self.get_state(bus, path).await?;
+        if has_state(&states, ATSPI_STATE_DEFUNCT) || has_state(&states, ATSPI_STATE_STALE) {
+            return Err(stale());
+        }
+        Ok(())
+    }
+
     async fn get_state(&mut self, dest: &str, path: &str) -> Result<Vec<u32>, AdapterError> {
-        let (_, resp) = self
+        let (sig, resp) = self
             .call_raw(dest, path, "org.a11y.atspi.Accessible", "GetState", "", &[])
             .await?;
         let mut cursor = 0;
-        let byte_len = decode_u32(&resp, &mut cursor)
-            .ok_or_else(|| AdapterError::Backend("missing state array length".into()))?
-            as usize;
-        let end = cursor.saturating_add(byte_len).min(resp.len());
-        let mut words = Vec::new();
-        while cursor + 4 <= end {
-            if let Some(w) = decode_u32(&resp, &mut cursor) {
-                words.push(w);
-            }
+        let length = decode_u32(&resp, &mut cursor).unwrap_or(0) as usize;
+        // AT-SPI currently reports two 32-bit words. Accept additional words,
+        // but refuse incomplete, empty or mismatched replies.
+        if sig != "au" || length == 0 || resp.len() != cursor + length {
+            return Err(AdapterError::Backend(
+                "invalid accessibility state reply".into(),
+            ));
         }
-        Ok(words)
+        let (words, remainder) = resp[cursor..].as_chunks::<4>();
+        if !remainder.is_empty() {
+            return Err(AdapterError::Backend(
+                "invalid accessibility state reply".into(),
+            ));
+        }
+        Ok(words.iter().copied().map(u32::from_le_bytes).collect())
     }
 
     async fn get_extents(
@@ -1053,6 +1193,7 @@ struct Walk {
     remaining: usize,
     truncated: bool,
     strict: bool,
+    ancestors: Vec<(String, String)>,
 }
 
 impl Walk {
@@ -1062,6 +1203,7 @@ impl Walk {
             remaining,
             truncated: false,
             strict,
+            ancestors: Vec::new(),
         }
     }
 
@@ -1082,8 +1224,7 @@ async fn walk_atspi_apps(
     offset: usize,
     walk: &mut Walk,
 ) -> Result<Vec<RawNode<LinuxHandle>>, AdapterError> {
-    let root_bus = "org.a11y.atspi.Registry";
-    let root_path = "/org/a11y/atspi/accessible/root";
+    let (root_bus, root_path) = REGISTRY;
     let app_count = conn
         .get_i32_prop(
             root_bus,
@@ -1174,11 +1315,13 @@ fn walk_atspi_node<'a>(
             .unwrap_or_default();
         let states = conn.get_state(bus, path).await.unwrap_or_default();
         let enabled = if states.is_empty() {
-            true
+            !walk.strict
         } else {
             has_state(&states, ATSPI_STATE_ENABLED)
         };
         let focused = has_state(&states, ATSPI_STATE_FOCUSED);
+        let editable = has_state(&states, ATSPI_STATE_EDITABLE);
+        let checked = has_state(&states, ATSPI_STATE_CHECKED);
         let bounds = conn.get_extents(bus, path).await.ok().flatten();
         let role = limit_snapshot_string(role, walk.strict);
         let name = limit_snapshot_string(name, walk.strict);
@@ -1202,7 +1345,10 @@ fn walk_atspi_node<'a>(
         } else {
             depth <= walk.depth
         };
-        if can_descend {
+        if can_descend && walk.ancestors.len() < super::MAX_ALLOWED_DEPTH - 1 {
+            if walk.strict {
+                walk.ancestors.push((bus.to_owned(), path.to_owned()));
+            }
             for idx in offset..count {
                 if !walk.take() {
                     break;
@@ -1224,6 +1370,15 @@ fn walk_atspi_node<'a>(
                 } else {
                     &child_bus
                 };
+                if walk.strict
+                    && walk
+                        .ancestors
+                        .iter()
+                        .any(|(b, p)| b == target_bus && p == &child_path)
+                {
+                    walk.truncated = true;
+                    continue;
+                }
                 if let Some(child) = walk_atspi_node(
                     conn,
                     target_bus,
@@ -1239,6 +1394,9 @@ fn walk_atspi_node<'a>(
                     children.push(child);
                 }
             }
+            if walk.strict {
+                walk.ancestors.pop();
+            }
         } else if count > offset {
             walk.truncated = true;
         }
@@ -1247,6 +1405,7 @@ fn walk_atspi_node<'a>(
             handle: LinuxHandle::AtSpi {
                 bus: bus.to_owned(),
                 path: path.to_owned(),
+                ancestors: walk.ancestors.clone(),
             },
             role,
             name,
@@ -1255,6 +1414,8 @@ fn walk_atspi_node<'a>(
             pid,
             enabled,
             focused,
+            editable,
+            checked,
             bounds,
             actions: Vec::new(),
             children,
@@ -1737,12 +1898,20 @@ mod tests {
         let listener = UnixListener::bind(&sock).unwrap();
         let received_actions = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
         let actions_ref = std::sync::Arc::clone(&received_actions);
+        let fixture = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let server_fixture = fixture.clone();
         let address = format!("unix:path={}", sock.display());
+        let foreign = tempfile::tempdir().unwrap();
+        let foreign_socket = foreign.path().join("foreign.sock");
+        let foreign_listener = UnixListener::bind(&foreign_socket).unwrap();
+        let foreign_address = format!("unix:path={}", foreign_socket.display());
 
         let server = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let actions_ref = std::sync::Arc::clone(&actions_ref);
                 let address = address.clone();
+                let fixture = server_fixture.clone();
+                let foreign_address = foreign_address.clone();
                 tokio::spawn(async move {
                     // SASL handshake (byte-exact, never over-reading into binary frames)
                     let mut nul = [0u8; 1];
@@ -1762,7 +1931,15 @@ mod tests {
                     {
                         let (sig, resp_body) = match member.as_str() {
                             "Hello" => ("s", encoded_string(":1.42")),
-                            "GetAddress" => ("s", encoded_string(&address)),
+                            "GetAddress" => {
+                                let advertised =
+                                    if fixture.load(std::sync::atomic::Ordering::Relaxed) == 5 {
+                                        &foreign_address
+                                    } else {
+                                        &address
+                                    };
+                                ("s", encoded_string(advertised))
+                            }
                             "GetConnectionUnixProcessID" => {
                                 let mut b = Vec::new();
                                 encode_u32(&mut b, 777);
@@ -1813,6 +1990,29 @@ mod tests {
                                 }
                                 ("(so)", b)
                             }
+                            "GetChildren" => {
+                                let mode = fixture.load(std::sync::atomic::Ordering::Relaxed);
+                                let child = match (path.as_str(), mode) {
+                                    ("/org/a11y/atspi/accessible/root", 1) => None,
+                                    ("/org/a11y/atspi/accessible/root", _) => {
+                                        Some((":1.10", "/app/1"))
+                                    }
+                                    ("/app/1", 2) => Some((":1.11", "/btn/1")),
+                                    ("/app/1", _) => Some(("", "/btn/1")),
+                                    _ => None,
+                                };
+                                let mut bytes = vec![0u8; 8];
+                                if let Some((bus, path)) = child {
+                                    encode_string(&mut bytes, bus);
+                                    encode_string(&mut bytes, path);
+                                }
+                                let declared = (bytes.len() - 8) as u32;
+                                bytes[..4].copy_from_slice(&declared.to_le_bytes());
+                                if mode == 3 {
+                                    bytes.pop();
+                                }
+                                ("a(so)", bytes)
+                            }
                             "GetRoleName" => {
                                 let role = if path == "/app/1" {
                                     "application"
@@ -1826,7 +2026,22 @@ mod tests {
                                 encode_u32(&mut b, 4);
                                 encode_u32(
                                     &mut b,
-                                    (1 << ATSPI_STATE_ENABLED) | (1 << ATSPI_STATE_FOCUSED),
+                                    (1 << ATSPI_STATE_ENABLED)
+                                        | (1 << ATSPI_STATE_FOCUSED)
+                                        | if path == "/btn/1" {
+                                            (1 << ATSPI_STATE_EDITABLE)
+                                                | (1 << ATSPI_STATE_CHECKED)
+                                                | if fixture
+                                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                                    == 4
+                                                {
+                                                    1 << ATSPI_STATE_DEFUNCT
+                                                } else {
+                                                    0
+                                                }
+                                        } else {
+                                            0
+                                        },
                                 );
                                 ("au", b)
                             }
@@ -1934,6 +2149,71 @@ mod tests {
             })
             .await
             .unwrap();
+
+        // The re-rooted ref must retain the same app ancestry even after ref rotation.
+        let old = NodeRef::parse(&tree.roots[0].children[0].qualified_ref).unwrap();
+        let SessionCapture::Native(subtree) = session
+            .capture_session(TreeOptions::default(), Some(old.clone()), 0)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a native subtree");
+        };
+        assert_eq!(subtree.total_nodes, 1);
+        assert_eq!(subtree.roots[0].ref_id, "e1");
+        assert!(subtree.roots[0].editable && subtree.roots[0].checked && subtree.roots[0].focused);
+        assert!(subtree.text.contains("focused editable checked"));
+        assert_eq!(
+            session.validate_target(&old).unwrap_err().code(),
+            "stale-ref"
+        );
+        let target = NodeRef::parse(&subtree.roots[0].qualified_ref).unwrap();
+        use std::sync::atomic::Ordering::Relaxed;
+        // Detached app, swapped owner, malformed reply, and defunct leaf must all block dispatch.
+        for (mode, code) in [
+            (1, "stale-ref"),
+            (2, "stale-ref"),
+            (3, "backend-error"),
+            (4, "stale-ref"),
+        ] {
+            fixture.store(mode, Relaxed);
+            for action in [
+                DesktopAction::Click {
+                    target: target.clone(),
+                    button: None,
+                },
+                DesktopAction::Focus {
+                    target: target.clone(),
+                },
+                DesktopAction::SetValue {
+                    target: target.clone(),
+                    value: "not sent".into(),
+                },
+            ] {
+                assert_eq!(session.act(action).await.unwrap_err().code(), code);
+            }
+        }
+        fixture.store(1, Relaxed);
+        let error = session
+            .capture_session(TreeOptions::default(), Some(target), 0)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(error, crate::Error::StaleRef(_)));
+
+        fixture.store(5, Relaxed);
+        assert!(matches!(
+            session
+                .capture_session(TreeOptions::default(), None, 0)
+                .await
+                .unwrap(),
+            SessionCapture::Degraded(DesktopFallbackReason::AccessibilityUnavailable)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), foreign_listener.accept())
+                .await
+                .is_err()
+        );
 
         assert_eq!(
             *received_actions.lock().unwrap(),

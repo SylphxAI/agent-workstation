@@ -212,6 +212,12 @@ pub struct DesktopNode {
     pub enabled: bool,
     /// Whether the node currently has keyboard focus.
     pub focused: bool,
+    /// Whether the platform reports an editable control.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub editable: bool,
+    /// Whether the platform reports a checked control.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checked: bool,
     /// Screen-space bounding box in desktop pixels, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bounds: Option<DesktopRect>,
@@ -289,6 +295,12 @@ impl DesktopTree {
                 }
                 if n.focused {
                     line.push_str(" focused");
+                }
+                if n.editable {
+                    line.push_str(" editable");
+                }
+                if n.checked {
+                    line.push_str(" checked");
                 }
                 if let Some(b) = n.bounds {
                     line.push_str(&format!(" ({},{} {}x{})", b.x, b.y, b.width, b.height));
@@ -478,6 +490,10 @@ pub struct RawNode<H> {
     pub enabled: bool,
     /// Whether focused.
     pub focused: bool,
+    /// Whether the control is editable.
+    pub editable: bool,
+    /// Whether the control is checked.
+    pub checked: bool,
     /// Screen bounding box, if known.
     pub bounds: Option<DesktopRect>,
     /// Supported native action names.
@@ -582,6 +598,8 @@ impl<H> SnapshotIndex<H> {
                     pid: raw.pid,
                     enabled: raw.enabled,
                     focused: raw.focused,
+                    editable: raw.editable,
+                    checked: raw.checked,
                     bounds: raw.bounds,
                     actions: raw.actions,
                     children,
@@ -899,6 +917,8 @@ mod tests {
             pid: Some(500),
             enabled: true,
             focused: true,
+            editable: false,
+            checked: false,
             bounds: Some(DesktopRect {
                 x: 0,
                 y: 0,
@@ -916,6 +936,8 @@ mod tests {
                     pid: Some(500),
                     enabled: true,
                     focused: false,
+                    editable: false,
+                    checked: false,
                     bounds: Some(DesktopRect {
                         x: 40,
                         y: 80,
@@ -934,6 +956,8 @@ mod tests {
                     pid: Some(500),
                     enabled: true,
                     focused: false,
+                    editable: false,
+                    checked: false,
                     bounds: Some(DesktopRect {
                         x: 40,
                         y: 140,
@@ -952,6 +976,8 @@ mod tests {
                     pid: Some(500),
                     enabled: false,
                     focused: false,
+                    editable: false,
+                    checked: false,
                     bounds: Some(DesktopRect {
                         x: 180,
                         y: 140,

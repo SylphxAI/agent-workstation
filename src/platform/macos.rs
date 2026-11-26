@@ -429,6 +429,8 @@ fn walk_ax(
         pid,
         enabled,
         focused,
+        editable: false,
+        checked: false,
         bounds,
         actions: Vec::new(),
         children,

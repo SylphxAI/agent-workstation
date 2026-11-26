@@ -2,8 +2,8 @@
 //! accessibility tree used for agent desktop actions.
 
 use super::{
-    ATSPI_STATE_ENABLED, ATSPI_STATE_FOCUSED, DbusConn, LinuxPlatformAdapter, align_cursor,
-    decode_string, decode_u32, encoded_string, has_state,
+    ATSPI_STATE_ENABLED, ATSPI_STATE_FOCUSED, DbusConn, LinuxPlatformAdapter, decode_u32,
+    encoded_string, has_state,
 };
 use crate::desktop::DesktopRect;
 use crate::takeover::{InputContext, InputPurpose};
@@ -12,7 +12,6 @@ use std::time::Duration;
 
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const ROOT: &str = "/org/a11y/atspi/accessible/root";
-const NULL: &str = "/org/a11y/atspi/null";
 const WINDOW_COORDS: u32 = 1;
 const MAX_NODES: usize = 512;
 const MAX_WINDOWS: usize = 64;
@@ -109,7 +108,10 @@ async fn probe(
             }
         }
         let remaining = MAX_NODES.saturating_sub(visited.len() + pending.len());
-        let paths = children(conn, &bus, &path, remaining).await?;
+        let paths = conn
+            .accessible_children(&bus, &path, remaining)
+            .await
+            .ok()?;
         pending.extend(paths.into_iter().rev().filter_map(|(child_bus, child)| {
             (child_bus == bus || child_bus.is_empty()).then_some(child)
         }));
@@ -141,11 +143,19 @@ async fn focused_window(
 ) -> Option<(String, String, [i64; 2])> {
     let mut best: Option<WindowMatch> = None;
     let mut ambiguous = false;
-    for (bus, root) in children(conn, "org.a11y.atspi.Registry", ROOT, MAX_WINDOWS).await? {
+    for (bus, root) in conn
+        .accessible_children("org.a11y.atspi.Registry", ROOT, MAX_WINDOWS)
+        .await
+        .ok()?
+    {
         if !bus.starts_with(':') || process_id(conn, &bus).await != Some(pid) {
             continue;
         }
-        for (child_bus, frame) in children(conn, &bus, &root, MAX_WINDOWS).await? {
+        for (child_bus, frame) in conn
+            .accessible_children(&bus, &root, MAX_WINDOWS)
+            .await
+            .ok()?
+        {
             if !child_bus.is_empty() && child_bus != bus {
                 continue;
             }
@@ -254,42 +264,6 @@ fn purpose(role: u32, states: &[u32], browser: bool) -> InputPurpose {
     } else {
         InputPurpose::Text
     }
-}
-
-async fn children(
-    conn: &mut DbusConn,
-    bus: &str,
-    path: &str,
-    limit: usize,
-) -> Option<Vec<(String, String)>> {
-    // GetChildren batches object references only. Cache.GetItems would also
-    // send accessible names and descriptions for the entire application.
-    let (sig, bytes) = conn
-        .call_raw(bus, path, ACCESSIBLE, "GetChildren", "", &[])
-        .await
-        .ok()?;
-    if sig != "a(so)" {
-        return None;
-    }
-    let mut cursor = 0;
-    let length = decode_u32(&bytes, &mut cursor)? as usize;
-    align_cursor(&mut cursor, 8);
-    let array = bytes.get(..cursor.checked_add(length)?)?;
-    let mut children = Vec::new();
-    for _ in 0..limit {
-        if cursor == array.len() {
-            break;
-        }
-        align_cursor(&mut cursor, 8);
-        let bus = decode_string(array, &mut cursor)?;
-        let path = decode_string(array, &mut cursor)?;
-        if path != NULL && path.starts_with('/') {
-            children.push((bus, path));
-        }
-    }
-    // Reject a partial traversal rather than publishing an inactive context
-    // (or choosing the wrong toplevel) from a truncated reply.
-    (cursor == array.len()).then_some(children)
 }
 
 async fn role(conn: &mut DbusConn, bus: &str, path: &str) -> Option<u32> {

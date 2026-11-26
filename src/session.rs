@@ -662,6 +662,32 @@ impl<'a> Agent<'a> {
         Ok(guard)
     }
 
+    #[cfg(target_os = "linux")]
+    async fn under_accessibility_control<T>(
+        &self,
+        operation: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let mut control = self.session.gate.subscribe();
+        self.session.check(&self.principal)?;
+        let result = tokio::select! {
+            biased;
+            _ = control.changed() => Err(self.session.check(&self.principal).err().unwrap_or_else(|| {
+                Error::Refused("session control changed during desktop accessibility operation".into())
+            })),
+            result = operation => result,
+        };
+        self.session.check(&self.principal)?;
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn native_desktop_action(&self, action: DesktopAction) -> Result<()> {
+        self.under_accessibility_control(async {
+            Ok(self.session.accessibility.act(action).await?)
+        })
+        .await
+    }
+
     // ---- web operations -------------------------------------------------
 
     /// Navigate the active tab; returns the final URL. Keyboard focus moves
@@ -1155,33 +1181,36 @@ impl<'a> Agent<'a> {
             if root.is_none() {
                 self.window_refs().clear();
             }
-            match self
-                .session
-                .accessibility
-                .capture_session(options, root, offset)
-                .await?
-            {
-                SessionCapture::Native(tree) => {
-                    Ok(SessionDesktopSnapshot::NativeAccessibility { tree })
+            self.under_accessibility_control(async {
+                match self
+                    .session
+                    .accessibility
+                    .capture_session(options, root, offset)
+                    .await?
+                {
+                    SessionCapture::Native(tree) => {
+                        Ok(SessionDesktopSnapshot::NativeAccessibility { tree })
+                    }
+                    SessionCapture::Degraded(fallback_reason) => {
+                        let windows = compositor::list_windows(&self.session.ipc_socket)
+                            .await?
+                            .into_iter()
+                            .filter(|w| options.pid.is_none_or(|pid| w.pid == Some(pid)))
+                            .collect::<Vec<_>>();
+                        let (_, limit) = options.effective_bounds();
+                        let truncated = windows.len() > offset.saturating_add(limit);
+                        let snapshot = self
+                            .window_refs()
+                            .record(windows.into_iter().skip(offset).take(limit).collect());
+                        Ok(SessionDesktopSnapshot::Compositor {
+                            fallback_reason,
+                            snapshot,
+                            truncated,
+                        })
+                    }
                 }
-                SessionCapture::Degraded(fallback_reason) => {
-                    let windows = compositor::list_windows(&self.session.ipc_socket)
-                        .await?
-                        .into_iter()
-                        .filter(|w| options.pid.is_none_or(|pid| w.pid == Some(pid)))
-                        .collect::<Vec<_>>();
-                    let (_, limit) = options.effective_bounds();
-                    let truncated = windows.len() > offset.saturating_add(limit);
-                    let snapshot = self
-                        .window_refs()
-                        .record(windows.into_iter().skip(offset).take(limit).collect());
-                    Ok(SessionDesktopSnapshot::Compositor {
-                        fallback_reason,
-                        snapshot,
-                        truncated,
-                    })
-                }
-            }
+            })
+            .await
         }
     }
 
@@ -1212,12 +1241,10 @@ impl<'a> Agent<'a> {
                 self.window_refs().resolve(target)?.id
             } else {
                 let target = NodeRef::parse(target)?;
-                self.session
-                    .accessibility
-                    .act(DesktopAction::Focus {
-                        target: target.clone(),
-                    })
-                    .await?;
+                self.native_desktop_action(DesktopAction::Focus {
+                    target: target.clone(),
+                })
+                .await?;
                 return Ok(DesktopFocus::NativeAccessibility { target });
             };
             compositor::focus_window(&self.session.ipc_socket, id).await?;
@@ -1270,13 +1297,11 @@ impl<'a> Agent<'a> {
                         "accessibility refs support native invocation, not pointer gestures".into(),
                     ));
                 }
-                self.session
-                    .accessibility
-                    .act(DesktopAction::Click {
-                        target,
-                        button: None,
-                    })
-                    .await?;
+                self.native_desktop_action(DesktopAction::Click {
+                    target,
+                    button: None,
+                })
+                .await?;
                 return Ok(());
             }
             let window = self.window_refs().resolve(raw)?;
@@ -1330,11 +1355,8 @@ impl<'a> Agent<'a> {
                 ));
             }
             let target = NodeRef::parse(raw)?;
-            Ok(self
-                .session
-                .accessibility
-                .act(DesktopAction::SetValue { target, value })
-                .await?)
+            self.native_desktop_action(DesktopAction::SetValue { target, value })
+                .await
         }
     }
 }

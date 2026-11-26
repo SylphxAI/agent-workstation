@@ -216,6 +216,8 @@ fn walk_uia(
         pid,
         enabled,
         focused,
+        editable: false,
+        checked: false,
         bounds,
         actions: Vec::new(),
         children,
