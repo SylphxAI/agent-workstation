@@ -3,7 +3,8 @@ name: ci
 # Format, clippy, docs, unit tests and a headful integration test on a
 # headless Wayland desktop (sway + wayvnc + Chrome).
 #
-# Build, test, and gate jobs use standard hosted runners only on public repositories.
+# Use standard hosted runners only for affirmatively public repositories.
+# Non-public fork pull-request workflows must remain disabled in repository policy.
 #
 # `ci-ok` is the one required check; it runs no repository code.
 
@@ -29,6 +30,7 @@ env:
 
 jobs:
   changes:
+    if: github.event.repository.visibility == 'public' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       pull-requests: read
@@ -44,8 +46,8 @@ jobs:
       migrations: ${{ needs.changes.outputs.migrations }}
 
   lint:
-    if: github.event.repository.visibility == 'public'
-    runs-on: ubuntu-latest
+    if: github.event.repository.visibility == 'public' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || github.event_name == 'merge_group' && 'sylphx-linux-standard-merge' || 'sylphx-linux-standard' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -71,8 +73,8 @@ jobs:
         run: cargo doc --no-deps --all-features --locked
 
   test:
-    if: github.event.repository.visibility == 'public'
-    runs-on: ubuntu-latest
+    if: github.event.repository.visibility == 'public' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || github.event_name == 'merge_group' && 'sylphx-linux-standard-merge' || 'sylphx-linux-standard' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -84,6 +86,13 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -yq --no-install-recommends sway wayvnc fonts-dejavu-core dbus at-spi2-core python3-gi gir1.2-gtk-3.0
+          if [ ! -x /usr/bin/google-chrome ]; then
+            chrome_deb="$RUNNER_TEMP/google-chrome-stable.deb"
+            curl --fail --silent --show-error --location --retry 3 \
+              --output "$chrome_deb" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+            sudo apt-get install -yq --no-install-recommends "$chrome_deb"
+          fi
+          test -x /usr/bin/google-chrome
       - name: Unit and behaviour tests
         run: cargo test --all-features --locked
       - name: WebMCP integration (headless Chromium)
@@ -103,8 +112,8 @@ jobs:
         run: cargo test --all-features --locked --tests -- --nocapture --test-threads=1
 
   macos:
-    if: github.event.repository.visibility == 'public'
-    runs-on: macos-latest
+    if: github.event.repository.visibility == 'public' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(github.event.repository.visibility == 'public' && '"macos-latest"' || '["self-hosted","sylphx","macos","standard"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -122,8 +131,8 @@ jobs:
         run: cargo test --all-features --locked
 
   windows:
-    if: github.event.repository.visibility == 'public'
-    runs-on: windows-latest
+    if: github.event.repository.visibility == 'public' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ${{ fromJSON(github.event.repository.visibility == 'public' && '"windows-latest"' || '["self-hosted","sylphx","windows","standard"]') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -141,16 +150,24 @@ jobs:
         run: cargo test --all-features --locked
 
   ci-ok:
-    if: always() && github.event.repository.visibility == 'public'
-    needs: [lint, test, macos, windows, shared-baseline]
-    runs-on: ubuntu-latest
+    if: always()
+    needs: [changes, lint, test, macos, windows, shared-baseline]
+    runs-on: ${{ github.event.repository.visibility == 'public' && 'ubuntu-latest' || 'sylphx-linux-control' }}
+    permissions: {}
     timeout-minutes: 5
     steps:
       - name: All required jobs passed
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
+          RESULTS: ${{ format('{0} {1} {2} {3} {4}', needs.changes.result, needs.lint.result, needs.test.result, needs.macos.result, needs.windows.result) }}
+          BASELINE_RESULT: ${{ needs.shared-baseline.result }}
+          BASELINE_MAY_SKIP: ${{ github.event.repository.visibility != 'public' && needs.changes.outputs.migrations == 'false' }}
         run: |
           echo "results: $RESULTS"
-          for r in $RESULTS; do
-            [ "$r" = success ] || { echo "a required job did not succeed"; exit 1; }
-          done
+          [ "$RESULTS" = "success success success success success" ] || {
+            echo "a required job did not succeed"
+            exit 1
+          }
+          case "$BASELINE_MAY_SKIP:$BASELINE_RESULT" in
+            true:skipped|true:success|false:success) ;;
+            *) echo "shared-baseline did not succeed: $BASELINE_RESULT"; exit 1 ;;
+          esac
