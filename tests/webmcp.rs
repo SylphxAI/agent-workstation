@@ -12,8 +12,20 @@ use serde_json::{Value, json};
 use tokio::time::timeout;
 
 async fn call(web: &mut Web, name: &str, input: Value) -> agent_workstation::Result<Value> {
-    web.webmcp_call(name, input, false, WEBMCP_DEFAULT_TIMEOUT_MS)
+    let tool_ref = discover(web, name).await?;
+    web.webmcp_call(&tool_ref, input, false, WEBMCP_DEFAULT_TIMEOUT_MS)
         .await
+        .map(|r| r.value)
+}
+
+async fn discover(web: &mut Web, name: &str) -> agent_workstation::Result<String> {
+    web.webmcp_list()
+        .await?
+        .tools
+        .into_iter()
+        .find(|tool| tool.name == name)
+        .map(|tool| tool.tool_ref)
+        .ok_or_else(|| Error::NotFound("fixture tool was not discovered".into()))
 }
 
 #[tokio::test]
@@ -38,9 +50,10 @@ async fn real_headless_chromium_webmcp() {
                         Html(include_str!("fixtures/webmcp-navigator.html"))
                     }),
                 )
+                .route("/form", axum::routing::get(|| async { Html(include_str!("fixtures/webmcp-form.html")) }))
                 .route(
                     "/plain",
-                    axum::routing::get(|| async { Html("<p>Plain content</p><script>Object.defineProperty(document, 'modelContext', {value: undefined})</script>") }),
+                    axum::routing::get(|| async { Html("<p>Plain content</p><input id=query><button id=go onclick='window.clicked=query.value'>Go</button><script>Object.defineProperty(document, 'modelContext', {value: undefined})</script>") }),
                 ),
         )
         .await
@@ -52,7 +65,7 @@ async fn real_headless_chromium_webmcp() {
     browser.extra_args = vec![
         "--headless".into(),
         "--disable-gpu".into(),
-        "--enable-blink-features=WebMCP".into(),
+        "--enable-blink-features=WebMCP,DeclarativeWebMCP".into(),
     ];
     // Only opt out for disposable CI/sandbox environments whose namespaces
     // disallow the browser's own sandbox. The normal launch remains unchanged.
@@ -72,16 +85,24 @@ async fn real_headless_chromium_webmcp() {
     let mut web = Web::connect(browser.endpoint()).await.unwrap();
 
     web.navigate(&format!("{origin}/plain")).await.unwrap();
-    assert!(web.webmcp_list().await.unwrap().is_empty());
-    assert_eq!(web.read().await.unwrap(), "Plain content");
+    assert!(web.webmcp_list().await.unwrap().tools.is_empty());
+    assert_eq!(web.read().await.unwrap(), "Plain content\n\nGo");
     assert!(matches!(
         call(&mut web, "echo", json!({})).await,
         Err(Error::NotFound(_))
     ));
+    let snapshot = web.snapshot().await.unwrap();
+    assert!(snapshot.text.contains("Plain content"));
+    web.fill("#query", "still works").await.unwrap();
+    web.click("#go").await.unwrap();
+    assert_eq!(web.eval("window.clicked").await.unwrap(), "still works");
 
     web.navigate(&format!("{origin}/native")).await.unwrap();
     web.eval("window.ready").await.unwrap();
-    let tools = web.webmcp_list().await.unwrap();
+    let discovery = web.webmcp_list().await.unwrap();
+    assert!(discovery.untrusted);
+    assert_eq!(discovery.origin.as_deref(), Some(origin.as_str()));
+    let tools = discovery.tools;
     assert!(tools.iter().all(|tool| tool.name != "hidden"));
     let tool = tools.iter().find(|tool| tool.name == "gated").unwrap();
     assert_eq!(tool.description, "Run gated");
@@ -103,7 +124,7 @@ async fn real_headless_chromium_webmcp() {
     );
     assert!(matches!(
         web.webmcp_call("hidden", json!({}), true, 5_000).await,
-        Err(Error::NotFound(_))
+        Err(Error::StaleRef(_))
     ));
     let error = call(
         &mut web,
@@ -117,9 +138,10 @@ async fn real_headless_chromium_webmcp() {
         matches!(error, Error::WebMcpConfirmation { tool, description, arguments }
         if tool == "gated" && description == "Run gated" && json!(arguments) == json!({"text": "[redacted]"}))
     );
+    let secret = discover(&mut web, "secret").await.unwrap();
     let error = web
         .webmcp_call(
-            "secret",
+            &secret,
             json!({"credential": "fixture-secret"}),
             true,
             5_000,
@@ -139,10 +161,12 @@ async fn real_headless_chromium_webmcp() {
         web.eval("effects").await.unwrap(),
         json!({"hidden":0,"confirmed":0,"secret":0,"clicks":0,"started":0,"aborted":0})
     );
+    let gated = discover(&mut web, "gated").await.unwrap();
     assert_eq!(
-        web.webmcp_call("gated", json!({"text": "allowed"}), true, 5_000)
+        web.webmcp_call(&gated, json!({"text": "allowed"}), true, 5_000)
             .await
-            .unwrap(),
+            .unwrap()
+            .value,
         json!({"ok":true})
     );
     assert_eq!(web.eval("effects.confirmed").await.unwrap(), 1);
@@ -157,13 +181,14 @@ async fn real_headless_chromium_webmcp() {
         .unwrap();
     let mut observer = Cdp::connect(browser.endpoint()).await.unwrap();
     observer.attach(&tab.id).await.unwrap();
+    let slow = discover(&mut web, "slow").await.unwrap();
     assert!(matches!(
-        web.webmcp_call("slow", json!({}), false, 700).await,
+        web.webmcp_call(&slow, json!({}), false, 700).await,
         Err(Error::Timeout(_))
     ));
     observe(&mut observer, "effects.aborted", 1).await;
     {
-        let mut pending = Box::pin(web.webmcp_call("slow", json!({}), false, 5_000));
+        let mut pending = Box::pin(web.webmcp_call(&slow, json!({}), false, 5_000));
         tokio::select! {
             result = &mut pending => panic!("slow returned early: {result:?}"),
             _ = observe(&mut observer, "effects.started", 2) => {}
@@ -172,11 +197,31 @@ async fn real_headless_chromium_webmcp() {
     }
     observe(&mut observer, "effects.aborted", 2).await;
 
+    let echo = discover(&mut web, "echo").await.unwrap();
+    web.eval("unregister()").await.unwrap();
+    let removed = web.webmcp_call(&echo, json!({}), false, 5_000).await;
+    assert!(
+        matches!(removed, Err(Error::NotFound(_) | Error::StaleRef(_))),
+        "{removed:?}"
+    );
+    web.eval("registerAgain()").await.unwrap();
+    let replaced = web.webmcp_call(&echo, json!({}), false, 5_000).await;
+    assert!(
+        matches!(replaced, Err(Error::NotFound(_) | Error::StaleRef(_))),
+        "{replaced:?}"
+    );
+    assert_eq!(
+        call(&mut web, "echo", json!({})).await.unwrap(),
+        json!({"new":true})
+    );
+    web.navigate(&format!("{origin}/native")).await.unwrap();
+    web.eval("window.ready").await.unwrap();
     web.eval("unregister()").await.unwrap();
     assert!(
         !web.webmcp_list()
             .await
             .unwrap()
+            .tools
             .iter()
             .any(|t| t.name == "echo")
     );
@@ -190,13 +235,94 @@ async fn real_headless_chromium_webmcp() {
         json!({"new":true})
     );
 
+    let echo = discover(&mut web, "echo").await.unwrap();
+    let second_tab = web.new_tab(&format!("{origin}/native")).await.unwrap();
+    assert!(matches!(
+        web.webmcp_call(&echo, json!({}), false, 5_000).await,
+        Err(Error::StaleRef(_))
+    ));
+    web.close_tab(&second_tab).await.unwrap();
+    let echo = discover(&mut web, "echo").await.unwrap();
+    // Navigate externally, bypassing the Web controller's invalidation.
+    observer
+        .call(
+            "Page.navigate",
+            json!({"url":format!("{origin}/native?same-origin")}),
+        )
+        .await
+        .unwrap();
+    observe(
+        &mut observer,
+        "Number(location.search === '?same-origin')",
+        1,
+    )
+    .await;
+    assert!(matches!(
+        web.webmcp_call(&echo, json!({}), false, 5_000).await,
+        Err(Error::StaleRef(_))
+    ));
+
+    let echo = discover(&mut web, "echo").await.unwrap();
+    let other_origin = origin.replace("127.0.0.1", "localhost");
+    observer
+        .call(
+            "Page.navigate",
+            json!({"url":format!("{other_origin}/native")}),
+        )
+        .await
+        .unwrap();
+    observe(
+        &mut observer,
+        "Number(location.hostname === 'localhost')",
+        1,
+    )
+    .await;
+    assert!(matches!(
+        web.webmcp_call(&echo, json!({}), false, 5_000).await,
+        Err(Error::StaleRef(_))
+    ));
+
     web.navigate(&format!("{origin}/navigator")).await.unwrap();
-    let tools = web.webmcp_list().await.unwrap();
+    let discovery = web.webmcp_list().await.unwrap();
+    assert!(discovery.untrusted);
+    assert_eq!(discovery.origin.as_deref(), Some(origin.as_str()));
+    let tools = discovery.tools;
     assert_eq!(
         tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
-        ["ui.snapshot", "ui.query", "ui.act"]
+        ["ui.snapshot", "ui.query", "ui.act", "refuses", "oversized"]
     );
-    let result = call(&mut web, "ui.snapshot", json!({})).await.unwrap();
+    let snapshot = &tools[0];
+    assert_eq!(snapshot.annotations["readOnlyHint"], true);
+    assert_eq!(snapshot.annotations["untrustedContentHint"], false);
+    assert_eq!(tools[2].annotations["consequentialHint"], true);
+    let result = web
+        .webmcp_call(&snapshot.tool_ref, json!({}), false, 5_000)
+        .await
+        .unwrap();
+    assert!(result.untrusted);
+    assert_eq!(result.origin, origin);
+    let result = result.value;
+    assert!(matches!(
+        web.webmcp_call(
+            &snapshot.tool_ref,
+            json!({"input":"é".repeat(9000)}),
+            false,
+            5_000
+        )
+        .await,
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        web.webmcp_call(&tools[4].tool_ref, json!({}), false, 5_000)
+            .await,
+        Err(Error::Refused(_))
+    ));
+    let refusal = web
+        .webmcp_call(&tools[3].tool_ref, json!({}), false, 5_000)
+        .await
+        .unwrap_err();
+    assert_eq!(refusal.code(), "refused");
+    assert!(!refusal.to_string().contains("fixture-secret"));
     assert!(!result.to_string().contains("fixture-"));
     assert_eq!(
         result["children"],
@@ -240,7 +366,28 @@ async fn real_headless_chromium_webmcp() {
         Err(Error::NotFound(_))
     ));
     web.navigate(&format!("{origin}/plain")).await.unwrap();
-    assert!(web.webmcp_list().await.unwrap().is_empty());
+    assert!(web.webmcp_list().await.unwrap().tools.is_empty());
+    web.navigate(&format!("{origin}/form")).await.unwrap();
+    web.eval("new Promise(resolve => { const frame = document.createElement('iframe'); frame.src = '/native'; frame.onload = async () => { await frame.contentWindow.ready; resolve(true); }; document.body.append(frame); })").await.unwrap();
+    let discovery = web.webmcp_list().await.unwrap();
+    assert_eq!(
+        discovery.tools.len(),
+        1,
+        "do not expose iframe registrations"
+    );
+    let form = discovery
+        .tools
+        .iter()
+        .find(|t| t.name == "catalog_search")
+        .expect("native declarative form must be registered");
+    assert_eq!(form.description, "Search the catalog");
+    assert_eq!(form.input_schema["properties"]["query"]["type"], "string");
+    let result = web
+        .webmcp_call(&form.tool_ref, json!({"query":"café"}), false, 5_000)
+        .await
+        .unwrap();
+    assert!(result.untrusted);
+    assert_eq!(result.value, json!({"query":"café", "agentInvoked":true}));
     browser.shutdown().await;
     server.abort();
 }

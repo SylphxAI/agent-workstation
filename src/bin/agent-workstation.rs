@@ -424,7 +424,7 @@ impl From<Error> for ApiError {
                 StatusCode::FORBIDDEN,
                 json!({
                     "code": e.code(), "message": e.to_string(), "tool": tool,
-                    "description": description, "arguments": arguments,
+                    "description": description, "arguments": arguments, "untrusted": true,
                 }),
             );
         }
@@ -691,7 +691,8 @@ enum Op {
     },
     WebmcpList,
     WebmcpCall {
-        name: String,
+        #[serde(rename = "ref")]
+        tool_ref: String,
         #[serde(default = "webmcp_empty_arguments")]
         arguments: Value,
         #[serde(default)]
@@ -838,14 +839,17 @@ async fn call(
         }
         Op::ReleaseKeys => json!({ "ok": s.release_keys().await? }),
         Op::Eval { expression } => json!({ "value": s.eval(&expression).await? }),
-        Op::WebmcpList => json!({ "tools": s.webmcp_list().await? }),
+        Op::WebmcpList => json!(s.webmcp_list().await?),
         Op::WebmcpCall {
-            name,
+            tool_ref,
             arguments,
             confirmed,
             timeout_ms,
         } => {
-            json!({ "value": s.webmcp_call(&name, arguments, confirmed, timeout_ms).await? })
+            json!(
+                s.webmcp_call(&tool_ref, arguments, confirmed, timeout_ms)
+                    .await?
+            )
         }
         Op::Html { r#ref } => json!({ "html": s.html(r#ref.as_deref()).await? }),
         Op::Cookies { urls } => json!({ "cookies": s.cookies(&urls).await? }),
@@ -1467,7 +1471,7 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
             println!("{response}");
         }
         Command::WebmcpCall {
-            name,
+            tool_ref,
             arguments,
             confirmed,
             timeout_ms,
@@ -1479,7 +1483,7 @@ async fn run_client(args: ClientArgs, cmd: Command) -> Result<(), String> {
                 .call_op(
                     &id,
                     json!({
-                        "op": "webmcp_call", "name": name, "arguments": arguments,
+                        "op": "webmcp_call", "ref": tool_ref, "arguments": arguments,
                         "confirmed": confirmed, "timeout_ms": timeout_ms,
                     }),
                 )

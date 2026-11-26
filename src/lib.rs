@@ -50,7 +50,7 @@ pub mod webauthn;
 
 pub use browser::{
     BrowserConfig, Cookie, Locator, PageImage, Snapshot, Tab, WEBMCP_DEFAULT_TIMEOUT_MS,
-    WEBMCP_MAX_TIMEOUT_MS, WebAuthnCeremonyLease, WebMcpTool,
+    WEBMCP_MAX_TIMEOUT_MS, WebAuthnCeremonyLease, WebMcpDiscovery, WebMcpResult, WebMcpTool,
 };
 pub use desktop::{
     Button, DesktopFallbackReason, DesktopFocus, DesktopRect, DesktopSnapshot, DesktopWindow,

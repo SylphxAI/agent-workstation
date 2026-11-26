@@ -10,7 +10,7 @@ use std::time::Duration;
 use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::error::{Error, Result};
@@ -40,9 +40,21 @@ impl std::fmt::Debug for Cdp {
 impl Cdp {
     /// Connect to a `ws://` endpoint.
     pub async fn connect(endpoint: &str) -> Result<Self> {
+        Self::connect_bounded(endpoint, None).await
+    }
+
+    pub(crate) async fn connect_bounded(
+        endpoint: &str,
+        max_message: Option<usize>,
+    ) -> Result<Self> {
+        let config = max_message.map(|limit| {
+            WebSocketConfig::default()
+                .max_message_size(Some(limit))
+                .max_frame_size(Some(limit))
+        });
         let (ws, _) = tokio::time::timeout(
             Duration::from_secs(10),
-            tokio_tungstenite::connect_async(endpoint),
+            tokio_tungstenite::connect_async_with_config(endpoint, config, false),
         )
         .await
         .map_err(|_| Error::Timeout("CDP connect".into()))?

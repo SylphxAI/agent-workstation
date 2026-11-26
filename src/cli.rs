@@ -194,8 +194,8 @@ pub enum Command {
 
     /// Invoke a page-defined WebMCP tool with a JSON argument object.
     WebmcpCall {
-        /// Page-defined tool name from webmcp-list.
-        name: String,
+        /// Opaque tool ref returned by webmcp-list.
+        tool_ref: String,
         /// JSON argument object.
         #[arg(default_value = "{}")]
         arguments: String,

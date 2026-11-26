@@ -22,6 +22,7 @@ const nodes = [
 ];
 navigator.modelContext.provideContext({tools: [
     {name: 'ui.snapshot', description: 'Read the semantic tree', inputSchema: {type: 'object'},
+        annotations: {readOnlyHint: true, untrustedContentHint: false},
         execute: () => ({role: 'window', children: nodes})},
     {name: 'ui.query', description: 'Query the semantic tree', inputSchema: {type: 'object'},
         execute: ({ref}) => nodes.filter(node => node.ref === ref)},
@@ -31,6 +32,10 @@ navigator.modelContext.provideContext({tools: [
             if (ref === 'locked') return {isError: true, error: {code: 'confirmation_required', ref}};
             return {isError: true, error: {code: 'not_found'}};
         }},
+    {name: 'refuses', description: 'Refused by the page', execute: async () => {
+        throw new DOMException('fixture-secret', 'NotAllowedError');
+    }},
+    {name: 'oversized', description: 'Large output', execute: () => ({text: 'é'.repeat(20_000)})},
     {name: 'invisible', description: 'Never discover', annotations: {agent_hidden: null}, execute: () => ++counter.clicks},
 ]});
 </script>

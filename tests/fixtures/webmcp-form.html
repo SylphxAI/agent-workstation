@@ -1,0 +1,14 @@
+<!doctype html><meta charset="utf-8"><title>Catalog</title>
+<form toolname="catalog_search" tooldescription="Search the catalog" toolautosubmit>
+    <label>Query <input name="query" toolparamdescription="Search term" required></label>
+    <button>Search</button>
+</form>
+<script>
+const form = document.querySelector('form');
+form.addEventListener('submit', event => {
+    event.preventDefault();
+    event.respondWith(Promise.resolve({
+        query: new FormData(form).get('query'), agentInvoked: event.agentInvoked,
+    }));
+});
+</script>
