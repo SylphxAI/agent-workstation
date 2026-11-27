@@ -849,6 +849,22 @@ impl Web {
         Ok(web)
     }
 
+    /// Observe a pending modal without issuing a renderer command.
+    pub async fn pending_dialog(&mut self) -> Result<Option<crate::cdp::JavaScriptDialog>> {
+        self.cdp.drain_events().await?;
+        Ok(self.cdp.pending_dialog().cloned())
+    }
+
+    /// Wait until the active tab has a modal, e.g. while using a second CDP connection.
+    pub async fn wait_dialog(&mut self) -> Result<()> {
+        self.cdp.wait_dialog().await
+    }
+
+    /// Explicitly accept or dismiss the active tab's modal.
+    pub async fn handle_dialog(&mut self, accept: bool, prompt_text: Option<&str>) -> Result<()> {
+        self.cdp.handle_dialog(accept, prompt_text).await
+    }
+
     /// Open tabs.
     pub async fn tabs(&mut self) -> Result<Vec<Tab>> {
         Ok(self
@@ -872,13 +888,16 @@ impl Web {
     pub async fn new_tab(&mut self, url: &str) -> Result<String> {
         check_url(url)?;
         let r = self
-            .browser_call("Target.createTarget", json!({ "url": url }))
+            .browser_call("Target.createTarget", json!({ "url": "about:blank" }))
             .await?;
         let id = r["targetId"]
             .as_str()
             .ok_or_else(|| Error::Protocol("createTarget returned no id".into()))?
             .to_string();
         self.select_tab(&id).await?;
+        if url != "about:blank" {
+            self.navigate(url).await?;
+        }
         Ok(id)
     }
 
@@ -1602,10 +1621,10 @@ impl Web {
                     json!({ "expression": "document.readyState", "returnByValue": true }),
                 )
                 .await;
-            if let Ok(v) = r
-                && v["result"]["value"] == "complete"
-            {
-                return Ok(());
+            match r {
+                Ok(v) if v["result"]["value"] == "complete" => return Ok(()),
+                Err(Error::DialogOpen) => return Err(Error::DialogOpen),
+                _ => {}
             }
             if Instant::now() >= deadline {
                 return Err(Error::Timeout("page load".into()));
