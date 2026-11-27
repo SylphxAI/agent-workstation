@@ -4,7 +4,7 @@
 //! commands; events that arrive while waiting for a reply are buffered and
 //! readable through [`Cdp::next_event`].
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
@@ -18,6 +18,30 @@ use crate::error::{Error, Result};
 /// Default wait for one command's reply.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Browser-provided metadata for a JavaScript modal. Text is untrusted page data.
+#[derive(Clone, serde::Deserialize, serde::Serialize)]
+pub struct JavaScriptDialog {
+    /// Chromium dialog type (alert, confirm, prompt, or beforeunload).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Text displayed by the dialog.
+    pub message: String,
+    /// Initial value for a prompt (empty for other dialog types).
+    #[serde(default, alias = "defaultPrompt")]
+    pub default_prompt: String,
+    /// URL of the document that opened the dialog.
+    pub url: String,
+    /// Whether the browser has its own handler for this dialog.
+    #[serde(alias = "hasBrowserHandler")]
+    pub has_browser_handler: bool,
+}
+
+impl std::fmt::Debug for JavaScriptDialog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JavaScriptDialog").finish_non_exhaustive()
+    }
+}
+
 /// One CDP connection.
 pub struct Cdp {
     endpoint: String,
@@ -25,6 +49,8 @@ pub struct Cdp {
     next_id: u64,
     session_id: Option<String>,
     events: VecDeque<Value>,
+    sessions: HashMap<String, String>,
+    dialogs: HashMap<String, JavaScriptDialog>,
     healthy: bool,
 }
 
@@ -65,6 +91,8 @@ impl Cdp {
             next_id: 0,
             session_id: None,
             events: VecDeque::new(),
+            sessions: HashMap::new(),
+            dialogs: HashMap::new(),
             healthy: true,
         })
     }
@@ -98,7 +126,17 @@ impl Cdp {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
-        let webauthn = method.starts_with("WebAuthn.");
+        let private = method.starts_with("WebAuthn.") || method == "Page.handleJavaScriptDialog";
+        let blocked = |cdp: &Self| {
+            method != "Page.handleJavaScriptDialog"
+                && session_id.is_some_and(|id| cdp.dialogs.contains_key(id))
+        };
+        if session_id.is_some() && method != "Page.handleJavaScriptDialog" {
+            self.drain_events().await?;
+            if blocked(self) {
+                return Err(Error::DialogOpen);
+            }
+        }
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({ "id": id, "method": method, "params": params });
@@ -107,7 +145,7 @@ impl Cdp {
         }
         if let Err(e) = self.ws.send(Message::Text(msg.to_string().into())).await {
             self.healthy = false;
-            return Err(if webauthn {
+            return Err(if private {
                 Error::protocol(format!("{method}: send failed"))
             } else {
                 Error::protocol(format!("{method}: send failed: {e}"))
@@ -116,7 +154,7 @@ impl Cdp {
         let wait = async {
             loop {
                 let v = self.read_one().await.map_err(|e| {
-                    if webauthn {
+                    if private {
                         Error::protocol(format!("{method}: could not read reply"))
                     } else {
                         e
@@ -124,7 +162,16 @@ impl Cdp {
                 })?;
                 if v.get("id").and_then(Value::as_u64) == Some(id) {
                     if let Some(err) = v.get("error") {
-                        if webauthn {
+                        if method == "Page.handleJavaScriptDialog"
+                            && err["code"] == -32602
+                            && err["message"] == "No dialog is showing"
+                        {
+                            if let Some(id) = session_id {
+                                self.dialogs.remove(id);
+                            }
+                            return Err(Error::NoActiveDialog);
+                        }
+                        if private {
                             // A backend may echo command arguments in diagnostic text.
                             let code = err["code"].as_i64().unwrap_or_default();
                             return Err(Error::protocol(format!("{method}: CDP error ({code})")));
@@ -139,6 +186,9 @@ impl Cdp {
                 }
                 if v.get("method").is_some() {
                     self.events.push_back(v);
+                }
+                if blocked(self) {
+                    return Err(Error::DialogOpen);
                 }
             }
         };
@@ -199,6 +249,14 @@ impl Cdp {
 
     /// Attach to a page target with a flat session; later [`Cdp::call`]s go to it.
     pub async fn attach(&mut self, target_id: &str) -> Result<String> {
+        // Keep the original session: enabling Page again does not replay a modal.
+        if self.sessions.contains_key(target_id) {
+            self.drain_events().await?;
+        }
+        if let Some(sid) = self.sessions.get(target_id) {
+            self.session_id = Some(sid.clone());
+            return Ok(sid.clone());
+        }
         let r = self
             .call_in(
                 None,
@@ -213,6 +271,7 @@ impl Cdp {
             .ok_or_else(|| Error::protocol("attachToTarget returned no sessionId"))?
             .to_string();
         self.session_id = Some(sid.clone());
+        self.sessions.insert(target_id.to_owned(), sid.clone());
         Ok(sid)
     }
 
@@ -237,6 +296,79 @@ impl Cdp {
             .unwrap_or_default())
     }
 
+    /// Consume immediately readable frames without dropping unrelated events.
+    pub(crate) async fn drain_events(&mut self) -> Result<()> {
+        for _ in 0..1024 {
+            let Ok(frame) = tokio::time::timeout(Duration::ZERO, self.read_one()).await else {
+                return Ok(());
+            };
+            let frame = frame?;
+            if frame.get("method").is_some() {
+                self.events.push_back(frame);
+            }
+        }
+        Err(Error::protocol("CDP event backlog"))
+    }
+
+    /// Pending JavaScript dialog in the current flat session, if observed.
+    pub fn pending_dialog(&self) -> Option<&JavaScriptDialog> {
+        self.dialogs.get(self.session_id.as_deref()?)
+    }
+
+    /// Wait for a modal in the active session while retaining unrelated events.
+    pub async fn wait_dialog(&mut self) -> Result<()> {
+        self.drain_events().await?;
+        while self.pending_dialog().is_none() {
+            let frame = self.read_one().await?;
+            if frame.get("method").is_some() {
+                self.events.push_back(frame);
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle the pending dialog in the current flat session. Never retries.
+    pub async fn handle_dialog(&mut self, accept: bool, prompt_text: Option<&str>) -> Result<()> {
+        self.drain_events().await?;
+        let Some(dialog) = self.pending_dialog() else {
+            return Err(Error::NoActiveDialog);
+        };
+        let mut params = json!({"accept": accept});
+        if let Some(text) = prompt_text.filter(|_| accept && dialog.kind == "prompt") {
+            params["promptText"] = json!(text);
+        }
+        self.call("Page.handleJavaScriptDialog", params).await?;
+        // Chromium emits javascriptDialogClosed before acknowledging the handle.
+        // Do not clear here: a follow-up dialog can already have opened.
+        Ok(())
+    }
+
+    fn observe_dialog(&mut self, event: &Value) -> bool {
+        match event["method"].as_str() {
+            Some("Page.javascriptDialogOpening") => {
+                if let Some(session) = event["sessionId"].as_str()
+                    && let Ok(dialog) = serde_json::from_value(event["params"].clone())
+                {
+                    self.dialogs.insert(session.to_owned(), dialog);
+                }
+            }
+            Some("Page.javascriptDialogClosed") => {
+                if let Some(session) = event["sessionId"].as_str() {
+                    self.dialogs.remove(session);
+                }
+            }
+            Some("Target.detachedFromTarget") => {
+                if let Some(session) = event["params"]["sessionId"].as_str() {
+                    self.dialogs.remove(session);
+                    self.sessions.retain(|_, id| id != session);
+                }
+                return false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
     async fn read_one(&mut self) -> Result<Value> {
         loop {
             match self.ws.next().await {
@@ -255,6 +387,10 @@ impl Cdp {
                     {
                         credential.remove("privateKey");
                         credential.remove("cmtgKeys");
+                    }
+                    // Never queue dialog payloads (including Closed.userInput).
+                    if self.observe_dialog(&value) {
+                        return Ok(Value::Null);
                     }
                     return Ok(value);
                 }
@@ -396,3 +532,6 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod dialog_tests;

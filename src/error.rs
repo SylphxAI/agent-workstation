@@ -41,6 +41,12 @@ pub enum Error {
     /// A page script the caller asked to evaluate threw.
     #[error("script: {0}")]
     Script(String),
+    /// A native browser dialog blocked the command. It is still awaiting an explicit decision.
+    #[error("JavaScript dialog is awaiting explicit accept or dismiss")]
+    DialogOpen,
+    /// There is no active JavaScript dialog to handle.
+    #[error("no active JavaScript dialog")]
+    NoActiveDialog,
     /// The browser protocol (CDP) failed or answered with an error.
     #[error("browser protocol: {0}")]
     Protocol(String),
@@ -101,6 +107,8 @@ impl Error {
             Error::StaleRef(_) => "stale-ref",
             Error::StaleHandoff => "stale-handoff",
             Error::Script(_) => "script",
+            Error::DialogOpen => "dialog-open",
+            Error::NoActiveDialog => "no-active-dialog",
             Error::Protocol(_) => "protocol",
             Error::Starting { .. } => "starting",
             Error::Timeout(_) => "timeout",

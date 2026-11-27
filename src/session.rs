@@ -720,6 +720,21 @@ impl<'a> Agent<'a> {
         self.web().await?.current_url().await
     }
 
+    /// Observe a pending modal without issuing a renderer command.
+    pub async fn pending_dialog(&self) -> Result<Option<crate::cdp::JavaScriptDialog>> {
+        self.web().await?.pending_dialog().await
+    }
+
+    /// Wait until the active tab has a modal while using a second CDP connection.
+    pub async fn wait_dialog(&self) -> Result<()> {
+        self.web().await?.wait_dialog().await
+    }
+
+    /// Explicitly accept or dismiss the active tab's modal.
+    pub async fn handle_dialog(&self, accept: bool, prompt_text: Option<&str>) -> Result<()> {
+        self.web().await?.handle_dialog(accept, prompt_text).await
+    }
+
     /// Open tabs.
     pub async fn tabs(&self) -> Result<Vec<Tab>> {
         self.web().await?.tabs().await
