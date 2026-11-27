@@ -365,6 +365,7 @@ async fn real_headless_chromium_webmcp() {
         call(&mut web, "echo", json!({})).await,
         Err(Error::NotFound(_))
     ));
+    assert_webmcp_dialogs(&mut web).await;
     web.navigate(&format!("{origin}/plain")).await.unwrap();
     assert!(web.webmcp_list().await.unwrap().tools.is_empty());
     web.navigate(&format!("{origin}/form")).await.unwrap();
@@ -390,6 +391,60 @@ async fn real_headless_chromium_webmcp() {
     assert_eq!(result.value, json!({"query":"café", "agentInvoked":true}));
     browser.shutdown().await;
     server.abort();
+}
+
+async fn assert_webmcp_dialogs(web: &mut Web) {
+    async fn expect_dialog<T: std::fmt::Debug>(
+        operation: impl Future<Output = agent_workstation::Result<T>>,
+    ) {
+        let result = timeout(Duration::from_secs(3), operation)
+            .await
+            .expect("WebMCP waited for the blocked renderer");
+        assert!(matches!(result, Err(Error::DialogOpen)), "{result:?}");
+    }
+
+    web.eval(
+        r#"navigator.modelContext.provideContext({tools: [{
+            name: 'opens_alert', description: 'Open a modal',
+            execute: () => { alert('tool modal'); return true; },
+        }]})"#,
+    )
+    .await
+    .unwrap();
+    let tool = discover(web, "opens_alert").await.unwrap();
+    // The tool itself opens the modal, so no timer or scheduling guess is needed.
+    expect_dialog(web.webmcp_call(&tool, json!({}), false, 5_000)).await;
+    let dialog = web.pending_dialog().await.unwrap().unwrap();
+    assert_eq!(dialog.kind, "alert");
+    assert_eq!(dialog.message, "tool modal");
+
+    // Neither operation may touch the blocked renderer or dismiss the modal.
+    expect_dialog(web.webmcp_call(&tool, json!({}), false, 5_000)).await;
+    expect_dialog(web.webmcp_list()).await;
+    web.handle_dialog(true, None).await.unwrap();
+    assert!(web.pending_dialog().await.unwrap().is_none());
+
+    web.eval(
+        r#"(() => {
+            const context = navigator.modelContext;
+            const getTools = context.getTools;
+            context.getTools = () => {
+                context.getTools = getTools;
+                prompt('discovery modal');
+                return getTools();
+            };
+        })()"#,
+    )
+    .await
+    .unwrap();
+    expect_dialog(web.webmcp_list()).await;
+    let dialog = web.pending_dialog().await.unwrap().unwrap();
+    assert_eq!(dialog.kind, "prompt");
+    assert_eq!(dialog.message, "discovery modal");
+    web.handle_dialog(false, None).await.unwrap();
+    assert!(web.pending_dialog().await.unwrap().is_none());
+    let recovered = call(web, "ui.snapshot", json!({})).await.unwrap();
+    assert_eq!(recovered["role"], "window");
 }
 
 async fn observe(cdp: &mut Cdp, expression: &str, expected: u64) {

@@ -175,13 +175,15 @@ async fn main_realm(cdp: &mut Cdp, doc: &Document) -> Result<String> {
 
 impl Web {
     /// Discover tools afresh. A new discovery invalidates the prior references.
+    /// An open JavaScript modal interrupts discovery without dismissing it.
     pub async fn webmcp_list(&mut self) -> Result<WebMcpDiscovery> {
+        self.check_webmcp_dialog().await?;
         self.webmcp_discovery = None;
         let target = self.active.clone().ok_or_else(stale)?;
         let generation = random_key()?;
         let (value, doc, realm) = self
             .webmcp_operation(
-                &target,
+                target.clone(),
                 None,
                 json!({"op": "list", "generation": generation}),
                 WEBMCP_DEFAULT_TIMEOUT_MS,
@@ -209,6 +211,7 @@ impl Web {
 
     /// Invoke a discovery ref, without a synthetic user gesture. Confirm only
     /// after independent approval. Dropping the future requests cancellation.
+    /// An open JavaScript modal interrupts the CDP request, not page code.
     pub async fn webmcp_call(
         &mut self,
         tool_ref: &str,
@@ -216,6 +219,7 @@ impl Web {
         confirmed: bool,
         timeout_ms: u64,
     ) -> Result<WebMcpResult> {
+        self.check_webmcp_dialog().await?;
         if !input.is_object()
             || serde_json::to_vec(&input).map_err(|_| failed())?.len() > MAX_INPUT_BYTES
         {
@@ -238,7 +242,7 @@ impl Web {
             .position(|r| r == tool_ref)
             .ok_or_else(stale)?;
         let (value, doc, _) = self.webmcp_operation(
-            &binding.target, Some(binding),
+            binding.target.clone(), Some((binding.document.clone(), binding.realm.clone())),
             json!({"op": "call", "index": index, "generation": binding.generation, "input": input, "confirmed": confirmed}),
             timeout_ms,
         ).await?;
@@ -249,16 +253,22 @@ impl Web {
         })
     }
 
+    async fn check_webmcp_dialog(&mut self) -> Result<()> {
+        self.cdp.drain_events().await?;
+        if self.cdp.pending_dialog().is_some() {
+            return Err(Error::DialogOpen);
+        }
+        Ok(())
+    }
+
     async fn webmcp_operation(
-        &self,
-        target: &str,
-        binding: Option<&Discovery>,
+        &mut self,
+        target: String,
+        expected: Option<(Document, String)>,
         mut payload: Value,
         timeout_ms: u64,
     ) -> Result<(Value, Document, String)> {
-        let target = target.to_owned();
         let endpoint = self.cdp.endpoint().to_owned();
-        let expected = binding.map(|d| (d.document.clone(), d.realm.clone()));
         let key = random_key()?;
         let registry = &self.webmcp_registry;
         payload["registry"] = json!(registry);
@@ -268,7 +278,7 @@ impl Web {
         let (mut tx, rx) = oneshot::channel();
         // A short-lived attachment lets us abort even after the caller drops
         // the future. Limit untrusted CDP messages on this socket only.
-        tokio::spawn(async move {
+        let worker = tokio::spawn(async move {
             let setup = async {
                 let mut cdp = Cdp::connect_bounded(&endpoint, Some(512 * 1024))
                     .await
@@ -326,7 +336,18 @@ impl Web {
                 let _ = tx.send(result);
             }
         });
-        rx.await.map_err(|_| failed())?
+        tokio::select! {
+            biased;
+            dialog = self.cdp.wait_dialog() => {
+                // Only the primary Page session receives dialog events. Drop
+                // the attachment without awaiting JS in the blocked renderer.
+                worker.abort();
+                let _ = worker.await;
+                dialog?;
+                Err(Error::DialogOpen)
+            }
+            result = rx => result.map_err(|_| failed())?,
+        }
     }
 }
 
